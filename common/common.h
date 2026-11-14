@@ -1273,6 +1273,19 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
 // prompt utils
 //
 
+// the state reader writes every byte of a checkpoint, so growing its buffer need not zero it first
+template <typename T>
+struct common_no_init_allocator : std::allocator<T> {
+    using std::allocator<T>::allocator;
+    template <typename U> struct rebind { using other = common_no_init_allocator<U>; };
+    template <typename U> void construct(U * p) noexcept { ::new (static_cast<void *>(p)) U; }
+    template <typename U, typename... Args> void construct(U * p, Args &&... args) {
+        ::new (static_cast<void *>(p)) U(std::forward<Args>(args)...);
+    }
+};
+
+using common_ckpt_buffer = std::vector<uint8_t, common_no_init_allocator<uint8_t>>;
+
 struct common_prompt_checkpoint {
     int64_t n_tokens;
 
@@ -1282,8 +1295,8 @@ struct common_prompt_checkpoint {
     llama_pos pos_min;
     llama_pos pos_max;
 
-    std::vector<uint8_t> data_tgt;
-    std::vector<uint8_t> data_dft;
+    common_ckpt_buffer data_tgt;
+    common_ckpt_buffer data_dft;
 
     // (optional) speculative-decoding implementation state stashed with the checkpoint
     // (e.g. eagle3's deferred-boundary g_embd row)

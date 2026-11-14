@@ -42,6 +42,7 @@ static bool prefix_copy() {
 #include <exception>
 #include <memory>
 #include <filesystem>
+#include <future>
 #include <random>
 #include <utility>
 #include <fstream>
@@ -322,6 +323,55 @@ struct server_slot {
     slot_state state = SLOT_STATE_IDLE;
 
     server_prompt prompt;
+
+    // buffers of dropped checkpoints kept for the next ones: fresh memory pays a page fault per page, which
+    // costs more than copying the state into it
+    std::vector<common_ckpt_buffer> ckpt_spare;
+    std::future<std::vector<common_ckpt_buffer>> ckpt_faulting;
+    int ckpt_limit = 0;
+
+    void ckpt_recycle(common_prompt_checkpoint & cur) {
+        if (ckpt_spare.size() < 4 && cur.data_tgt.capacity() > 0) {
+            cur.data_tgt.clear();
+            ckpt_spare.push_back(std::move(cur.data_tgt));
+        }
+    }
+
+    // a prepared buffer if one is ready; a request that comes first allocates as before
+    void ckpt_take(common_prompt_checkpoint & cur) {
+        if (ckpt_faulting.valid() && ckpt_faulting.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+            for (auto & buf : ckpt_faulting.get()) {
+                ckpt_spare.push_back(std::move(buf));
+            }
+        }
+        if (!ckpt_spare.empty()) {
+            cur.data_tgt = std::move(ckpt_spare.back());
+            ckpt_spare.pop_back();
+        }
+    }
+
+    // after an answer, bring the next request's two checkpoint buffers into memory off the main thread
+    void ckpt_prepare() {
+        if (prompt.checkpoints.empty() || ckpt_faulting.valid()) {
+            return;
+        }
+        const size_t size = prompt.checkpoints.back().data_tgt.size();
+        const int n = std::min(2 - (int) ckpt_spare.size(), ckpt_limit - (int) (prompt.checkpoints.size() + ckpt_spare.size()));
+        if (n <= 0 || size == 0) {
+            return;
+        }
+        ckpt_faulting = std::async(std::launch::async, [size, n]() {
+            std::vector<common_ckpt_buffer> bufs(n);
+            for (auto & buf : bufs) {
+                buf.resize(size + size/4);
+                for (size_t i = 0; i < buf.size(); i += 4096) {
+                    buf[i] = 0;
+                }
+                buf.resize(0);
+            }
+            return bufs;
+        });
+    }
 
     bool prompt_save(server_prompt_cache & prompt_cache) const {
         if (prompt.tokens.size() == 0) {
@@ -617,6 +667,8 @@ struct server_slot {
             reset();
 
             callback_on_release(id);
+
+            ckpt_prepare();
         }
     }
 
@@ -1452,6 +1504,7 @@ private:
             slot.mem.init(ctx_tgt, ctx_dft);
             slot.spec    = spec.get();
             slot.n_ctx   = n_ctx_slot();
+            slot.ckpt_limit = params_base.n_ctx_checkpoints;
 
             slot.mctx                   = mctx;
             slot.prompt.tokens.has_mtmd = mctx != nullptr;
@@ -2618,6 +2671,7 @@ private:
                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                         it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
 
+                slot.ckpt_recycle(*it);
                 it = slot.prompt.checkpoints.erase(it);
                 continue;
             }
@@ -2628,11 +2682,12 @@ private:
 
         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
             // make room for the new checkpoint, if needed
-            const auto & cur = slot.prompt.checkpoints.front();
+            auto & cur = slot.prompt.checkpoints.front();
 
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                     cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
+            slot.ckpt_recycle(cur);
             slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
         }
 
@@ -2642,6 +2697,7 @@ private:
             for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
                 if (it->n_tokens == n_tokens_new) {
                     SLT_TRC(slot, "superseding context checkpoint at n_tokens = %" PRId64 "\n", it->n_tokens);
+                    slot.ckpt_recycle(*it);
                     it = slot.prompt.checkpoints.erase(it);
                 } else {
                     ++it;
@@ -2652,6 +2708,7 @@ private:
         auto & cur = slot.prompt.checkpoints.emplace_back();
 
         cur.id_task = id_task;
+        slot.ckpt_take(cur);
 
         // [TAG_CHECKPOINTS_FIX_POS_MIN]
         // TODO: here we incorrectly deterimne that the saved checkpoint data covers the [pos_min, pos_max] range
@@ -3700,7 +3757,10 @@ private:
                                     SLT_WRN(slot, "%s\n", st1.str().c_str());
                                 }
 
-                                if (pos_min >= pos_min_thold) {
+                                // a sliding window that still starts at 0 has dropped nothing and goes on from n_past
+                                const bool swa_whole = n_swa > 0 && pos_min == 0;
+
+                                if (pos_min >= pos_min_thold && !swa_whole) {
                                     // search for a context checkpoint
                                     const auto it = std::find_if(
                                         slot.prompt.checkpoints.rbegin(),
@@ -3745,6 +3805,7 @@ private:
                                     const auto & cur = *it;
                                     if (cur.pos_max > pos_next || cur.n_tokens > n_prefix) {
                                         SLT_TRC(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
+                                        slot.ckpt_recycle(*it);
                                         it = slot.prompt.checkpoints.erase(it);
                                     } else {
                                         ++it;
@@ -3999,6 +4060,11 @@ private:
                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
                         // message or we are near the end of the prompt
                         if (!is_user_start && !near_prompt_end) {
+                            do_checkpoint = false;
+                        }
+                        // a short batch that does not start a user message ends where the next checkpoint goes,
+                        // so one before it would hold nearly the same state
+                        if (!is_user_start && n_tokens_cur < 32) {
                             do_checkpoint = false;
                         }
                     }
