@@ -1432,6 +1432,22 @@ int ggml_metal_op_lightning_indexer(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(m),  4);
     ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op), 5);
 
+    // without simdgroup matrices (AMD) a scalar kernel keeps the indexer on the GPU
+    if (!ggml_metal_device_get_props(ctx->dev)->has_simdgroup_mm) {
+        const int nk = OP_LIGHTNING_INDEXER_AMD_NK;
+        const int nb = OP_LIGHTNING_INDEXER_AMD_NB;
+
+        auto pipeline = ggml_metal_library_get_pipeline_lightning_indexer_amd(ctx->lib, op);
+        ggml_metal_encoder_set_pipeline(enc, pipeline);
+        ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_dispatch_threadgroups(enc,
+                (k->ne[2] + nk - 1)/nk,
+                (q->ne[2] + nb - 1)/nb,
+                q->ne[3], nk*nb, 1, 1);
+
+        return 1;
+    }
+
     const int nsg   = OP_LIGHTNING_INDEXER_NSG;
     const int nkptg = OP_LIGHTNING_INDEXER_NKPSG*nsg;
     const int nbptg = OP_LIGHTNING_INDEXER_NBPTG;
@@ -1714,6 +1730,7 @@ int ggml_metal_op_ssm_conv(ggml_metal_op_t ctx, int idx) {
         /*.nb00 =*/ nb00,
         /*.nb01 =*/ nb01,
         /*.nb02 =*/ nb02,
+        /*.ne10 =*/ ne10,
         /*.ne11 =*/ ne11,
         /*.nb10 =*/ nb10,
         /*.nb11 =*/ nb11,
@@ -1754,7 +1771,7 @@ int ggml_metal_op_ssm_conv(ggml_metal_op_t ctx, int idx) {
         const int n_token_batches = (ne1 + BATCH_SIZE - 1) / BATCH_SIZE;
         ggml_metal_encoder_dispatch_threadgroups(enc, ne01, n_token_batches, ne02, BATCH_SIZE, 1, 1);
     } else {
-        auto pipeline = ggml_metal_library_get_pipeline_ssm_conv(lib, op, (int32_t) ne10, use_silu);
+        // decode packs rows across a threadgroup; token/seq stay grid dims
         auto pipeline = ggml_metal_library_get_pipeline_ssm_conv_decode(lib, op, use_silu);
 
         ggml_metal_encoder_set_pipeline(enc, pipeline);
@@ -3818,6 +3835,12 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
     const bool fa_amd_width_ok = props_dev->simd_width == 32
         ? props_dev->has_simdgroup_reduction
         : props_dev->wave64_decode;
+    // sparse attention (QSA / DeepSeek-V4): the mask already carries the selection, the
+    // index kernel compacts it and the vec kernel walks the list instead of the whole cache
+    const int amd_n_kv_max = ggml_metal_op_flash_attn_ext_n_kv_max_sparse(op);
+    const bool amd_sparse  = amd_n_kv_max > 0 && ne01 == 1;
+    const int amd_n_kv_pad = amd_sparse ? GGML_PAD(amd_n_kv_max, OP_FLASH_ATTN_EXT_VEC_NCPSG) : 0;
+
     if (TOSH_ENV("TOSH_FA_AMD") != NULL && fa_amd_pipeline[0] != '\0' &&
         !props_dev->has_simdgroup_mm && fa_amd_width_ok &&
         !has_bias && !has_scap) {
@@ -3857,6 +3880,8 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             /*.logit_softcap =*/ logit_softcap,
             /*.has_sinks     =*/ has_sinks ? 1 : 0,
             /*.has_mask      =*/ has_mask ? 1 : 0,
+            /*.n_kv_max_padded =*/ amd_n_kv_pad,
+        };
 
         // queries per threadgroup, matching the instantiation for this head size
         static const bool pf512 = TOSH_ENV("TOSH_FA_PF_DK512") != nullptr;
@@ -4086,6 +4111,41 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         if (fa_amd_nwg > 1) {
             snprintf(fa_amd_wg_pipeline, sizeof(fa_amd_wg_pipeline), "%s_wg32", fa_amd_pipeline);
         }
+
+        // sparse: build the compacted index list first, on the same encoder
+        ggml_metal_buffer_id bid_amd_idx = bid_tmp;
+        if (amd_sparse) {
+            bid_amd_idx.offs += ggml_metal_op_flash_attn_ext_extra_tmp(op)
+                              + ggml_metal_op_flash_attn_ext_extra_kv_f16(op);
+
+            ggml_metal_kargs_flash_attn_ext_vec_idx argsi = {
+                /*.ne30            =*/ ne30,
+                /*.ne31            =*/ ne31,
+                /*.ne32            =*/ ne32,
+                /*.ne33            =*/ ne33,
+                /*.nb31            =*/ nb31,
+                /*.nb32            =*/ nb32,
+                /*.nb33            =*/ nb33,
+                /*.n_kv_max        =*/ amd_n_kv_max,
+                /*.n_kv_max_padded =*/ amd_n_kv_pad,
+            };
+
+            auto pipei = ggml_metal_library_get_pipeline_flash_attn_ext_vec_idx(lib, op);
+
+            ggml_metal_encoder_set_pipeline(enc, pipei);
+            ggml_metal_encoder_set_bytes   (enc, &argsi, sizeof(argsi), 0);
+            ggml_metal_encoder_set_buffer  (enc, bid_src3,    1);
+            ggml_metal_encoder_set_buffer  (enc, bid_amd_idx, 2);
+
+            int nthi = std::min(ggml_metal_pipeline_max_theads_per_threadgroup(pipei), 256);
+            // whole simdgroups only: a partial one loses its slice of the count
+            const int nwi = props_dev->simd_width;
+            nthi = std::max(nwi, (nthi/nwi)*nwi);
+
+            ggml_metal_encoder_dispatch_threadgroups(enc, ne31, ne32, ne33, nthi, 1, 1);
+            ggml_metal_op_concurrency_reset(ctx);
+        }
+
         auto pipeline = ggml_metal_fa_amd_pipeline(lib, fa_amd_nwg > 1 ? fa_amd_wg_pipeline : fa_amd_pipeline);
         // 32 KB of threadgroup memory (GCN 1.0) does not hold the 64-lane kernel; its twin
         // with half the simdgroups does. TOSH_FA_AMD_LDS32=1 takes the twin on any wave64 card.
@@ -4121,6 +4181,8 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer  (enc, bid_src4, 5);
         ggml_metal_encoder_set_buffer  (enc, bid_pad,  6);
         ggml_metal_encoder_set_buffer  (enc, fa_amd_nwg > 1 ? bid_tmp : bid_dst, 7);
+        ggml_metal_encoder_set_buffer  (enc, bid_amd_idx, 8);
+
         ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, ne03*fa_amd_nwg, props_dev->simd_width, fa_amd_nsg, 1);
 
         if (fa_amd_nwg > 1) {
@@ -4557,7 +4619,9 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_set_buffer  (enc, bid_idx,  2);
 
             int nth = std::min(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline0), 256);
-            nth = std::max(32, (nth/32)*32);
+            // whole simdgroups only: a partial one loses its slice of the count
+            const int nw0 = props_dev->simd_width;
+            nth = std::max(nw0, (nth/nw0)*nw0);
 
             ggml_metal_encoder_dispatch_threadgroups(enc, ne31, ne32, ne33, nth, 1, 1);
 

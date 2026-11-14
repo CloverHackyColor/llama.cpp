@@ -2152,7 +2152,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             if (op->src[0]->ne[0] != OP_LIGHTNING_INDEXER_DK) {
                 return false;
             }
-            if (!has_simdgroup_mm ||
+            if ((!has_simdgroup_mm && op->src[1]->type == GGML_TYPE_BF16) ||
                 op->src[0]->type != GGML_TYPE_F32 ||
                 op->src[2]->type != GGML_TYPE_F32 ||
                 op->src[3]->type != GGML_TYPE_F16 ||

@@ -182,14 +182,14 @@ kernel void kernel_flash_attn_ext_blk(
 // compress the finite entries of each KQ mask row into a list of KV indices (ascending order),
 // padded with -1 up to n_kv_max_padded (a multiple of OP_FLASH_ATTN_EXT_VEC_NCPSG)
 // one threadgroup per mask row; the mask remains the single source of truth for the values
-kernel void kernel_flash_attn_ext_vec_idx(
+template<short NW>
+kernel void kernel_flash_attn_ext_vec_idx_t(
         constant ggml_metal_kargs_flash_attn_ext_vec_idx & args,
         device const half * mask,
         device       int  * idx,
         uint3   tgpig[[threadgroup_position_in_grid]],
         ushort  tiitg[[thread_index_in_threadgroup]],
         ushort3 ntg[[threads_per_threadgroup]]) {
-    constexpr short NW = N_SIMDWIDTH;
     constexpr short NLOCAL = 32; // max finite positions kept in registers per thread
 
     const int i1 = tgpig[0];
@@ -468,6 +468,15 @@ kernel void kernel_lightning_indexer(
         }
     }
 }
+
+// the scan and the per-simdgroup counts are width-dependent, so the 64-lane cards need
+// their own instantiation instead of the 32-lane default
+typedef decltype(kernel_flash_attn_ext_vec_idx_t<N_SIMDWIDTH>) flash_attn_ext_vec_idx_t;
+
+template [[host_name("kernel_flash_attn_ext_vec_idx")]] kernel flash_attn_ext_vec_idx_t
+    kernel_flash_attn_ext_vec_idx_t<32>;
+template [[host_name("kernel_flash_attn_ext_vec_idx_w64")]] kernel flash_attn_ext_vec_idx_t
+    kernel_flash_attn_ext_vec_idx_t<64>;
 
 typedef decltype(kernel_lightning_indexer<half4x4, 1, dequantize_f16>) kernel_lightning_indexer_t;
 

@@ -3,6 +3,7 @@
 
 // AMD flash attention kernels; the upstream ones live in fa_*.metal
 // vec kernel above miscompiles. Generalized over the K/V element type via the
+
 template<
     short DK, short NSG,
     typename k_t, short NKK, void (*deq_k)(device const k_t *, short, thread float4 &),
@@ -16,6 +17,7 @@ kernel void kernel_flash_attn_ext_vec_amd(
         device const char * sinks [[buffer(5)]],
         device const char * pad   [[buffer(6)]],
         device       char * dst   [[buffer(7)]],
+        device const int  * idx   [[buffer(8)]],
         uint3  tgpig [[threadgroup_position_in_grid]],
         ushort tiisg [[thread_index_in_simdgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]]) {
@@ -59,6 +61,18 @@ kernel void kernel_flash_attn_ext_vec_amd(
     if (args.has_mask) {
         pm = (device const half *) (mask + iq1*args.nb31 + (iq2%args.ne32)*args.nb32 + (iq3%args.ne33)*args.nb33);
     }
+
+    // sparse: the index list is laid out per (row, head, batch), same as the mask
+    // sparse when the host filled the index list; uniform across the threadgroup
+    const bool has_sparse = args.n_kv_max_padded > 0;
+
+    device const int * pidx = nullptr;
+    if (has_sparse) {
+        pidx = idx +
+            ((int64_t)(iq3%args.ne33)*args.ne32 + (iq2%args.ne32))*args.ne31*args.n_kv_max_padded +
+            (iq1%args.ne31)*args.n_kv_max_padded;
+    }
+
     const short sub  = tiisg/SUBW;
     const short lch  = tiisg%SUBW;
     const short gidx = sgitg*RPS + sub;
@@ -71,12 +85,26 @@ kernel void kernel_flash_attn_ext_vec_amd(
     float m = -FLT_MAX/2;
     float s = 0.0f;
 
+    // sparse walks the compacted index list instead of the whole cache; a padded slot is -1
+    const int n_kv = has_sparse ? args.n_kv_max_padded : args.ne11;
+
+    for (int j = (iwg*NSG + sgitg)*RPS + sub; j < n_kv; j += NWG*NG) {
+        const int i11 = has_sparse ? pidx[j] : j;
+
         // no early-out: the sub-groups of a simdgroup sit on different rows, so the
         // skip is not uniform and the shuffle reduction below would diverge
+        const float mv = (has_sparse && i11 < 0) ? -MAXHALF
+                       : (args.has_mask ? (float) pm[i11] : 0.0f);
         const bool  msk = mv <= -1e30f;
         if (RPS == 1 && msk) {
             continue;
         }
+
+        // a padded slot keeps running through the body to hold the reduction uniform, and its
+        // weight ends up zero, but the address is still formed: read row 0 instead of -1
+        const int i11a = i11 < 0 ? 0 : i11;
+
+        device const k_t * kb = (device const k_t *) (kp + (uint64_t) i11a*args.nb11);
         float pl = 0.0f;
             const short ch = lch + c*SUBW;
             if (ch < DK4) {
@@ -99,6 +127,7 @@ kernel void kernel_flash_attn_ext_vec_amd(
         const float corr = exp(m  - nm);
         const float w    = msk ? 0.0f : exp(pp - nm);
 
+        device const v_t * vb = (device const v_t *) (vp + (uint64_t) i11a*args.nb21);
             const short ch = lch + c*SUBW;
             if (ch < DV4) {
                 float4 vreg;
@@ -854,3 +883,123 @@ FA_AMD_PF_INST_DV(320, 256, 16, 32, "kq8_0_vq8_0", block_q8_0, 8, dequantize_q8_
 // note: I think the s_t can be half instead of float, because the Q*K scaling is done before storing to shared mem
 //       in the other (non-vec) kernel, we need s_t to also be float because we scale during the soft_max
 //
+
+constant short FC_lightning_indexer_amd_nh [[function_constant(FC_LIGHTNING_INDEXER + 0)]];
+
+// Lightning indexer for GPUs without simdgroup matrices: one thread per key and query row, with
+// the key tile and a few heads of the queries in threadgroup memory. It stays under 32 KB of it.
+template<
+    typename kd4x4_t,
+    short nl_k,
+    void (*deq_k)(device const kd4x4_t *, short, thread half4x4 &)>
+kernel void kernel_lightning_indexer_amd(
+        constant ggml_metal_kargs_lightning_indexer & args,
+        device const char * q,
+        device const char * k,
+        device const char * w,
+        device const char * m,
+        device       char * dst,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]]) {
+    constexpr short DK   = OP_LIGHTNING_INDEXER_DK;
+    constexpr short DK4  = DK/4;
+    constexpr short DK16 = DK/16;
+    constexpr short NK   = OP_LIGHTNING_INDEXER_AMD_NK;
+    constexpr short NB   = OP_LIGHTNING_INDEXER_AMD_NB;
+    constexpr short NT   = NK*NB;
+    constexpr short NHC  = 8;
+    // a padded row puts the keys a simdgroup reads at the same step in different banks
+    constexpr short SKS  = DK4 + 1;
+
+    const short NH = FC_lightning_indexer_amd_nh;
+
+    threadgroup half4 sk[NK*SKS];
+    threadgroup half4 sq[NB*NHC*DK4];
+    threadgroup float sw[NB*NHC];
+
+    const int i_stream = tgpig.z;
+    const int i_kv_0   = tgpig.x*NK;
+    const int i_b_0    = tgpig.y*NB;
+
+    for (short i = tiitg; i < NK*DK16; i += NT) {
+        const short ik  = i/DK16;
+        const short i16 = i%DK16;
+
+        half4x4 tmp;
+        if (i_kv_0 + ik < args.n_kv) {
+            device const kd4x4_t * kr = (device const kd4x4_t *) (k + (uint64_t) (i_kv_0 + ik)*args.nbk2 + (uint64_t) i_stream*args.nbk3);
+            deq_k(kr + i16/nl_k, i16%nl_k, tmp);
+        } else {
+            for (short j = 0; j < 4; ++j) {
+                tmp[j] = half4(0.0h);
+            }
+        }
+        for (short j = 0; j < 4; ++j) {
+            sk[ik*SKS + i16*4 + j] = tmp[j];
+        }
+    }
+
+    const short ik = tiitg%NK;
+    const short ib = tiitg/NK;
+
+    float score = 0.0f;
+
+    for (short h0 = 0; h0 < NH; h0 += NHC) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (short i = tiitg; i < NB*NHC*DK4; i += NT) {
+            const short b  = i/(NHC*DK4);
+            const short h  = (i/DK4)%NHC;
+            const short i4 = i%DK4;
+            const int   bb = i_b_0 + b;
+
+            half4 v = half4(0.0h);
+            if (bb < args.n_batch && h0 + h < NH) {
+                device const float4 * q4 = (device const float4 *) (q + (uint64_t) bb*args.nbq2 + (uint64_t) i_stream*args.nbq3 + (uint64_t) (h0 + h)*args.nbq1);
+                v = half4(q4[i4]);
+            }
+            sq[i] = v;
+        }
+        for (short i = tiitg; i < NB*NHC; i += NT) {
+            const short b  = i/NHC;
+            const short h  = i%NHC;
+            const int   bb = i_b_0 + b;
+
+            sw[i] = bb < args.n_batch && h0 + h < NH
+                ? ((device const float *) (w + (uint64_t) bb*args.nbw1 + (uint64_t) i_stream*args.nbw3))[h0 + h]
+                : 0.0f;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half4 * kr = sk + ik*SKS;
+        for (short h = 0; h < NHC; ++h) {
+            threadgroup const half4 * qr = sq + (ib*NHC + h)*DK4;
+
+            float4 acc = 0.0f;
+            for (short i4 = 0; i4 < DK4; ++i4) {
+                acc += float4(kr[i4])*float4(qr[i4]);
+            }
+            score += max(acc[0] + acc[1] + acc[2] + acc[3], 0.0f)*sw[ib*NHC + h];
+        }
+    }
+
+    const int i_kv    = i_kv_0 + ik;
+    const int i_batch = i_b_0 + ib;
+    if (i_kv < args.n_kv && i_batch < args.n_batch) {
+        device const half  * pm = (device const half  *) (m   + (uint64_t) i_batch*args.nbm1 + (uint64_t) (i_stream % args.mask_ne3)*args.nbm3);
+        device       float * pd = (device       float *) (dst + (uint64_t) i_batch*args.nb1  + (uint64_t) i_stream*args.nb3);
+
+        pd[i_kv] = score + (float) pm[i_kv];
+    }
+}
+
+typedef decltype(kernel_lightning_indexer_amd<half4x4, 1, dequantize_f16>) kernel_lightning_indexer_amd_t;
+
+template [[host_name("kernel_lightning_indexer_amd_f32")]]  kernel kernel_lightning_indexer_amd_t kernel_lightning_indexer_amd<float4x4,   1, dequantize_f32>;
+template [[host_name("kernel_lightning_indexer_amd_f16")]]  kernel kernel_lightning_indexer_amd_t kernel_lightning_indexer_amd<half4x4,    1, dequantize_f16>;
+template [[host_name("kernel_lightning_indexer_amd_q4_0")]] kernel kernel_lightning_indexer_amd_t kernel_lightning_indexer_amd<block_q4_0, 2, dequantize_q4_0>;
+template [[host_name("kernel_lightning_indexer_amd_q4_1")]] kernel kernel_lightning_indexer_amd_t kernel_lightning_indexer_amd<block_q4_1, 2, dequantize_q4_1>;
+template [[host_name("kernel_lightning_indexer_amd_q5_0")]] kernel kernel_lightning_indexer_amd_t kernel_lightning_indexer_amd<block_q5_0, 2, dequantize_q5_0>;
+template [[host_name("kernel_lightning_indexer_amd_q5_1")]] kernel kernel_lightning_indexer_amd_t kernel_lightning_indexer_amd<block_q5_1, 2, dequantize_q5_1>;
+template [[host_name("kernel_lightning_indexer_amd_q8_0")]] kernel kernel_lightning_indexer_amd_t kernel_lightning_indexer_amd<block_q8_0, 2, dequantize_q8_0>;

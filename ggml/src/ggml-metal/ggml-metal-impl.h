@@ -144,6 +144,9 @@
 #define OP_LIGHTNING_INDEXER_NKPSG   8
 #define OP_LIGHTNING_INDEXER_NSG     8
 #define OP_LIGHTNING_INDEXER_NBPTG   8
+// GPUs without simdgroup matrices: keys and query rows per threadgroup of the scalar kernel
+#define OP_LIGHTNING_INDEXER_AMD_NK  64
+#define OP_LIGHTNING_INDEXER_AMD_NB   4
 
 #define OP_UNARY_NUM_SCALE      10
 #define OP_UNARY_NUM_FILL       11
@@ -487,6 +490,8 @@ typedef struct {
     int32_t  has_mask;  // 0 for bidirectional attention (vision towers), which has no mask
 } ggml_metal_kargs_flash_attn_ext_vec;
 
+// the AMD kernels take their own copy: a field added to the upstream vec struct changes the
+// constant buffer layout and with it the code the Metal compiler emits for them
     uint64_t nb23;
     int32_t  ne31;
     int32_t  ne32;
@@ -505,6 +510,8 @@ typedef struct {
     float    logit_softcap;
     int32_t  has_sinks; // read by the AMD kernels; upstream uses a function constant
     int32_t  has_mask;  // 0 for bidirectional attention (vision towers), which has no mask
+    int32_t  n_kv_max_padded; // sparse: length of the per-row index list
+} ggml_metal_kargs_flash_attn_ext_amd;
 typedef struct {
     int32_t  ne30;
     int32_t  ne31;
