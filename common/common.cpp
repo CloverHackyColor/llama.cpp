@@ -1236,8 +1236,12 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     pimpl(new impl{}) {
     {
         tosh_plan plan;
-        if (!tosh_plan_apply(params, &plan) && plan.state == TOSH_PLAN_NOT_PLANNED && !params.dynamic_moe && getenv("TOSH_AUTO") == nullptr) {
+        const bool planned = tosh_plan_apply(params, &plan);
+        if (!planned && plan.state == TOSH_PLAN_NOT_PLANNED && !params.dynamic_moe && getenv("TOSH_AUTO") == nullptr) {
             LOG_INF("Tosh MoE: standard\n");
+        }
+        if (!planned && plan.state != TOSH_PLAN_UNSUPPORTED) {
+            tosh_plan_checkpoints(params);
         }
         // no plan fits: loading with the defaults would hand memory to a layout nobody checked
         if (plan.state == TOSH_PLAN_UNSUPPORTED && getenv("TOSH_AUTO_DRY_RUN") == nullptr) {

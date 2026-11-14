@@ -931,6 +931,9 @@ extern "C" {
 // Getting the state for a seq_id with this flag invalidates all prior states gotten for that seq_id with this flag.
 #define LLAMA_STATE_SEQ_FLAGS_ON_DEVICE 2
 
+// a cached copy that may be stored in a smaller type; never for a state that must come back exact
+#define LLAMA_STATE_SEQ_FLAGS_COMPACT 4
+
     typedef uint32_t llama_state_seq_flags;
 
     LLAMA_API size_t llama_state_seq_get_size_ext(

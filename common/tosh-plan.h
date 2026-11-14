@@ -127,6 +127,10 @@ std::string  tosh_plan_json(const tosh_plan & plan);
 // when no plan exists: then out->state is TOSH_PLAN_UNSUPPORTED and the model must not be loaded.
 bool tosh_plan_apply(common_params & params, tosh_plan * out = nullptr);
 
+// For a model the plan did not take: checkpoints of a recurrent state stay exact while enough of them fit in
+// the free memory, and drop to 8 bits otherwise; their number is cut to what fits either way.
+void tosh_plan_checkpoints(common_params & params);
+
 // Outcome of the load that followed the last plan: READY, PLAN_REFUSED, MODEL_LOAD_FAILED,
 // ALLOCATION_FAILED or CONTEXT_FAILED, with the measured RSS and VRAM next to the projection.
 // Written to <TOSH_AUTO_PLAN_FILE>.actual; no-op when nothing was planned.

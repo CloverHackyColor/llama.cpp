@@ -1190,6 +1190,8 @@ struct ggml_metal_device {
     id<MTLCommandBuffer> stage_set_cmds[4];
     int                  stage_set_cur;
     // open read batch: blits accumulate into one command buffer, one wait at end
+    bool                       stage_batch_open;
+    id<MTLCommandBuffer>       stage_batch_cmd;   // created by the first read, released on flush
     id<MTLBlitCommandEncoder>  stage_batch_enc;
     size_t                     stage_batch_used;
     int                        stage_batch_n;
@@ -3842,6 +3844,8 @@ static void ggml_metal_device_stage_batch_flush(ggml_metal_device_t dev) {
                (char *) dev->stage_buf.contents + dev->stage_batch_items[i].off,
                dev->stage_batch_items[i].size);
     }
+    [dev->stage_batch_enc release];
+    [dev->stage_batch_cmd release];
     dev->stage_batch_n    = 0;
     dev->stage_batch_used = 0;
     dev->stage_batch_enc  = nil;
@@ -3854,10 +3858,16 @@ void ggml_metal_device_read_batch_begin(ggml_metal_device_t dev) {
         return;
     }
     [dev->stage_lock lock];   // held until read_batch_end
+    // no command buffer yet: one left uncommitted by an empty batch keeps its slot in the queue
+    dev->stage_batch_open = true;
+}
 
 void ggml_metal_device_read_batch_end(ggml_metal_device_t dev) {
     if (dev->props.use_shared_buffers) {
         return;
+    }
+    ggml_metal_device_stage_batch_flush(dev);
+    dev->stage_batch_open = false;
     [dev->stage_lock unlock];
 }
 
@@ -3882,6 +3892,7 @@ bool ggml_metal_device_stage_get(ggml_metal_device_t dev, struct ggml_metal_buff
     [dev->stage_lock lock];
 
     // inside an open read batch: queue the blit, defer the wait to batch end
+    if (dev->stage_batch_open) {
         if (ggml_metal_device_stage_buf(dev) == nil) {
             [dev->stage_lock unlock];
             return false;   // no buffer: caller falls back to the direct path
@@ -3890,7 +3901,12 @@ bool ggml_metal_device_stage_get(ggml_metal_device_t dev, struct ggml_metal_buff
         // staging buffer instead of one per read
         if (dev->stage_batch_n == 16 || dev->stage_batch_used + size > ggml_metal_stage_batch_cap()) {
             ggml_metal_device_stage_batch_flush(dev);
+        }
+        if (dev->stage_batch_cmd == nil) {
             // the caller sits in an autorelease pool that drains before the batch ends
+            dev->stage_batch_cmd = [[dev->mtl_queue commandBufferWithUnretainedReferences] retain];
+            dev->stage_batch_enc = [[dev->stage_batch_cmd blitCommandEncoder] retain];
+        }
         [dev->stage_batch_enc copyFromBuffer:bid_src.metal
                                 sourceOffset:bid_src.offs
                                     toBuffer:dev->stage_buf

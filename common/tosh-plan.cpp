@@ -62,6 +62,8 @@ struct moe_info {
     // sliding-window cache of one sequence per cache element size: what a context checkpoint holds
     double swa_elems = 0;
     int    n_swa     = 0;
+    // recurrent state of one sequence, every recurrent layer: what a hybrid model's checkpoint holds
+    double recr_elems = 0;
     int    n_split   = 1;
     std::string error;          // the model's metadata could not be read completely
 };
@@ -133,6 +135,17 @@ moe_info read_moe_info(const char * path) {
             }
             mi.swa_elems += (double) heads*(kl + vl);
         }
+    }
+    const int d_state = u32_or(arch + ".ssm.state_size", 0);
+    const int d_inner = u32_or(arch + ".ssm.inner_size", 0);
+    if (d_state > 0 && d_inner > 0 && mi.n_layer > 0) {
+        const int d_conv   = u32_or(arch + ".ssm.conv_kernel", 0);
+        const int n_group  = u32_or(arch + ".ssm.group_count", 0);
+        const int interval = u32_or(arch + ".full_attention_interval", 0);
+        const int n_main   = mi.n_layer - u32_or(arch + ".nextn_predict_layers", 0);
+        int n_recr = 0;
+        for (int il = 0; il < n_main; ++il) n_recr += interval <= 0 || (il + 1) % interval != 0;
+        mi.recr_elems = (double) n_recr*((double) std::max(0, d_conv - 1)*(d_inner + 2*n_group*d_state) + (double) d_state*d_inner);
     }
     const int64_t sid = gguf_find_key(g, "split.count");
     mi.n_split = sid < 0 ? 1 : std::max(1, (int) gguf_get_val_u16(g, sid));
@@ -532,6 +545,47 @@ static void plan_emit(const tosh_plan & p) {
         printf("%s\n", tosh_plan_json(p).c_str());
         fflush(stdout);
         exit(p.state == TOSH_PLAN_UNSUPPORTED ? 2 : 0);
+    }
+}
+
+// a recurrent state is checkpointed exact when at least this many checkpoints fit, in 8 bits below that
+static constexpr int RS_EXACT_MIN_CHECKPOINTS = 8;
+// what a plan keeps even when the model takes its whole budget: this turn's checkpoints and the last one's
+static constexpr int RS_MIN_CHECKPOINTS = 4;
+
+// sets TOSH_RS_STATE_TYPE for the server when it was not set by hand; returns the checkpoint size it chose
+static double rs_checkpoint_mib(double left_mib, double fixed_mib, double recr_elems, int n_wanted) {
+    const char * rs = getenv("TOSH_RS_STATE_TYPE");
+    if (rs != nullptr || recr_elems <= 0) {
+        const std::string t = rs ? rs : "f32";
+        const double b = t == "f32" ? 4.0 : t == "f16" || t == "bf16" ? 2.0 : 34.0/32.0;
+        return fixed_mib + recr_elems*b/MiB;
+    }
+    const double exact = fixed_mib + recr_elems*4.0/MiB;
+    if (left_mib >= std::min(n_wanted, RS_EXACT_MIN_CHECKPOINTS)*exact) {
+        return exact;
+    }
+    setenv("TOSH_RS_STATE_TYPE", "q8_0", 1);
+    LOG_WRN("%s: %.0f MiB left for checkpoints holds fewer than %d exact ones of %.1f MiB, keeping them in 8 bits\n",
+            __func__, left_mib, RS_EXACT_MIN_CHECKPOINTS, exact);
+    return fixed_mib + recr_elems*34.0/32.0/MiB;
+}
+
+void tosh_plan_checkpoints(common_params & params) {
+    if (params.n_ctx_checkpoints <= 0 || params.model.path.empty()) {
+        return;
+    }
+    const moe_info mi = read_moe_info(params.model.path.c_str(), params.lazy_mode);
+    if (!mi.error.empty() || mi.recr_elems <= 0) {
+        return;
+    }
+    const double left = read_host_info().available_mib - HOST_MARGIN_MIB;
+    const double ckpt = rs_checkpoint_mib(left, 0.0, mi.recr_elems, params.n_ctx_checkpoints);
+    const int fit = (int) std::max(0.0, std::floor(left/ckpt));
+    if (fit < params.n_ctx_checkpoints) {
+        LOG_WRN("%s: %d context checkpoints of %.1f MiB fit in %.0f MiB free, down from %d\n",
+                __func__, fit, ckpt, left, params.n_ctx_checkpoints);
+        params.n_ctx_checkpoints = fit;
     }
 }
 
@@ -967,7 +1021,20 @@ bool tosh_plan_apply(common_params & params, tosh_plan * out) {
     // the server keeps context checkpoints and a prompt cache in RAM; they take what the plan leaves,
     // checkpoints first since they spare re-reading a conversation, and the model before both
     double left = runtime ? p.effective_mib - p.host_required_mib : hi.available_mib - HOST_MARGIN_MIB - p.host_required_mib;
+    if (sel && (mi.swa_elems > 0 || mi.recr_elems > 0) && params.n_ctx_checkpoints > 0) {
+        const double swa_mib = mi.swa_elems*(mi.n_swa + sel->ubatch)*ggml_type_size(sel->kv)/ggml_blck_size(sel->kv)/MiB;
+        p.checkpoint_mib = rs_checkpoint_mib(left, swa_mib, mi.recr_elems, params.n_ctx_checkpoints);
         p.n_ctx_checkpoints = std::min(params.n_ctx_checkpoints, (int) std::max(0.0, std::floor(left/p.checkpoint_mib)));
+        // the next turn restores one of the last checkpoints, and with none a hybrid model re-reads the whole
+        // conversation: a few come out of what the load leaves to the system
+        const int n_min = std::min(params.n_ctx_checkpoints, RS_MIN_CHECKPOINTS);
+        if (p.n_ctx_checkpoints < n_min) {
+            const double extra = (n_min - p.n_ctx_checkpoints)*p.checkpoint_mib;
+            if (p.projected_left_mib - extra >= HOST_MARGIN_MIB) {
+                p.n_ctx_checkpoints = n_min;
+                p.projected_left_mib -= extra;
+            }
+        }
         if (p.n_ctx_checkpoints < params.n_ctx_checkpoints) p.warnings.push_back("CONTEXT_CHECKPOINTS_REDUCED");
         left -= p.n_ctx_checkpoints*p.checkpoint_mib;
         p.projected_rss_mib += p.n_ctx_checkpoints*p.checkpoint_mib;
