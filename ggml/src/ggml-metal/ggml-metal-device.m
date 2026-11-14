@@ -2879,14 +2879,15 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 ggml_is_contiguous_rows(op->src[1]) &&
                 ggml_is_contiguous_rows(op->src[2]);
         case GGML_OP_DSV4_HC_PRE:
-            return has_simdgroup_reduction &&
+            return (has_simdgroup_reduction || wave64_decode) &&
                 op->src[0]->type == GGML_TYPE_F32 &&
                 op->src[1]->type == GGML_TYPE_F32 &&
                 op->type         == GGML_TYPE_F32 &&
                 ggml_is_contiguous_rows(op->src[0]) &&
                 ggml_is_contiguous_rows(op->src[1]);
         case GGML_OP_DSV4_HC_POST:
-            return has_simdgroup_reduction &&
+            // 64-lane cards only have the kernel without a combination matrix
+            return (has_simdgroup_reduction || (wave64_decode && op->src[3] == NULL)) &&
                 op->src[0]->type == GGML_TYPE_F32 &&
                 op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 &&
