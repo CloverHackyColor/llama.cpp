@@ -81,6 +81,15 @@ struct server_mcp_transport {
                    const std::function<bool()> & should_stop,
                    const std::function<void(const json &)> & on_progress = nullptr);
 
+    // whether the server answers a ping within ms: a slow server still does, a hung one does not
+    bool ping(int ms);
+
+    std::atomic<int>  timeouts{0};     // calls in a row that timed out; any reply resets it
+    std::atomic<bool> draining{false}; // hung: takes no new calls, closed once the ones on it end
+    std::atomic<bool> pinging{false};
+    std::atomic<bool> drain_noted{false}; // the manager has taken it out of service
+    std::atomic<int>  in_flight{0};
+
 protected:
     // per-transport: guards the tool list and the members below; a tool call holds it only to take its id,
     // so a long call (the Tosh agent's turn) does not stall the calls of other clients
@@ -109,7 +118,8 @@ protected:
 
     bool ensure_init(const std::function<bool()> & should_stop); // initialize handshake, once; without rpc_mutex
     json send_rpc(const json & request, const std::function<bool()> & should_stop,
-                  const std::function<void(const json &)> & on_progress = nullptr); // returns the reply or an {"error": ...}
+                  const std::function<void(const json &)> & on_progress = nullptr,
+                  int deadline_ms = 0); // returns the reply or an {"error": ...}; 0 waits timeout_ms
 };
 
 //
@@ -190,6 +200,8 @@ private:
     // shared_ptr: call_tool() hands a transport to the caller and drops the lock for the blocking RPC, so a concurrent evict/respawn must not destroy it mid-call
     std::map<std::string, std::shared_ptr<server_mcp_transport>> transports;
     std::map<std::string, std::chrono::steady_clock::time_point> dead_servers; // spawn-failure cooldown
+    std::map<std::string, int> hangs; // processes in a row found hung, per server; a call answered resets it
+    std::vector<std::shared_ptr<server_mcp_transport>> drained; // hung transports finishing the calls they had
     std::vector<server_mcp_tool_def> registry;
 
     std::atomic<bool> stopping{false};
@@ -202,4 +214,7 @@ private:
 
     // nullptr during cooldown or shutdown
     std::shared_ptr<server_mcp_transport> get_or_create(const std::string & name);
+
+    // after a call: a transport found hung leaves service, and one with no calls left on it is closed
+    void after_call(const std::string & name, const std::shared_ptr<server_mcp_transport> & transport, const json & out);
 };

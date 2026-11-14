@@ -213,7 +213,7 @@ static json mcp_result_to_response(const json & result) {
 }
 
 json server_mcp_transport::send_rpc(const json & request, const std::function<bool()> & should_stop,
-                                    const std::function<void(const json &)> & on_progress) {
+                                    const std::function<void(const json &)> & on_progress, int deadline_ms) {
     const bool has_id = request.contains("id");
     const std::string key = has_id ? request.at("id").dump() : "";
     // nothing is sent for a caller that already went away
@@ -235,7 +235,7 @@ json server_mcp_transport::send_rpc(const json & request, const std::function<bo
         return {{"error", {{"code", -32603}, {"message", "transport closed"}}}};
     }
 
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(deadline_ms > 0 ? deadline_ms : timeout_ms);
     auto stop = [&]() {
         return (should_stop && should_stop()) || std::chrono::steady_clock::now() >= deadline;
     };
@@ -322,6 +322,7 @@ json server_mcp_transport::send_rpc(const json & request, const std::function<bo
     const bool closed = demux_closed;
     lk.unlock();
     if (got) {
+        timeouts = 0;
         return reply;
     }
 
@@ -338,12 +339,14 @@ json server_mcp_transport::send_rpc(const json & request, const std::function<bo
     }
     if (std::chrono::steady_clock::now() >= deadline) {
         cancel("request timed out");
+        timeouts++;
         return {{"error", {{"code", -32603}, {"message", "request timed out"}}}};
     }
     return {{"error", {{"code", -32603}, {"message", "transport closed"}}}};
 }
 
 static constexpr int MCP_INIT_RETRY_SECONDS = 5;
+static constexpr int MCP_PING_MS = 5000;
 
 bool server_mcp_transport::ensure_init(const std::function<bool()> & should_stop) {
     {
@@ -444,6 +447,10 @@ json server_mcp_transport::call_tool(const std::string & tool_name,
             }
         }
     }
+    // a call that waited behind a hung one was never sent: the manager hands it to a fresh process
+    if (draining) {
+        return {{"error", "transport drained"}};
+    }
     const bool ready = ensure_init(should_stop);
     json req;
     {
@@ -463,12 +470,38 @@ json server_mcp_transport::call_tool(const std::string & tool_name,
     }
     json resp = send_rpc(req, should_stop, on_progress);
     if (resp.contains("error")) {
-        return {{"error", rpc_error_message(resp)}};
+        const std::string message = rpc_error_message(resp);
+        // a ping sent while this call still holds the lane tells a slow server from a hung one before the next call goes
+        if (message == "request timed out" && timeouts >= 2 && !draining && !pinging.exchange(true)) {
+            if (ping(MCP_PING_MS)) {
+                timeouts = 0;
+                SRV_WRN("MCP '%s': two calls in a row timed out but it answers a ping; it is slow, not hung\n", name.c_str());
+            } else {
+                draining = true;
+            }
+            pinging = false;
+        }
+        return {{"error", message}};
     }
     if (resp.contains("result")) {
         return mcp_result_to_response(resp.at("result"));
     }
     return {{"error", "invalid response from MCP server"}};
+}
+
+bool server_mcp_transport::ping(int ms) {
+    json req;
+    {
+        std::lock_guard<std::mutex> lock(rpc_mutex);
+        req = {{"jsonrpc", "2.0"}, {"id", next_id++}, {"method", "ping"}};
+    }
+    const json resp = send_rpc(req, nullptr, nullptr, ms);
+    if (resp.contains("result")) {
+        return true;
+    }
+    // an error the server itself sends, such as an unknown method, still shows it is reading
+    const std::string message = rpc_error_message(resp);
+    return message != "request timed out" && message != "transport closed" && message != "cancelled";
 }
 
 //
@@ -766,6 +799,8 @@ void server_mcp_stdio::join_pumps() {
 //
 
 static constexpr int MCP_COOLDOWN_SECONDS = 5;
+static constexpr int MCP_HUNG_COOLDOWN_SECONDS = 10;  // doubles for each process in a row found hung
+static constexpr int MCP_HUNG_COOLDOWN_MAX_SECONDS = 300;
 static constexpr int MCP_WARMUP_TIMEOUT_SECONDS = 10; // cap per-server tool discovery at startup
 
 server_mcp::~server_mcp() {
@@ -778,6 +813,10 @@ server_mcp::~server_mcp() {
             to_close.push_back(std::move(t));
         }
         transports.clear();
+        for (auto & t : drained) {
+            to_close.push_back(std::move(t));
+        }
+        drained.clear();
     }
     for (auto & t : to_close) {
         t->close();
@@ -878,15 +917,61 @@ json server_mcp::call_tool(const std::string & server_name,
                            const json & arguments,
                            const std::function<bool()> & should_stop,
                            const std::function<void(const json &)> & on_progress) {
-    auto transport = get_or_create(server_name);
-    if (!transport) {
-        return {{"error", "MCP server unavailable: " + server_name}};
-    }
-
     auto stop = [this, &should_stop]() {
         return stopping.load() || (should_stop && should_stop());
     };
-    return transport->call_tool(tool_name, arguments, stop, on_progress);
+    // a call that was never sent because its transport was found hung goes once to the fresh process
+    for (int attempt = 0; ; attempt++) {
+        auto transport = get_or_create(server_name);
+        if (!transport) {
+            return {{"error", "MCP server unavailable: " + server_name}};
+        }
+        transport->in_flight++;
+        json out = transport->call_tool(tool_name, arguments, stop, on_progress);
+        after_call(server_name, transport, out);
+        const bool drained_before_sent = out.contains("error") && out.at("error") == "transport drained";
+        if (!drained_before_sent || attempt > 0) {
+            return out;
+        }
+    }
+}
+
+void server_mcp::after_call(const std::string & name, const std::shared_ptr<server_mcp_transport> & transport, const json & out) {
+    const int left = --transport->in_flight;
+    if (!out.contains("error")) {
+        std::lock_guard<std::mutex> lock(mutex);
+        hangs.erase(name);
+    }
+    if (transport->draining && !transport->drain_noted.exchange(true)) {
+        std::lock_guard<std::mutex> lock(mutex);
+        auto it = transports.find(name);
+        if (it != transports.end() && it->second == transport) {
+            transports.erase(it);
+        }
+        drained.push_back(transport);
+        const int n = ++hangs[name];
+        if (n >= 2) {
+            const int seconds = std::min(MCP_HUNG_COOLDOWN_MAX_SECONDS, MCP_HUNG_COOLDOWN_SECONDS << std::min(n - 2, 5));
+            dead_servers[name] = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
+            SRV_WRN("MCP '%s' hung again after a restart: not started again for %d s\n", name.c_str(), seconds);
+        } else {
+            SRV_WRN("MCP '%s' does not answer: new calls go to a fresh process, the old one closes when its calls end\n", name.c_str());
+        }
+    }
+    if (transport->draining && left <= 0) {
+        bool mine = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            auto it = std::find(drained.begin(), drained.end(), transport);
+            if (it != drained.end()) {
+                drained.erase(it);
+                mine = true;
+            }
+        }
+        if (mine) {
+            transport->close();
+        }
+    }
 }
 
 std::shared_ptr<server_mcp_transport> server_mcp::get_or_create(const std::string & name) {
