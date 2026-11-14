@@ -593,7 +593,10 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 
         // output
         if (std::regex_match(tensor_name, pattern_output_weight)) {
-            if (is_dsv4) {
+            // A DFlash draft has no head of its own: its selector runs a top-k over the target's
+            // logits, and a head split by vocabulary leaves no device holding a whole row of them.
+            // The caller sets this when it pairs such a draft with a tensor split.
+            if (is_dsv4 || getenv("TOSH_MIRROR_OUTPUT_HEAD") != nullptr) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
             }
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
