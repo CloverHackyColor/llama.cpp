@@ -2118,7 +2118,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s,
-         ggml_tensor * selected_experts_in) const {
+         ggml_tensor * selected_experts_in,
+         ggml_tensor * overlap) const {
     return build_moe_ffn(
         cur,
         gate_inp,  /* gate_inp_b  */ nullptr,
@@ -2139,7 +2140,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         up_exps_s,
         gate_exps_s,
         down_exps_s,
-        selected_experts_in
+        selected_experts_in,
+        overlap
     );
 }
 
@@ -2167,7 +2169,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s,
-         ggml_tensor * selected_experts_in) const {
+         ggml_tensor * selected_experts_in,
+         ggml_tensor * overlap) const {
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
@@ -2358,6 +2361,18 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
+
+#ifdef TOSH_ENABLE_DYNAMIC_MOE
+    // work that reads none of the routed experts goes between the publish and the join, where the
+    // GPU would otherwise wait for the host's share
+    static const bool overlap_off = getenv("TOSH_DMOE_OVERLAP_DISABLE") != nullptr;
+    if (overlap != nullptr && !overlap_off && (dmoe_slots != nullptr || dmoe_wide != nullptr)) {
+        ggml_build_forward_expand(gf, expert_ids);
+        ggml_build_forward_expand(gf, overlap);
+    }
+#else
+    GGML_UNUSED(overlap);
+#endif
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
