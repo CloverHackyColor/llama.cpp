@@ -1616,10 +1616,11 @@ ggml_tensor * llm_graph_context::build_hadamard_lookup(
 }
 
 ggml_tensor * llm_graph_context::build_mtp_head(
-        const llama_vocab & vocab,
+        const llama_model & model,
               ggml_tensor * head_w,
               ggml_tensor * head_s,
               ggml_tensor * cur) const {
+    const llama_vocab & vocab = model.vocab;
     const int64_t n_vocab = head_w->ne[1];
     // Qwen 3.x keeps the byte-level BPE ranks of its 151643-token predecessor first; the rows after
     // them are rarer scripts, which a draft seldom needs and every draft token pays to score
@@ -1632,7 +1633,9 @@ ggml_tensor * llm_graph_context::build_mtp_head(
         }
         return n_vocab;
     }();
-    if (rows <= 0 || n_vocab <= 200000 || rows >= n_vocab || head_s != nullptr || n_vocab - tail > 4096) {
+    // views of a head split across GPUs by tensor break the fused allreduce boundary
+    if (rows <= 0 || n_vocab <= 200000 || rows >= n_vocab || head_s != nullptr || n_vocab - tail > 4096 ||
+            model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
         return build_lora_mm(head_w, cur, head_s);
     }
     ggml_tensor * head = ggml_mul_mat(ctx0, ggml_view_2d(ctx0, head_w, head_w->ne[0], rows, head_w->nb[1], 0), cur);

@@ -1104,7 +1104,7 @@ struct llm_graph_context {
     // logits of a draft head over the frequent prefix of a large vocabulary plus the control
     // tokens at its end; the rest stay 0, which a top candidate always beats
     ggml_tensor * build_mtp_head(
-        const llama_vocab & vocab,
+        const llama_model & model,
               ggml_tensor * head_w,
               ggml_tensor * head_s,
               ggml_tensor * cur) const;
