@@ -462,6 +462,7 @@ extern "C" {
     enum ggml_op_hint {
         GGML_HINT_NONE             = 0,
         GGML_HINT_SRC0_IS_HADAMARD = 1,
+        GGML_HINT_GRADIENT         = 2, // the product is a gradient: backends that sum in half accumulate in f32
     };
 
     // model file types
@@ -615,6 +616,12 @@ extern "C" {
         GGML_OP_TOSH_DMOE_PUBLISH,
         GGML_OP_TOSH_DMOE_JOIN,
         GGML_OP_TOSH_DMOE_OBSERVE,
+
+        GGML_OP_COUNT_EQUAL_MASKED,
+        GGML_OP_CROSS_ENTROPY_ROWS,
+        GGML_OP_CROSS_ENTROPY_ROWS_BACK,
+        GGML_OP_FLASH_ATTN_EXT_BACK,
+        GGML_OP_GATED_DELTA_NET_BACK,
 
         GGML_OP_COUNT,
     };
@@ -1094,6 +1101,13 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
+
+    // number of rows where a equals b and the mask is set
+    GGML_API struct ggml_tensor * ggml_count_equal_masked(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,  // predictions, i32 [n]
+            struct ggml_tensor  * b,  // targets, i32 [n]
+            struct ggml_tensor  * c); // mask, f32 [n]: 1 for rows to count, 0 to skip
 
     // if a is the same shape as b, and a is not parameter, return a
     // otherwise, return a new tensor: repeat(a) to fit in b
@@ -2575,6 +2589,28 @@ extern "C" {
            struct ggml_tensor  * d,
            bool                  masked);
 
+    enum ggml_flash_attn_ext_back_target {
+        GGML_FLASH_ATTN_EXT_BACK_STATS = 0, // [2, n_batch, n_head, ne3]: (logsumexp, dot(grad_o, o)) per q row
+        GGML_FLASH_ATTN_EXT_BACK_DQ    = 1, // same shape as q
+        GGML_FLASH_ATTN_EXT_BACK_DKV   = 2, // [n_embd_k, n_kv, n_head_kv, 2*ne3]: dk in ne3 [0, ne3), dv in [ne3, 2*ne3)
+    };
+
+    // backward of ggml_flash_attn_ext in 3 passes, the softmax is recomputed per row
+    // o:      the ggml_flash_attn_ext result, its op_params are reused
+    // grad_o: gradient of o, same shape
+    // stats:  result of the STATS target, NULL for STATS
+    // requires n_embd_k == n_embd_v, no sinks, max_bias == 0, logit_softcap == 0
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_back(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * o,
+            struct ggml_tensor  * grad_o,
+            struct ggml_tensor  * stats,
+            enum ggml_flash_attn_ext_back_target target);
+
     GGML_API struct ggml_tensor * ggml_ssm_conv(
             struct ggml_context * ctx,
             struct ggml_tensor  * sx,
@@ -2716,6 +2752,13 @@ extern "C" {
     // g and beta arrive before their activations (scalar gate only):
     //   beta -> sigmoid(beta), g -> a[h] * softplus(g + dt_bias[h])
     // dt_bias and a are F32 with one value per head
+    // backward of ggml_gated_delta_net with a scalar gate: the gradients of q, k, v, g, beta and the initial state,
+    // packed in that order in one f32 vector; grad is the gradient of the op's output (its state rows are ignored)
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_back(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * gdn,
+            struct ggml_tensor  * grad);
+
     GGML_API void ggml_gated_delta_net_set_raw_gates(
             struct ggml_tensor  * gdn,
             struct ggml_tensor  * dt_bias,
@@ -2891,6 +2934,25 @@ extern "C" {
             struct ggml_tensor  * a,  // logits
             struct ggml_tensor  * b,  // labels
             struct ggml_tensor  * c); // gradients of cross_entropy_loss result
+
+    // cross-entropy of each row of logits against one label index per row: logsumexp(a[:, r]) - a[b[r], r]
+    GGML_API struct ggml_tensor * ggml_cross_entropy_rows(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,  // logits, f32 [n_classes, n]
+            struct ggml_tensor  * b); // labels, i32 [n]
+    GGML_API struct ggml_tensor * ggml_cross_entropy_rows_back(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,  // gradient of each row's loss, f32 [n]
+            struct ggml_tensor  * b,  // logits, f32 [n_classes, n]
+            struct ggml_tensor  * c); // labels, i32 [n]
+
+    // mean cross-entropy over the rows whose mask is set (assistant-only loss for instruction tuning),
+    // 0 when no row is: sum(rows*mask) / max(sum(mask), 1)
+    GGML_API struct ggml_tensor * ggml_cross_entropy_loss_masked(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,  // logits, f32 [n_classes, n]
+            struct ggml_tensor  * b,  // labels, i32 [n]
+            struct ggml_tensor  * c); // mask, f32 [n]: 1 for rows in the loss, 0 for the rest
 
     // AdamW optimizer step
     // Paper: https://arxiv.org/pdf/1711.05101v3.pdf

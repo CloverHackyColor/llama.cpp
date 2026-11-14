@@ -1927,6 +1927,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_count_equal(params, tensor);
             } break;
+        case GGML_OP_COUNT_EQUAL_MASKED:
+            {
+                ggml_compute_forward_count_equal_masked(params, tensor);
+            } break;
         case GGML_OP_REPEAT:
             {
                 ggml_compute_forward_repeat(params, tensor);
@@ -2190,6 +2194,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_gated_delta_net(params, tensor);
             } break;
+        case GGML_OP_GATED_DELTA_NET_BACK:
+            {
+                ggml_compute_forward_gated_delta_net_back(params, tensor);
+            } break;
         case GGML_OP_TURBO_WHT:
             {
                 ggml_compute_forward_turbo_wht(params, tensor);
@@ -2238,6 +2246,20 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
             {
                 ggml_compute_forward_cross_entropy_loss_back(params, tensor);
+            }
+            break;
+        case GGML_OP_CROSS_ENTROPY_ROWS:
+            {
+                ggml_compute_forward_cross_entropy_rows(params, tensor);
+            }
+            break;
+        case GGML_OP_FLASH_ATTN_EXT_BACK:
+            {
+                ggml_compute_forward_flash_attn_ext_back(params, tensor);
+            } break;
+        case GGML_OP_CROSS_ENTROPY_ROWS_BACK:
+            {
+                ggml_compute_forward_cross_entropy_rows_back(params, tensor);
             }
             break;
         case GGML_OP_OPT_STEP_ADAMW:
@@ -2384,12 +2406,14 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_SUM_ROWS:
         case GGML_OP_MEAN:
         case GGML_OP_ARGMAX:
+        case GGML_OP_COUNT_EQUAL_MASKED:
             {
                 n_tasks = 1;
             } break;
         case GGML_OP_COUNT_EQUAL:
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_GATED_DELTA_NET:
+        case GGML_OP_GATED_DELTA_NET_BACK:
         case GGML_OP_TURBO_WHT:
         case GGML_OP_DSV4_HC_COMB:
         case GGML_OP_DSV4_HC_PRE:
@@ -2532,6 +2556,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_ARGSORT:
         case GGML_OP_TOP_K:
         case GGML_OP_FLASH_ATTN_EXT:
+        case GGML_OP_FLASH_ATTN_EXT_BACK:
         case GGML_OP_FLASH_ATTN_BACK:
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
@@ -2594,6 +2619,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
             } break;
         case GGML_OP_CROSS_ENTROPY_LOSS:
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
+        case GGML_OP_CROSS_ENTROPY_ROWS:
+        case GGML_OP_CROSS_ENTROPY_ROWS_BACK:
         case GGML_OP_OPT_STEP_ADAMW:
         case GGML_OP_OPT_STEP_SGD:
             {
@@ -3128,12 +3155,29 @@ struct ggml_cplan ggml_graph_plan(
                     {
                         cur = ggml_type_size(node->type)*(n_tasks + node->src[0]->ne[0]*n_tasks);
                     } break;
+                case GGML_OP_FLASH_ATTN_EXT_BACK:
+                    {
+                        const int64_t DK = node->src[1]->ne[0];
+                        const int64_t DV = node->src[2]->ne[0];
+
+                        // per-thread F32 copy of one K row and one V row
+                        cur = sizeof(float)*(DK + DV + CACHE_LINE_SIZE_F32)*n_tasks;
+                    } break;
                 case GGML_OP_GATED_DELTA_NET:
                     {
                         const int64_t S_v = node->src[2]->ne[0];
                         const int64_t K   = ggml_get_op_params_i32(node, 0);
                         const int64_t per_thread = S_v + (K > 1 ? S_v * S_v : 0);
                         cur = per_thread * sizeof(float) * n_tasks;
+                    } break;
+                case GGML_OP_GATED_DELTA_NET_BACK:
+                    {
+                        // per thread: the state at each chunk start, the states of one chunk, and the running dS
+                        const int64_t S_v = node->src[2]->ne[0];
+                        const int64_t T   = node->src[2]->ne[2];
+                        const int64_t C   = 64;
+                        const int64_t n_chunks = (T + C - 1)/C;
+                        cur = sizeof(float)*((n_chunks + C + 3)*S_v*S_v + 8*S_v + CACHE_LINE_SIZE_F32)*n_tasks;
                     } break;
                 case GGML_OP_TURBO_WHT:
                     {

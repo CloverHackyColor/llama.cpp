@@ -2635,6 +2635,8 @@ bool ggml_op_alloc_size_may_expand(enum ggml_op op) {
         case GGML_OP_CUMSUM:
         case GGML_OP_ARGSORT:
         case GGML_OP_TOP_K:
+        case GGML_OP_GATED_DELTA_NET_BACK:
+        case GGML_OP_OUT_PROD:
             return true;
         default:
             return false;
