@@ -455,7 +455,8 @@ export class ChatService {
 		abortSignal?: AbortSignal,
 		onConnectionState?: (state: StreamConnectionState) => void,
 		streamModel?: string | null,
-		onTosh?: (tosh: ToshChunk) => void
+		onTosh?: (tosh: ToshChunk) => void,
+		maxTokens?: number
 	): Promise<void> {
 		let reader = response.body?.getReader();
 
@@ -670,6 +671,12 @@ export class ChatService {
 								// the Tosh agent's progress and metadata; a retract drops the text streamed so far
 								if (parsed.tosh && typeof parsed.tosh === 'object') {
 									const event = parsed.tosh.event;
+									const used = parsed.tosh.context?.used;
+
+									// an agent's answer has no timings: the context meter reads its count instead
+									if (!event && typeof used === 'number' && !lastTimings) {
+										lastTimings = { prompt_n: used, cache_n: 0, predicted_n: 0 };
+									}
 
 									if (event?.type === 'retract') {
 										aggregatedContent = '';
@@ -761,7 +768,13 @@ export class ChatService {
 
 				if (streamFinished) break;
 
-				if (!conversationId) break;
+				if (!conversationId) {
+					onConnectionState?.(StreamConnectionState.LOST);
+					streamError = new Error('The connection ended before the answer did');
+					streamFinished = true;
+
+					break;
+				}
 
 				if (!madeProgress) {
 					onConnectionState?.(StreamConnectionState.LOST);
@@ -797,7 +810,12 @@ export class ChatService {
 
 				const newReader = resumeResp.body?.getReader();
 
-				if (!newReader) break;
+				if (!newReader) {
+					onConnectionState?.(StreamConnectionState.LOST);
+					onError?.(new Error('Stream connection lost and could not be resumed'));
+
+					break;
+				}
 
 				try {
 					reader.releaseLock();
@@ -836,9 +854,14 @@ export class ChatService {
 					return;
 				}
 
-				// an answer cut at its token limit says so, unless the agent already did
+				// an answer cut at its token limit says so, unless the agent already did; one that wrote fewer
+				// tokens than it was allowed was cut by the context
 				if (finishReason === 'length' && aggregatedContent && !/incomplet[ae]\._\s*$/.test(aggregatedContent)) {
-					const note = '\n\n_The answer was cut at the limit of tokens per answer, so it is incomplete._';
+					const written = lastTimings?.predicted_n ?? 0;
+					const byContext = !!maxTokens && maxTokens > 0 && written > 0 && written < maxTokens;
+					const note = byContext
+						? "\n\n_The answer was cut when the conversation filled the model's context, so it is incomplete._"
+						: '\n\n_The answer was cut at the limit of tokens per answer, so it is incomplete._';
 
 					aggregatedContent += note;
 
@@ -1371,7 +1394,8 @@ export class ChatService {
 					signal,
 					onConnectionState,
 					options.model,
-					onTosh
+					onTosh,
+					options.max_tokens ?? undefined
 				);
 
 				return;

@@ -48,6 +48,8 @@ export interface ToshChunk {
 	sketches?: ToshSketch[];
 	map_request?: ToshMapRequest;
 	map?: { layers: ToshMapLayer[] };
+	/** How full the context is after the turn, as the engine counted it. */
+	context?: { used?: number | null; n_ctx?: number | null; left_out?: number };
 	[key: string]: unknown;
 }
 
