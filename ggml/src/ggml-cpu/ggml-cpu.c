@@ -1567,6 +1567,48 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
 
     float tmp[16];
 
+    // a few tokens on one expert (decode, a verify window): unpack each weight block once for all of them
+    static ggml_vec_dot_multi_t multi_cache[GGML_TYPE_COUNT];
+    static bool multi_init[GGML_TYPE_COUNT];
+    if (!multi_init[type]) {
+        multi_cache[type] = getenv("GGML_CPU_NO_MULTI_DOT") ? NULL : ggml_get_vec_dot_multi(type);
+        multi_init[type] = true;
+    }
+    ggml_vec_dot_multi_t const vec_dot_multi = multi_cache[type];
+
+    if (vec_dot_multi != NULL && ir1_end - ir1_start >= 2) {
+        const void * cols[16];
+        float * dsts[16];
+        float res[4];
+        for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
+            int nc = 0;
+            for (int64_t ir1 = iir1; ir1 < iir1 + blck_1 && ir1 < ir1_end; ++ir1, ++nc) {
+                struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, ir1);
+                const int64_t i11 = row_mapping.i1 % ne11;
+                const int64_t i12 = row_mapping.i2;
+                cols[nc] = (const char *) wdata +
+                    (src1_cont || src1->type != vec_dot_type
+                    ? (i11      + i12*ne11)*row_size
+                    : (i11*nb11 + i12*nb12));
+                dsts[nc] = (float *) ((char *) dst->data + (row_mapping.i1*nb1 + i12*nb2));
+            }
+            for (int64_t ir0 = ir0_start; ir0 < ir0_end; ++ir0) {
+                for (int c0 = 0; c0 < nc; c0 += 4) {
+                    const int k = MIN(4, nc - c0);
+                    if (k == 1) {
+                        vec_dot(ne00, res, 0, src0_cur + ir0*nb01, 0, cols[c0], 0, 1);
+                    } else {
+                        vec_dot_multi(ne00, k, res, src0_cur + ir0*nb01, cols + c0);
+                    }
+                    for (int c = 0; c < k; ++c) {
+                        dsts[c0 + c][ir0] = res[c];
+                    }
+                }
+            }
+        }
+        return;
+    }
+
     for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
         for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
             for (int64_t ir1 = iir1; ir1 < iir1 + blck_1 && ir1 < ir1_end; ++ir1) {
@@ -3618,6 +3660,7 @@ static void ggml_vec_dot_tq4_1s_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
     free(tmp); free(tmp2);
     *s = sum;
 }
+
 void ggml_cpu_fp32_to_fp32(const float * x, float * y, int64_t n) {
     memcpy(y, x, n * sizeof(float));
 }
@@ -4078,4 +4121,8 @@ void ggml_cpu_init(void) {
     }
 
     ggml_critical_section_end();
+}
+
+ggml_cpu_vec_dot_multi_t ggml_cpu_get_vec_dot_multi(enum ggml_type type) {
+    return getenv("GGML_CPU_NO_MULTI_DOT") ? NULL : (ggml_cpu_vec_dot_multi_t) ggml_get_vec_dot_multi(type);
 }
