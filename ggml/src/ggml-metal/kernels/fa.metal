@@ -3,11 +3,14 @@
 
 // AMD flash attention kernels; the upstream ones live in fa_*.metal
 // vec kernel above miscompiles. Generalized over the K/V element type via the
+// dequantize_*_t4 helpers; standard kernels cover their native dimensions and
+// TurboQuant kernels cover padded head dimensions 128/256/384/512/640.
 
 template<
     short DK, short NSG,
     typename k_t, short NKK, void (*deq_k)(device const k_t *, short, thread float4 &),
     typename v_t, short NKV, void (*deq_v)(device const v_t *, short, thread float4 &),
+    short NW = 32, short NWG = 1, short SUBWP = 0, short DVP = 0>
 kernel void kernel_flash_attn_ext_vec_amd(
         constant ggml_metal_kargs_flash_attn_ext_amd & args [[buffer(0)]],
         device const char * q     [[buffer(1)]],
@@ -21,12 +24,17 @@ kernel void kernel_flash_attn_ext_vec_amd(
         uint3  tgpig [[threadgroup_position_in_grid]],
         ushort tiisg [[thread_index_in_simdgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    constexpr short DV  = DVP ? DVP : DK;   // MLA has DK != DV (K carries the rope tail, V is the bare latent)
+    constexpr short DK4 = DK/4;
+    constexpr short DV4 = DV/4;   // float4 per head row (32 for DV=128, 64 for DV=256)
     // chunks per lane scale with the simd width; on wave64 with DK=128 the upper
     // lanes own no chunk (guarded below) but still join the simd_sum reductions.
     // heads narrower than the simd width would leave the upper lanes idle, so the
     // simdgroup splits into RPS sub-groups that each take their own cache row
     constexpr short SUBW = SUBWP ? SUBWP : (DV4 < NW ? DV4 : NW);
     constexpr short RPS  = NW/SUBW;
+    constexpr short NCV  = (DV4 + SUBW - 1)/SUBW;
+    constexpr short NCK  = (DK4 + SUBW - 1)/SUBW;
     constexpr short NG   = NSG*RPS;
     constexpr short GPL  = (NG + NW - 1)/NW;
     // NSG (simdgroups per threadgroup) is a template parameter, kept in sync with
@@ -77,9 +85,14 @@ kernel void kernel_flash_attn_ext_vec_amd(
     const short lch  = tiisg%SUBW;
     const short gidx = sgitg*RPS + sub;
 
+    float4 myq[NCK];  // this lane's slice(s) of the query
+    for (short c = 0; c < NCK; ++c) {
         const short ch = lch + c*SUBW;
         myq[c] = ch < DK4 ? q4[ch] : float4(0.0f);
     }
+
+    float4 acc[NCV];  // this lane's slice(s) of the output
+    for (short c = 0; c < NCV; ++c) {
         acc[c] = float4(0.0f);
     }
     float m = -FLT_MAX/2;
@@ -106,6 +119,7 @@ kernel void kernel_flash_attn_ext_vec_amd(
 
         device const k_t * kb = (device const k_t *) (kp + (uint64_t) i11a*args.nb11);
         float pl = 0.0f;
+        for (short c = 0; c < NCK; ++c) {
             const short ch = lch + c*SUBW;
             if (ch < DK4) {
                 float4 kreg;
@@ -128,6 +142,7 @@ kernel void kernel_flash_attn_ext_vec_amd(
         const float w    = msk ? 0.0f : exp(pp - nm);
 
         device const v_t * vb = (device const v_t *) (vp + (uint64_t) i11a*args.nb21);
+        for (short c = 0; c < NCV; ++c) {
             const short ch = lch + c*SUBW;
             if (ch < DV4) {
                 float4 vreg;
@@ -140,6 +155,7 @@ kernel void kernel_flash_attn_ext_vec_amd(
     }
 
     // publish this simdgroup's partials (acc, m, s) and merge in simdgroup 0
+    for (short c = 0; c < NCV; ++c) {
         const short ch = lch + c*SUBW;
         if (ch < DV4) {
             sh_acc[gidx*SAS + ch] = acc[c];
@@ -224,6 +240,10 @@ kernel void kernel_flash_attn_ext_vec_amd(
             ss[rid*(2*NWG) + 2*iwg + 1] = gm;
         }
     }
+}
+
+// ===== TurboQuant store: centroids + quantize + set_rows kernels =====
+
 typedef decltype(kernel_flash_attn_ext_vec_amd<128, 32, half4, 1, dequantize_f16_t4, half4, 1, dequantize_f16_t4>) flash_attn_ext_vec_amd_t;
 
 // narrowing subw doubles the chunks per lane; the register pressure caps the pipeline,
@@ -268,19 +288,46 @@ FA_AMD_PAIR_S(32, 8,  "kf16_vq8_0",        half4,          1,  dequantize_f16_t4
 FA_AMD_PAIR_S(24, 8,  "kf16_vq4_0",        half4,          1,  dequantize_f16_t4,      block_q4_0,     8,  dequantize_q4_0_t4)
 FA_AMD_PAIR_S(24, 8,  "kq8_0_vq4_0",       block_q8_0,     8,  dequantize_q8_0_t4_h2,     block_q4_0,     8,  dequantize_q4_0_t4)
 FA_AMD_PAIR_Q4("kq4_0_vq8_0",       block_q4_0,     8,  dequantize_q4_0_t4,     block_q8_0,     8,  dequantize_q8_0_t4_h2)
+// MLA (deepseek2): K is the latent plus the 64-wide rope tail (DK=576); V is the
+// bare latent (DV=512). Same cache tensor, so K and V share one type.
+#define FA_AMD_INST_ASYM(dk, dv, nsg, subw, nm, kt, nkk, dkf, vt, nkv, dvf) \
+template [[host_name("kernel_flash_attn_ext_vec_amd_dk" #dk "_dv" #dv "_" nm)]] kernel flash_attn_ext_vec_amd_t \
+    kernel_flash_attn_ext_vec_amd<dk, nsg, kt, nkk, dkf, vt, nkv, dvf, 32, 1, subw, dv>; \
+template [[host_name("kernel_flash_attn_ext_vec_amd_dk" #dk "_dv" #dv "_" nm "_wg32")]] kernel flash_attn_ext_vec_amd_t \
+    kernel_flash_attn_ext_vec_amd<dk, nsg, kt, nkk, dkf, vt, nkv, dvf, 32, 32, subw, dv>;
+FA_AMD_INST_ASYM(576, 512, 16, 32, "kf16_vf16",   half4,      1, dequantize_f16_t4,  half4,      1, dequantize_f16_t4)
 FA_AMD_INST_ASYM(576, 512, 16, 32, "kq8_0_vq8_0", block_q8_0, 8, dequantize_q8_0_t4_h2, block_q8_0, 8, dequantize_q8_0_t4_h2)
 FA_AMD_INST_ASYM(320, 256, 16, 16, "kf16_vf16",   half4,      1, dequantize_f16_t4,  half4,      1, dequantize_f16_t4)
 FA_AMD_INST_ASYM(320, 256, 16, 16, "kq8_0_vq8_0", block_q8_0, 8, dequantize_q8_0_t4_h2, block_q8_0, 8, dequantize_q8_0_t4_h2)
+#undef FA_AMD_INST_ASYM
+#define FA_AMD_INST_ASYM_W64(dk, dv, nsg, nm, kt, nkk, dkf, vt, nkv, dvf) \
+template [[host_name("kernel_flash_attn_ext_vec_amd_dk" #dk "_dv" #dv "_" nm "_w64")]] kernel flash_attn_ext_vec_amd_t \
+    kernel_flash_attn_ext_vec_amd<dk, nsg, kt, nkk, dkf, vt, nkv, dvf, 64, 1, 64, dv>; \
+template [[host_name("kernel_flash_attn_ext_vec_amd_dk" #dk "_dv" #dv "_" nm "_w64_wg32")]] kernel flash_attn_ext_vec_amd_t \
+    kernel_flash_attn_ext_vec_amd<dk, nsg, kt, nkk, dkf, vt, nkv, dvf, 64, 32, 64, dv>;
+FA_AMD_INST_ASYM_W64(576, 512, 8, "kf16_vf16",   half4,      1, dequantize_f16_t4,  half4,      1, dequantize_f16_t4)
 FA_AMD_INST_ASYM_W64(576, 512, 8, "kq8_0_vq8_0", block_q8_0, 8, dequantize_q8_0_t4_h2, block_q8_0, 8, dequantize_q8_0_t4_h2)
 FA_AMD_INST_ASYM_W64(320, 256, 8, "kf16_vf16",   half4,      1, dequantize_f16_t4,  half4,      1, dequantize_f16_t4)
 FA_AMD_INST_ASYM_W64(320, 256, 8, "kq8_0_vq8_0", block_q8_0, 8, dequantize_q8_0_t4_h2, block_q8_0, 8, dequantize_q8_0_t4_h2)
+#undef FA_AMD_INST_ASYM_W64
 // wave64 (AMD GCN/Vega): 64-lane simdgroups, so nsg is the host's base count for the
 // head halved (host dispatches simd_width*nsg); a mismatch corrupts the merge. Host
 // appends "_w64". Untested on real GCN/Vega, needs a hardware pass before release.
 #define FA_AMD_INST_W64(dk, nsg, nm, kt, nkk, dkf, vt, nkv, dvf) \
 template [[host_name("kernel_flash_attn_ext_vec_amd_dk" #dk "_" nm "_w64")]] kernel flash_attn_ext_vec_amd_t \
     kernel_flash_attn_ext_vec_amd<dk, nsg, kt, nkk, dkf, vt, nkv, dvf, 64>;
+#define FA_AMD_INST_W64_S(dk, nsg, subw, nm, kt, nkk, dkf, vt, nkv, dvf) \
+template [[host_name("kernel_flash_attn_ext_vec_amd_dk" #dk "_" nm "_w64")]] kernel flash_attn_ext_vec_amd_t \
+    kernel_flash_attn_ext_vec_amd<dk, nsg, kt, nkk, dkf, vt, nkv, dvf, 64, 1, subw>;
+#define FA_AMD_INST_W64_WG(dk, nsg, subw, nm, kt, nkk, dkf, vt, nkv, dvf) \
+template [[host_name("kernel_flash_attn_ext_vec_amd_dk" #dk "_" nm "_w64_wg32")]] kernel flash_attn_ext_vec_amd_t \
+    kernel_flash_attn_ext_vec_amd<dk, nsg, kt, nkk, dkf, vt, nkv, dvf, 64, 32, subw>;
 #define FA_AMD_PAIR_W64(nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_INST_W64_WG(256, 8, 16, nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_INST_W64_WG(512, 8, 32, nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_INST_W64_S( 64, 16,  8, nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_INST_W64_S(128,  8,  8, nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_INST_W64_S(256,  8, 16, nm, kt, nkk, dkf, vt, nkv, dvf) \
     FA_AMD_INST_W64_S(512,  8, 32, nm, kt, nkk, dkf, vt, nkv, dvf) \
     FA_AMD_INST_W64_WG( 64, 16,  8, nm, kt, nkk, dkf, vt, nkv, dvf) \
     FA_AMD_INST_W64_WG(128,  8,  8, nm, kt, nkk, dkf, vt, nkv, dvf)
@@ -309,12 +356,13 @@ FA_AMD_PAIR_W64_LDS("kf16_vq4_0",  half4,      1, dequantize_f16_t4,  block_q4_0
 FA_AMD_PAIR_W64_LDS("kq8_0_vq4_0", block_q8_0, 8, dequantize_q8_0_t4_h2, block_q4_0, 8, dequantize_q4_0_t4)
 FA_AMD_PAIR_W64_LDS("kq4_0_vq8_0", block_q4_0, 8, dequantize_q4_0_t4, block_q8_0, 8, dequantize_q8_0_t4_h2)
 #undef FA_AMD_PAIR_W64_LDS
-#undef FA_AMD_INST_W64_LDS
 
 // DK=72 (vision towers: qwen3vl_merger and SigLIP are 1152/16). f16 only: 72 is
 // not a multiple of the 32-element quant block, so quantized K/V cannot occur.
 // DV4=18 is not a power of two, so the auto subw would break the shuffle reduction;
 // pin subw=16 and let the ch < DV4 guards cover the top two chunks.
+FA_AMD_INST_S   (72, 32, 16, "kf16_vf16", half4, 1, dequantize_f16_t4, half4, 1, dequantize_f16_t4)
+FA_AMD_INST_W64_S(72, 16, 16, "kf16_vf16", half4, 1, dequantize_f16_t4, half4, 1, dequantize_f16_t4)
 // UNet diffusion heads (SD 1.5 runs 40 at full resolution, then 80 and 160). Same
 // reasoning as dk72: DV4 is not a power of two, so subw is pinned and the guards
 // cover the tail chunk. f16 only, since none of them is a whole quant block.
@@ -332,19 +380,95 @@ FA_AMD_PAIR_W64("kf16_vq4_0",  half4,      1, dequantize_f16_t4,  block_q4_0, 8,
 FA_AMD_PAIR_W64("kq8_0_vq4_0", block_q8_0, 8, dequantize_q8_0_t4_h2, block_q4_0, 8, dequantize_q4_0_t4)
 FA_AMD_PAIR_W64("kq4_0_vq8_0", block_q4_0, 8, dequantize_q4_0_t4, block_q8_0, 8, dequantize_q8_0_t4_h2)
 #undef FA_AMD_PAIR_W64
+// TurboQuant KV: DK is a multiple of 128 (the turbo block is 128 elements, each
+// WHT-rotated independently). Dequant stays in the WHT-rotated domain; the graph
+// un-rotates. Heads below 128 are zero-padded to 128 in the KV cache.
+#define FA_AMD_TURBO(nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_INST_S (128, 16, 8, nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_INST_WG(128, 16, 8, nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_INST_S (256, 16, 16, nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_INST_WG(256, 16, 16, nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_INST_S (384, 16, 32, nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_INST_S (512, 16, 32, nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_INST_WG(512, 16, 32, nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_INST_S (640, 16, 32, nm, kt, nkk, dkf, vt, nkv, dvf)
 FA_AMD_TURBO("kq8_0_vturbo2", block_q8_0, 8, dequantize_q8_0_t4_h2, block_turbo2_0, 32, dequantize_turbo2_0_t4)
 FA_AMD_TURBO("kq8_0_vturbo3", block_q8_0, 8, dequantize_q8_0_t4_h2, block_turbo3_0, 32, dequantize_turbo3_0_t4)
 FA_AMD_TURBO("kq8_0_vturbo4", block_q8_0, 8, dequantize_q8_0_t4_h2, block_turbo4_0, 32, dequantize_turbo4_0_t4)
+FA_AMD_TURBO("kf16_vturbo2", half4, 1, dequantize_f16_t4, block_turbo2_0, 32, dequantize_turbo2_0_t4)
+FA_AMD_TURBO("kf16_vturbo3", half4, 1, dequantize_f16_t4, block_turbo3_0, 32, dequantize_turbo3_0_t4)
+FA_AMD_TURBO("kf16_vturbo4", half4, 1, dequantize_f16_t4, block_turbo4_0, 32, dequantize_turbo4_0_t4)
 FA_AMD_TURBO("kturbo2_vq8_0", block_turbo2_0, 32, dequantize_turbo2_0_t4, block_q8_0, 8, dequantize_q8_0_t4_h2)
+FA_AMD_TURBO("kturbo2_vf16", block_turbo2_0, 32, dequantize_turbo2_0_t4, half4, 1, dequantize_f16_t4)
+FA_AMD_TURBO("kturbo2_vturbo2", block_turbo2_0, 32, dequantize_turbo2_0_t4, block_turbo2_0, 32, dequantize_turbo2_0_t4)
+FA_AMD_TURBO("kturbo2_vturbo3", block_turbo2_0, 32, dequantize_turbo2_0_t4, block_turbo3_0, 32, dequantize_turbo3_0_t4)
+FA_AMD_TURBO("kturbo2_vturbo4", block_turbo2_0, 32, dequantize_turbo2_0_t4, block_turbo4_0, 32, dequantize_turbo4_0_t4)
 FA_AMD_TURBO("kturbo3_vq8_0", block_turbo3_0, 32, dequantize_turbo3_0_t4, block_q8_0, 8, dequantize_q8_0_t4_h2)
+FA_AMD_TURBO("kturbo3_vf16", block_turbo3_0, 32, dequantize_turbo3_0_t4, half4, 1, dequantize_f16_t4)
+FA_AMD_TURBO("kturbo3_vturbo2", block_turbo3_0, 32, dequantize_turbo3_0_t4, block_turbo2_0, 32, dequantize_turbo2_0_t4)
+FA_AMD_TURBO("kturbo3_vturbo3", block_turbo3_0, 32, dequantize_turbo3_0_t4, block_turbo3_0, 32, dequantize_turbo3_0_t4)
+FA_AMD_TURBO("kturbo3_vturbo4", block_turbo3_0, 32, dequantize_turbo3_0_t4, block_turbo4_0, 32, dequantize_turbo4_0_t4)
 FA_AMD_TURBO("kturbo4_vq8_0", block_turbo4_0, 32, dequantize_turbo4_0_t4, block_q8_0, 8, dequantize_q8_0_t4_h2)
+FA_AMD_TURBO("kturbo4_vf16", block_turbo4_0, 32, dequantize_turbo4_0_t4, half4, 1, dequantize_f16_t4)
+FA_AMD_TURBO("kturbo4_vturbo2", block_turbo4_0, 32, dequantize_turbo4_0_t4, block_turbo2_0, 32, dequantize_turbo2_0_t4)
+FA_AMD_TURBO("kturbo4_vturbo3", block_turbo4_0, 32, dequantize_turbo4_0_t4, block_turbo3_0, 32, dequantize_turbo3_0_t4)
+FA_AMD_TURBO("kturbo4_vturbo4", block_turbo4_0, 32, dequantize_turbo4_0_t4, block_turbo4_0, 32, dequantize_turbo4_0_t4)
+FA_AMD_TURBO("kq4_0_vturbo2", block_q4_0, 8, dequantize_q4_0_t4, block_turbo2_0, 32, dequantize_turbo2_0_t4)
+FA_AMD_TURBO("kq4_0_vturbo3", block_q4_0, 8, dequantize_q4_0_t4, block_turbo3_0, 32, dequantize_turbo3_0_t4)
+FA_AMD_TURBO("kq4_0_vturbo4", block_q4_0, 8, dequantize_q4_0_t4, block_turbo4_0, 32, dequantize_turbo4_0_t4)
+FA_AMD_TURBO("kturbo2_vq4_0", block_turbo2_0, 32, dequantize_turbo2_0_t4, block_q4_0, 8, dequantize_q4_0_t4)
+FA_AMD_TURBO("kturbo3_vq4_0", block_turbo3_0, 32, dequantize_turbo3_0_t4, block_q4_0, 8, dequantize_q4_0_t4)
+FA_AMD_TURBO("kturbo4_vq4_0", block_turbo4_0, 32, dequantize_turbo4_0_t4, block_q4_0, 8, dequantize_q4_0_t4)
+#undef FA_AMD_TURBO
+// wave64 (GCN/Vega) parity; nsg=8. Untested on real hardware.
+// The 32 KB twins skip dk384, which fits as is, and dk640 has no split kernel to pair with.
+#define FA_AMD_TURBO_W64(nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_INST_W64_S(128, 8,  8, nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_INST_W64_WG(128, 8, 8, nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_INST_W64_WG(256, 8, 16, nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_INST_W64_S(256, 8, 16, nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_INST_W64_S(384, 8, 32, nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_INST_W64_WG(512, 8, 32, nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_INST_W64_S(512, 8, 32, nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_INST_W64_S(640, 8, 32, nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_INST_W64_LDS(128, 8,  8, nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_INST_W64_LDS(256, 8, 16, nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_INST_W64_LDS(512, 8, 32, nm, kt, nkk, dkf, vt, nkv, dvf) \
+template [[host_name("kernel_flash_attn_ext_vec_amd_dk640_" nm "_w64_lds32")]] kernel flash_attn_ext_vec_amd_t \
+    kernel_flash_attn_ext_vec_amd<640, 4, kt, nkk, dkf, vt, nkv, dvf, 64, 1, 32>;
 FA_AMD_TURBO_W64("kq8_0_vturbo2", block_q8_0, 8, dequantize_q8_0_t4_h2, block_turbo2_0, 32, dequantize_turbo2_0_t4)
 FA_AMD_TURBO_W64("kq8_0_vturbo3", block_q8_0, 8, dequantize_q8_0_t4_h2, block_turbo3_0, 32, dequantize_turbo3_0_t4)
 FA_AMD_TURBO_W64("kq8_0_vturbo4", block_q8_0, 8, dequantize_q8_0_t4_h2, block_turbo4_0, 32, dequantize_turbo4_0_t4)
+FA_AMD_TURBO_W64("kf16_vturbo2", half4, 1, dequantize_f16_t4, block_turbo2_0, 32, dequantize_turbo2_0_t4)
+FA_AMD_TURBO_W64("kf16_vturbo3", half4, 1, dequantize_f16_t4, block_turbo3_0, 32, dequantize_turbo3_0_t4)
+FA_AMD_TURBO_W64("kf16_vturbo4", half4, 1, dequantize_f16_t4, block_turbo4_0, 32, dequantize_turbo4_0_t4)
 FA_AMD_TURBO_W64("kturbo2_vq8_0", block_turbo2_0, 32, dequantize_turbo2_0_t4, block_q8_0, 8, dequantize_q8_0_t4_h2)
+FA_AMD_TURBO_W64("kturbo2_vf16", block_turbo2_0, 32, dequantize_turbo2_0_t4, half4, 1, dequantize_f16_t4)
+FA_AMD_TURBO_W64("kturbo2_vturbo2", block_turbo2_0, 32, dequantize_turbo2_0_t4, block_turbo2_0, 32, dequantize_turbo2_0_t4)
+FA_AMD_TURBO_W64("kturbo2_vturbo3", block_turbo2_0, 32, dequantize_turbo2_0_t4, block_turbo3_0, 32, dequantize_turbo3_0_t4)
+FA_AMD_TURBO_W64("kturbo2_vturbo4", block_turbo2_0, 32, dequantize_turbo2_0_t4, block_turbo4_0, 32, dequantize_turbo4_0_t4)
 FA_AMD_TURBO_W64("kturbo3_vq8_0", block_turbo3_0, 32, dequantize_turbo3_0_t4, block_q8_0, 8, dequantize_q8_0_t4_h2)
+FA_AMD_TURBO_W64("kturbo3_vf16", block_turbo3_0, 32, dequantize_turbo3_0_t4, half4, 1, dequantize_f16_t4)
+FA_AMD_TURBO_W64("kturbo3_vturbo2", block_turbo3_0, 32, dequantize_turbo3_0_t4, block_turbo2_0, 32, dequantize_turbo2_0_t4)
+FA_AMD_TURBO_W64("kturbo3_vturbo3", block_turbo3_0, 32, dequantize_turbo3_0_t4, block_turbo3_0, 32, dequantize_turbo3_0_t4)
+FA_AMD_TURBO_W64("kturbo3_vturbo4", block_turbo3_0, 32, dequantize_turbo3_0_t4, block_turbo4_0, 32, dequantize_turbo4_0_t4)
 FA_AMD_TURBO_W64("kturbo4_vq8_0", block_turbo4_0, 32, dequantize_turbo4_0_t4, block_q8_0, 8, dequantize_q8_0_t4_h2)
+FA_AMD_TURBO_W64("kturbo4_vf16", block_turbo4_0, 32, dequantize_turbo4_0_t4, half4, 1, dequantize_f16_t4)
+FA_AMD_TURBO_W64("kturbo4_vturbo2", block_turbo4_0, 32, dequantize_turbo4_0_t4, block_turbo2_0, 32, dequantize_turbo2_0_t4)
+FA_AMD_TURBO_W64("kturbo4_vturbo3", block_turbo4_0, 32, dequantize_turbo4_0_t4, block_turbo3_0, 32, dequantize_turbo3_0_t4)
+FA_AMD_TURBO_W64("kturbo4_vturbo4", block_turbo4_0, 32, dequantize_turbo4_0_t4, block_turbo4_0, 32, dequantize_turbo4_0_t4)
+FA_AMD_TURBO_W64("kq4_0_vturbo2", block_q4_0, 8, dequantize_q4_0_t4, block_turbo2_0, 32, dequantize_turbo2_0_t4)
+FA_AMD_TURBO_W64("kq4_0_vturbo3", block_q4_0, 8, dequantize_q4_0_t4, block_turbo3_0, 32, dequantize_turbo3_0_t4)
+FA_AMD_TURBO_W64("kq4_0_vturbo4", block_q4_0, 8, dequantize_q4_0_t4, block_turbo4_0, 32, dequantize_turbo4_0_t4)
+FA_AMD_TURBO_W64("kturbo2_vq4_0", block_turbo2_0, 32, dequantize_turbo2_0_t4, block_q4_0, 8, dequantize_q4_0_t4)
+FA_AMD_TURBO_W64("kturbo3_vq4_0", block_turbo3_0, 32, dequantize_turbo3_0_t4, block_q4_0, 8, dequantize_q4_0_t4)
+FA_AMD_TURBO_W64("kturbo4_vq4_0", block_turbo4_0, 32, dequantize_turbo4_0_t4, block_q4_0, 8, dequantize_q4_0_t4)
+#undef FA_AMD_TURBO_W64
+#undef FA_AMD_INST_W64_LDS
+
 #undef FA_AMD_INST_W64
+#undef FA_AMD_INST_W64_S
+#undef FA_AMD_INST_W64_WG
 #undef FA_AMD_PAIR_S
 #undef FA_AMD_PAIR_Q4
 #undef FA_AMD_INST_S
@@ -356,6 +480,7 @@ template<
     short DK, short NQ,
     typename k_t, short NKK, void (*deq_k)(device const k_t *, short, thread float4 &),
     typename v_t, short NKV, void (*deq_v)(device const v_t *, short, thread float4 &),
+    short NW = 32, short DVP = 0>
 kernel void kernel_flash_attn_ext_tile_amd(
         constant ggml_metal_kargs_flash_attn_ext_amd & args [[buffer(0)]],
         device const char * q     [[buffer(1)]],
@@ -368,7 +493,15 @@ kernel void kernel_flash_attn_ext_tile_amd(
         uint3  tgpig [[threadgroup_position_in_grid]],
         ushort tiisg [[thread_index_in_simdgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    constexpr short DV  = DVP ? DVP : DK;
+    constexpr short DK4 = DK/4;
+    constexpr short DV4 = DV/4;
+    constexpr short NCK = (DK4 + NW - 1)/NW;
+    constexpr short NCV = (DV4 + NW - 1)/NW;
+    constexpr short TK  = 8192/(DK + DV); // KV rows per tile (sk + sv <= 16 KiB)
+
     threadgroup half4 sk[TK*DK4];
+    threadgroup half4 sv[TK*DV4];
     threadgroup short sh_any;
 
     const int iq1 = tgpig.x*NQ + sgitg; // this simdgroup's query token
@@ -393,9 +526,15 @@ kernel void kernel_flash_attn_ext_tile_amd(
     if (args.has_mask) {
         pm = (device const half *) (mask + iq1c*args.nb31 + (iq2%args.ne32)*args.nb32 + (iq3%args.ne33)*args.nb33);
     }
+
+    float4 myq[NCK];
+    for (short c = 0; c < NCK; ++c) {
         const short ch = tiisg + c*NW;
         myq[c] = ch < DK4 ? q4[ch] : float4(0.0f);
     }
+
+    float4 acc[NCV];
+    for (short c = 0; c < NCV; ++c) {
         acc[c] = float4(0.0f);
     }
     float m = -FLT_MAX/2;
@@ -425,6 +564,9 @@ kernel void kernel_flash_attn_ext_tile_amd(
         if (sh_any == 0) {
             continue;
         }
+
+        // cooperative dequant of the K/V tile rows into threadgroup memory;
+        // the loops are separate because MLA has DK != DV
         for (short c = tl; c < tn*DK4; c += NW*NQ) {
             const short jj = c / DK4;
             const short ch = c % DK4;
@@ -433,6 +575,10 @@ kernel void kernel_flash_attn_ext_tile_amd(
             deq_k(kb + ch/NKK, ch%NKK, t);
             sk[c] = (half4) t;
         }
+        for (short c = tl; c < tn*DV4; c += NW*NQ) {
+            const short jj = c / DV4;
+            const short ch = c % DV4;
+            float4 t;
             device const v_t * vb = (device const v_t *) (vp + (uint64_t)(j0 + jj)*args.nb21);
             deq_v(vb + ch/NKV, ch%NKV, t);
             sv[c] = (half4) t;
@@ -446,6 +592,7 @@ kernel void kernel_flash_attn_ext_tile_amd(
             }
 
             float pl = 0.0f;
+            for (short c = 0; c < NCK; ++c) {
                 const short ch = tiisg + c*NW;
                 if (ch < DK4) {
                     pl += dot(myq[c], (float4) sk[jj*DK4 + ch]);
@@ -458,8 +605,11 @@ kernel void kernel_flash_attn_ext_tile_amd(
             const float corr = exp(m  - nm);
             const float w    = exp(pp - nm);
 
+            for (short c = 0; c < NCV; ++c) {
                 const short ch = tiisg + c*NW;
                 if (ch < DV4) {
+                    acc[c] = acc[c]*corr + w*(float4) sv[jj*DV4 + ch];
+                }
             }
             s = s*corr + w;
             m = nm;
@@ -472,6 +622,7 @@ kernel void kernel_flash_attn_ext_tile_amd(
         const float sk_ = ((device const float *) sinks)[iq2];
         const float nm = max(m, sk_);
         const float corr = exp(m - nm);
+        for (short c = 0; c < NCV; ++c) {
             acc[c] *= corr;
         }
         s = s*corr + exp(sk_ - nm);
@@ -484,8 +635,12 @@ kernel void kernel_flash_attn_ext_tile_amd(
     const float inv = s > 0.0f ? 1.0f/s : 0.0f;
     const int64_t rid = (int64_t) iq3*args.ne2*args.ne1 + iq2 + (int64_t) iq1*args.ne1;
     device float4 * dst4 = (device float4 *) dst;
+    for (short c = 0; c < NCV; ++c) {
         const short ch = tiisg + c*NW;
         if (ch < DV4) {
+            dst4[rid*DV4 + ch] = acc[c]*inv;
+        }
+    }
 }
 
 typedef decltype(kernel_flash_attn_ext_tile_amd<128, 16, half4, 1, dequantize_f16_t4, half4, 1, dequantize_f16_t4>) flash_attn_ext_tile_amd_t;
@@ -509,15 +664,50 @@ FA_AMD_TILE_PAIR("kf16_vq8_0",  half4,      1, dequantize_f16_t4,  block_q8_0, 8
 FA_AMD_TILE_PAIR("kf16_vq4_0",  half4,      1, dequantize_f16_t4,  block_q4_0, 8, dequantize_q4_0_t4)
 FA_AMD_TILE_PAIR("kq8_0_vq4_0", block_q8_0, 8, dequantize_q8_0_t4_h2, block_q4_0, 8, dequantize_q4_0_t4)
 FA_AMD_TILE_PAIR("kq4_0_vq8_0", block_q4_0, 8, dequantize_q4_0_t4, block_q8_0, 8, dequantize_q8_0_t4_h2)
+// MLA (deepseek2) keeps the 64-wide rope tail in K only.
+#define FA_AMD_TILE_INST_ASYM(dk, dv, nm, kt, nkk, dkf, vt, nkv, dvf) \
+template [[host_name("kernel_flash_attn_ext_tile_amd_dk" #dk "_dv" #dv "_" nm)]] kernel flash_attn_ext_tile_amd_t \
+    kernel_flash_attn_ext_tile_amd<dk, 16, kt, nkk, dkf, vt, nkv, dvf, 32, dv>;
+FA_AMD_TILE_INST_ASYM(576, 512, "kf16_vf16",   half4,      1, dequantize_f16_t4,  half4,      1, dequantize_f16_t4)
 FA_AMD_TILE_INST_ASYM(576, 512, "kq8_0_vq8_0", block_q8_0, 8, dequantize_q8_0_t4_h2, block_q8_0, 8, dequantize_q8_0_t4_h2)
 FA_AMD_TILE_INST_ASYM(320, 256, "kf16_vf16",   half4,      1, dequantize_f16_t4,  half4,      1, dequantize_f16_t4)
 FA_AMD_TILE_INST_ASYM(320, 256, "kq8_0_vq8_0", block_q8_0, 8, dequantize_q8_0_t4_h2, block_q8_0, 8, dequantize_q8_0_t4_h2)
+#undef FA_AMD_TILE_INST_ASYM
+// TurboQuant KV (prefill companion of the FA_AMD_TURBO vec kernels).
+#define FA_AMD_TILE_TURBO(nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_TILE_INST(128, nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_TILE_INST(256, nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_TILE_INST(384, nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_TILE_INST(512, nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_TILE_INST(640, nm, kt, nkk, dkf, vt, nkv, dvf)
 FA_AMD_TILE_TURBO("kq8_0_vturbo2", block_q8_0, 8, dequantize_q8_0_t4_h2, block_turbo2_0, 32, dequantize_turbo2_0_t4)
 FA_AMD_TILE_TURBO("kq8_0_vturbo3", block_q8_0, 8, dequantize_q8_0_t4_h2, block_turbo3_0, 32, dequantize_turbo3_0_t4)
 FA_AMD_TILE_TURBO("kq8_0_vturbo4", block_q8_0, 8, dequantize_q8_0_t4_h2, block_turbo4_0, 32, dequantize_turbo4_0_t4)
+FA_AMD_TILE_TURBO("kf16_vturbo2", half4, 1, dequantize_f16_t4, block_turbo2_0, 32, dequantize_turbo2_0_t4)
+FA_AMD_TILE_TURBO("kf16_vturbo3", half4, 1, dequantize_f16_t4, block_turbo3_0, 32, dequantize_turbo3_0_t4)
+FA_AMD_TILE_TURBO("kf16_vturbo4", half4, 1, dequantize_f16_t4, block_turbo4_0, 32, dequantize_turbo4_0_t4)
 FA_AMD_TILE_TURBO("kturbo2_vq8_0", block_turbo2_0, 32, dequantize_turbo2_0_t4, block_q8_0, 8, dequantize_q8_0_t4_h2)
+FA_AMD_TILE_TURBO("kturbo2_vf16", block_turbo2_0, 32, dequantize_turbo2_0_t4, half4, 1, dequantize_f16_t4)
+FA_AMD_TILE_TURBO("kturbo2_vturbo2", block_turbo2_0, 32, dequantize_turbo2_0_t4, block_turbo2_0, 32, dequantize_turbo2_0_t4)
+FA_AMD_TILE_TURBO("kturbo2_vturbo3", block_turbo2_0, 32, dequantize_turbo2_0_t4, block_turbo3_0, 32, dequantize_turbo3_0_t4)
+FA_AMD_TILE_TURBO("kturbo2_vturbo4", block_turbo2_0, 32, dequantize_turbo2_0_t4, block_turbo4_0, 32, dequantize_turbo4_0_t4)
 FA_AMD_TILE_TURBO("kturbo3_vq8_0", block_turbo3_0, 32, dequantize_turbo3_0_t4, block_q8_0, 8, dequantize_q8_0_t4_h2)
+FA_AMD_TILE_TURBO("kturbo3_vf16", block_turbo3_0, 32, dequantize_turbo3_0_t4, half4, 1, dequantize_f16_t4)
+FA_AMD_TILE_TURBO("kturbo3_vturbo2", block_turbo3_0, 32, dequantize_turbo3_0_t4, block_turbo2_0, 32, dequantize_turbo2_0_t4)
+FA_AMD_TILE_TURBO("kturbo3_vturbo3", block_turbo3_0, 32, dequantize_turbo3_0_t4, block_turbo3_0, 32, dequantize_turbo3_0_t4)
+FA_AMD_TILE_TURBO("kturbo3_vturbo4", block_turbo3_0, 32, dequantize_turbo3_0_t4, block_turbo4_0, 32, dequantize_turbo4_0_t4)
 FA_AMD_TILE_TURBO("kturbo4_vq8_0", block_turbo4_0, 32, dequantize_turbo4_0_t4, block_q8_0, 8, dequantize_q8_0_t4_h2)
+FA_AMD_TILE_TURBO("kturbo4_vf16", block_turbo4_0, 32, dequantize_turbo4_0_t4, half4, 1, dequantize_f16_t4)
+FA_AMD_TILE_TURBO("kturbo4_vturbo2", block_turbo4_0, 32, dequantize_turbo4_0_t4, block_turbo2_0, 32, dequantize_turbo2_0_t4)
+FA_AMD_TILE_TURBO("kturbo4_vturbo3", block_turbo4_0, 32, dequantize_turbo4_0_t4, block_turbo3_0, 32, dequantize_turbo3_0_t4)
+FA_AMD_TILE_TURBO("kturbo4_vturbo4", block_turbo4_0, 32, dequantize_turbo4_0_t4, block_turbo4_0, 32, dequantize_turbo4_0_t4)
+FA_AMD_TILE_TURBO("kq4_0_vturbo2", block_q4_0, 8, dequantize_q4_0_t4, block_turbo2_0, 32, dequantize_turbo2_0_t4)
+FA_AMD_TILE_TURBO("kq4_0_vturbo3", block_q4_0, 8, dequantize_q4_0_t4, block_turbo3_0, 32, dequantize_turbo3_0_t4)
+FA_AMD_TILE_TURBO("kq4_0_vturbo4", block_q4_0, 8, dequantize_q4_0_t4, block_turbo4_0, 32, dequantize_turbo4_0_t4)
+FA_AMD_TILE_TURBO("kturbo2_vq4_0", block_turbo2_0, 32, dequantize_turbo2_0_t4, block_q4_0, 8, dequantize_q4_0_t4)
+FA_AMD_TILE_TURBO("kturbo3_vq4_0", block_turbo3_0, 32, dequantize_turbo3_0_t4, block_q4_0, 8, dequantize_q4_0_t4)
+FA_AMD_TILE_TURBO("kturbo4_vq4_0", block_turbo4_0, 32, dequantize_turbo4_0_t4, block_q4_0, 8, dequantize_q4_0_t4)
+#undef FA_AMD_TILE_TURBO
 // wave64 variants: 64-lane simdgroups, 8 queries per threadgroup (512 threads).
 #define FA_AMD_TILE_INST_W64(dk, nm, kt, nkk, dkf, vt, nkv, dvf) \
 template [[host_name("kernel_flash_attn_ext_tile_amd_dk" #dk "_" nm "_w64")]] kernel flash_attn_ext_tile_amd_t \
@@ -541,15 +731,50 @@ FA_AMD_TILE_INST    (72, "kf16_vf16", half4, 1, dequantize_f16_t4, half4, 1, deq
 FA_AMD_TILE_INST_W64(72, "kf16_vf16", half4, 1, dequantize_f16_t4, half4, 1, dequantize_f16_t4)
 FA_AMD_TILE_PAIR_W64("kq8_0_vq4_0", block_q8_0, 8, dequantize_q8_0_t4_h2, block_q4_0, 8, dequantize_q4_0_t4)
 FA_AMD_TILE_PAIR_W64("kq4_0_vq8_0", block_q4_0, 8, dequantize_q4_0_t4, block_q8_0, 8, dequantize_q8_0_t4_h2)
+// MLA wave64 parity (Vega/GCN): eight 64-lane query groups.
+#define FA_AMD_TILE_INST_ASYM_W64(dk, dv, nm, kt, nkk, dkf, vt, nkv, dvf) \
+template [[host_name("kernel_flash_attn_ext_tile_amd_dk" #dk "_dv" #dv "_" nm "_w64")]] kernel flash_attn_ext_tile_amd_t \
+    kernel_flash_attn_ext_tile_amd<dk, 8, kt, nkk, dkf, vt, nkv, dvf, 64, dv>;
+FA_AMD_TILE_INST_ASYM_W64(576, 512, "kf16_vf16",   half4,      1, dequantize_f16_t4,  half4,      1, dequantize_f16_t4)
 FA_AMD_TILE_INST_ASYM_W64(576, 512, "kq8_0_vq8_0", block_q8_0, 8, dequantize_q8_0_t4_h2, block_q8_0, 8, dequantize_q8_0_t4_h2)
 FA_AMD_TILE_INST_ASYM_W64(320, 256, "kf16_vf16",   half4,      1, dequantize_f16_t4,  half4,      1, dequantize_f16_t4)
 FA_AMD_TILE_INST_ASYM_W64(320, 256, "kq8_0_vq8_0", block_q8_0, 8, dequantize_q8_0_t4_h2, block_q8_0, 8, dequantize_q8_0_t4_h2)
+#undef FA_AMD_TILE_INST_ASYM_W64
+// TurboQuant KV wave64 parity. Untested on real hardware.
+#define FA_AMD_TILE_TURBO_W64(nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_TILE_INST_W64(128, nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_TILE_INST_W64(256, nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_TILE_INST_W64(384, nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_TILE_INST_W64(512, nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_TILE_INST_W64(640, nm, kt, nkk, dkf, vt, nkv, dvf)
 FA_AMD_TILE_TURBO_W64("kq8_0_vturbo2", block_q8_0, 8, dequantize_q8_0_t4_h2, block_turbo2_0, 32, dequantize_turbo2_0_t4)
 FA_AMD_TILE_TURBO_W64("kq8_0_vturbo3", block_q8_0, 8, dequantize_q8_0_t4_h2, block_turbo3_0, 32, dequantize_turbo3_0_t4)
 FA_AMD_TILE_TURBO_W64("kq8_0_vturbo4", block_q8_0, 8, dequantize_q8_0_t4_h2, block_turbo4_0, 32, dequantize_turbo4_0_t4)
+FA_AMD_TILE_TURBO_W64("kf16_vturbo2", half4, 1, dequantize_f16_t4, block_turbo2_0, 32, dequantize_turbo2_0_t4)
+FA_AMD_TILE_TURBO_W64("kf16_vturbo3", half4, 1, dequantize_f16_t4, block_turbo3_0, 32, dequantize_turbo3_0_t4)
+FA_AMD_TILE_TURBO_W64("kf16_vturbo4", half4, 1, dequantize_f16_t4, block_turbo4_0, 32, dequantize_turbo4_0_t4)
 FA_AMD_TILE_TURBO_W64("kturbo2_vq8_0", block_turbo2_0, 32, dequantize_turbo2_0_t4, block_q8_0, 8, dequantize_q8_0_t4_h2)
+FA_AMD_TILE_TURBO_W64("kturbo2_vf16", block_turbo2_0, 32, dequantize_turbo2_0_t4, half4, 1, dequantize_f16_t4)
+FA_AMD_TILE_TURBO_W64("kturbo2_vturbo2", block_turbo2_0, 32, dequantize_turbo2_0_t4, block_turbo2_0, 32, dequantize_turbo2_0_t4)
+FA_AMD_TILE_TURBO_W64("kturbo2_vturbo3", block_turbo2_0, 32, dequantize_turbo2_0_t4, block_turbo3_0, 32, dequantize_turbo3_0_t4)
+FA_AMD_TILE_TURBO_W64("kturbo2_vturbo4", block_turbo2_0, 32, dequantize_turbo2_0_t4, block_turbo4_0, 32, dequantize_turbo4_0_t4)
 FA_AMD_TILE_TURBO_W64("kturbo3_vq8_0", block_turbo3_0, 32, dequantize_turbo3_0_t4, block_q8_0, 8, dequantize_q8_0_t4_h2)
+FA_AMD_TILE_TURBO_W64("kturbo3_vf16", block_turbo3_0, 32, dequantize_turbo3_0_t4, half4, 1, dequantize_f16_t4)
+FA_AMD_TILE_TURBO_W64("kturbo3_vturbo2", block_turbo3_0, 32, dequantize_turbo3_0_t4, block_turbo2_0, 32, dequantize_turbo2_0_t4)
+FA_AMD_TILE_TURBO_W64("kturbo3_vturbo3", block_turbo3_0, 32, dequantize_turbo3_0_t4, block_turbo3_0, 32, dequantize_turbo3_0_t4)
+FA_AMD_TILE_TURBO_W64("kturbo3_vturbo4", block_turbo3_0, 32, dequantize_turbo3_0_t4, block_turbo4_0, 32, dequantize_turbo4_0_t4)
 FA_AMD_TILE_TURBO_W64("kturbo4_vq8_0", block_turbo4_0, 32, dequantize_turbo4_0_t4, block_q8_0, 8, dequantize_q8_0_t4_h2)
+FA_AMD_TILE_TURBO_W64("kturbo4_vf16", block_turbo4_0, 32, dequantize_turbo4_0_t4, half4, 1, dequantize_f16_t4)
+FA_AMD_TILE_TURBO_W64("kturbo4_vturbo2", block_turbo4_0, 32, dequantize_turbo4_0_t4, block_turbo2_0, 32, dequantize_turbo2_0_t4)
+FA_AMD_TILE_TURBO_W64("kturbo4_vturbo3", block_turbo4_0, 32, dequantize_turbo4_0_t4, block_turbo3_0, 32, dequantize_turbo3_0_t4)
+FA_AMD_TILE_TURBO_W64("kturbo4_vturbo4", block_turbo4_0, 32, dequantize_turbo4_0_t4, block_turbo4_0, 32, dequantize_turbo4_0_t4)
+FA_AMD_TILE_TURBO_W64("kq4_0_vturbo2", block_q4_0, 8, dequantize_q4_0_t4, block_turbo2_0, 32, dequantize_turbo2_0_t4)
+FA_AMD_TILE_TURBO_W64("kq4_0_vturbo3", block_q4_0, 8, dequantize_q4_0_t4, block_turbo3_0, 32, dequantize_turbo3_0_t4)
+FA_AMD_TILE_TURBO_W64("kq4_0_vturbo4", block_q4_0, 8, dequantize_q4_0_t4, block_turbo4_0, 32, dequantize_turbo4_0_t4)
+FA_AMD_TILE_TURBO_W64("kturbo2_vq4_0", block_turbo2_0, 32, dequantize_turbo2_0_t4, block_q4_0, 8, dequantize_q4_0_t4)
+FA_AMD_TILE_TURBO_W64("kturbo3_vq4_0", block_turbo3_0, 32, dequantize_turbo3_0_t4, block_q4_0, 8, dequantize_q4_0_t4)
+FA_AMD_TILE_TURBO_W64("kturbo4_vq4_0", block_turbo4_0, 32, dequantize_turbo4_0_t4, block_q4_0, 8, dequantize_q4_0_t4)
+#undef FA_AMD_TILE_TURBO_W64
 #undef FA_AMD_TILE_PAIR_W64
 #undef FA_AMD_TILE_INST_W64
 #undef FA_AMD_TILE_PAIR
@@ -852,12 +1077,40 @@ FA_AMD_PF_PAIR("kf16_vq8_0",  half4,      1, dequantize_f16_t4,  block_q8_0, 8, 
 FA_AMD_PF_PAIR("kf16_vq4_0",  half4,      1, dequantize_f16_t4,  block_q4_0, 8, dequantize_q4_0_t4)
 FA_AMD_PF_PAIR("kq8_0_vq4_0", block_q8_0, 8, dequantize_q8_0_t4_h2, block_q4_0, 8, dequantize_q4_0_t4)
 FA_AMD_PF_PAIR("kq4_0_vq8_0", block_q4_0, 8, dequantize_q4_0_t4, block_q8_0, 8, dequantize_q8_0_t4_h2)
+// TurboQuant KV (large-batch prefill companion of the tile/vec turbo kernels).
+// dk384/dk512/dk640 have no PF variant; the host routes them to the tile kernel.
+#define FA_AMD_PF_TURBO(nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_PF_INST(128, 64, 64, nm, kt, nkk, dkf, vt, nkv, dvf) \
+    FA_AMD_PF_INST(256, 32, 64, nm, kt, nkk, dkf, vt, nkv, dvf)
 FA_AMD_PF_TURBO("kq8_0_vturbo2", block_q8_0, 8, dequantize_q8_0_t4_h2, block_turbo2_0, 32, dequantize_turbo2_0_t4)
 FA_AMD_PF_TURBO("kq8_0_vturbo3", block_q8_0, 8, dequantize_q8_0_t4_h2, block_turbo3_0, 32, dequantize_turbo3_0_t4)
 FA_AMD_PF_TURBO("kq8_0_vturbo4", block_q8_0, 8, dequantize_q8_0_t4_h2, block_turbo4_0, 32, dequantize_turbo4_0_t4)
+FA_AMD_PF_TURBO("kf16_vturbo2", half4, 1, dequantize_f16_t4, block_turbo2_0, 32, dequantize_turbo2_0_t4)
+FA_AMD_PF_TURBO("kf16_vturbo3", half4, 1, dequantize_f16_t4, block_turbo3_0, 32, dequantize_turbo3_0_t4)
+FA_AMD_PF_TURBO("kf16_vturbo4", half4, 1, dequantize_f16_t4, block_turbo4_0, 32, dequantize_turbo4_0_t4)
 FA_AMD_PF_TURBO("kturbo2_vq8_0", block_turbo2_0, 32, dequantize_turbo2_0_t4, block_q8_0, 8, dequantize_q8_0_t4_h2)
+FA_AMD_PF_TURBO("kturbo2_vf16", block_turbo2_0, 32, dequantize_turbo2_0_t4, half4, 1, dequantize_f16_t4)
+FA_AMD_PF_TURBO("kturbo2_vturbo2", block_turbo2_0, 32, dequantize_turbo2_0_t4, block_turbo2_0, 32, dequantize_turbo2_0_t4)
+FA_AMD_PF_TURBO("kturbo2_vturbo3", block_turbo2_0, 32, dequantize_turbo2_0_t4, block_turbo3_0, 32, dequantize_turbo3_0_t4)
+FA_AMD_PF_TURBO("kturbo2_vturbo4", block_turbo2_0, 32, dequantize_turbo2_0_t4, block_turbo4_0, 32, dequantize_turbo4_0_t4)
 FA_AMD_PF_TURBO("kturbo3_vq8_0", block_turbo3_0, 32, dequantize_turbo3_0_t4, block_q8_0, 8, dequantize_q8_0_t4_h2)
+FA_AMD_PF_TURBO("kturbo3_vf16", block_turbo3_0, 32, dequantize_turbo3_0_t4, half4, 1, dequantize_f16_t4)
+FA_AMD_PF_TURBO("kturbo3_vturbo2", block_turbo3_0, 32, dequantize_turbo3_0_t4, block_turbo2_0, 32, dequantize_turbo2_0_t4)
+FA_AMD_PF_TURBO("kturbo3_vturbo3", block_turbo3_0, 32, dequantize_turbo3_0_t4, block_turbo3_0, 32, dequantize_turbo3_0_t4)
+FA_AMD_PF_TURBO("kturbo3_vturbo4", block_turbo3_0, 32, dequantize_turbo3_0_t4, block_turbo4_0, 32, dequantize_turbo4_0_t4)
 FA_AMD_PF_TURBO("kturbo4_vq8_0", block_turbo4_0, 32, dequantize_turbo4_0_t4, block_q8_0, 8, dequantize_q8_0_t4_h2)
+FA_AMD_PF_TURBO("kturbo4_vf16", block_turbo4_0, 32, dequantize_turbo4_0_t4, half4, 1, dequantize_f16_t4)
+FA_AMD_PF_TURBO("kturbo4_vturbo2", block_turbo4_0, 32, dequantize_turbo4_0_t4, block_turbo2_0, 32, dequantize_turbo2_0_t4)
+FA_AMD_PF_TURBO("kturbo4_vturbo3", block_turbo4_0, 32, dequantize_turbo4_0_t4, block_turbo3_0, 32, dequantize_turbo3_0_t4)
+FA_AMD_PF_TURBO("kturbo4_vturbo4", block_turbo4_0, 32, dequantize_turbo4_0_t4, block_turbo4_0, 32, dequantize_turbo4_0_t4)
+FA_AMD_PF_TURBO("kq4_0_vturbo2", block_q4_0, 8, dequantize_q4_0_t4, block_turbo2_0, 32, dequantize_turbo2_0_t4)
+FA_AMD_PF_TURBO("kq4_0_vturbo3", block_q4_0, 8, dequantize_q4_0_t4, block_turbo3_0, 32, dequantize_turbo3_0_t4)
+FA_AMD_PF_TURBO("kq4_0_vturbo4", block_q4_0, 8, dequantize_q4_0_t4, block_turbo4_0, 32, dequantize_turbo4_0_t4)
+FA_AMD_PF_TURBO("kturbo2_vq4_0", block_turbo2_0, 32, dequantize_turbo2_0_t4, block_q4_0, 8, dequantize_q4_0_t4)
+FA_AMD_PF_TURBO("kturbo3_vq4_0", block_turbo3_0, 32, dequantize_turbo3_0_t4, block_q4_0, 8, dequantize_q4_0_t4)
+FA_AMD_PF_TURBO("kturbo4_vq4_0", block_turbo4_0, 32, dequantize_turbo4_0_t4, block_q4_0, 8, dequantize_q4_0_t4)
+#undef FA_AMD_PF_TURBO
+
 // vision towers, f16 only like the vec and tile kernels
 FA_AMD_PF_INST(72, 64, 64, "kf16_vf16", half4, 1, dequantize_f16_t4, half4, 1, dequantize_f16_t4)
 // UNet diffusion heads, f16 only like head 72

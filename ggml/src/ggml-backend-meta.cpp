@@ -1036,6 +1036,11 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_GATED_DELTA_NET: {
                 split_state = handle_gated_delta_net(src_ss);
             } break;
+            case GGML_OP_TURBO_WHT: {
+                // the rotation stays inside each group of a row, so rows split but ne0 cannot
+                GGML_ASSERT(tensor->src[1] == nullptr || src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                split_state = handle_per_row(src_ss);
+            } break;
             case GGML_OP_LIGHTNING_INDEXER: {
                 split_state = handle_lightning_indexer(src_ss);
             } break;
@@ -1262,7 +1267,9 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
                 init_buf     = t_ij->view_src->buffer;
             }
         } else if (simple_buf != nullptr) {
-            if (ggml_backend_buffer_is_multi_buffer(simple_buf)) {
+            // Only this branch needs a single base, and views never reach it, so a model whose
+            // per-device weights outgrow one Metal buffer still splits by tensors.
+            // ref: https://github.com/ggml-org/llama.cpp/issues/22197
                 GGML_ABORT("multi buffers are not supported by the meta backend");
             }
             t_ij->data = (char *) ggml_backend_buffer_get_base(simple_buf)

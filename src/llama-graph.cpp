@@ -2699,6 +2699,17 @@ ggml_tensor * llm_graph_context::build_attn_mha(
              int64_t   n_kv_max,
                float   kq_scale,
                  int   il) const {
+    // TurboQuant pre-rotate-queries: WHT-rotate Q so <Q_rot, K_rot> preserves scores.
+    // K is stored WHT-rotated by the turbo quantizer; the orthogonal rotation cancels.
+    static const bool diag_no_wht = getenv("TOSH_DIAG_NO_WHT") != nullptr;
+    if (q->ne[0] < k->ne[0]) {
+        q = ggml_pad(ctx0, q, k->ne[0] - q->ne[0], 0, 0, 0);
+    }
+    GGML_ASSERT(q->ne[0] == k->ne[0]);
+    if (!diag_no_wht && (k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0)) {
+        if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
+        q = ggml_turbo_wht(ctx0, q, 0, 0, nullptr);
+    }
 
     const bool v_trans = v->nb[1] > v->nb[2];
 
@@ -2788,6 +2799,19 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
         ggml_prec_set_acc(cur, GGML_PREC_F32);
 
+        // TurboQuant: inverse WHT on FA output when V values are WHT-rotated.
+        if (!diag_no_wht && (v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0)) {
+            if (cur->ne[0] % 128 == 0) {
+                if (!ggml_is_contiguous(cur)) { cur = ggml_cont(ctx0, cur); }
+                cur = ggml_turbo_wht(ctx0, cur, 1, 128, nullptr);
+            }
+        }
+
+        const int64_t orig_head_v = hparams.n_embd_head_v(il);
+        if (orig_head_v != cur->ne[0]) {
+            cur = ggml_view_4d(ctx0, cur, orig_head_v, cur->ne[1], cur->ne[2], cur->ne[3], cur->nb[1], cur->nb[2], cur->nb[3], 0);
+            cur = ggml_cont(ctx0, cur);
+        }
 
         if (v_mla) {
 #if 0
@@ -2865,6 +2889,19 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         ggml_tensor * kqv = ggml_mul_mat(ctx0, v, kq);
         cb(kqv, "kqv", il);
 
+        // TurboQuant: inverse WHT on attention output (non-FA path) when V is WHT-rotated.
+        if (v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0) {
+            if (kqv->ne[0] % 128 == 0) {
+                if (!ggml_is_contiguous(kqv)) { kqv = ggml_cont(ctx0, kqv); }
+                kqv = ggml_turbo_wht(ctx0, kqv, 1, 128, nullptr);
+            }
+        }
+
+        const int64_t orig_head_v = hparams.n_embd_head_v(il);
+        if (orig_head_v != kqv->ne[0]) {
+            kqv = ggml_view_4d(ctx0, kqv, orig_head_v, kqv->ne[1], kqv->ne[2], kqv->ne[3], kqv->nb[1], kqv->nb[2], kqv->nb[3], 0);
+            kqv = ggml_cont(ctx0, kqv);
+        }
         // for MLA with the absorption optimization, we need to "decompress" from MQA back to MHA
         if (v_mla) {
             kqv = ggml_mul_mat(ctx0, v_mla, kqv);
@@ -3082,6 +3119,7 @@ ggml_tensor * llm_graph_context::build_attn(
     return cur;
 }
 
+
 static std::unique_ptr<llm_graph_input_attn_k> build_attn_inp_k_impl(
            ggml_context * ctx0,
      const llama_ubatch & ubatch,
@@ -3144,7 +3182,9 @@ ggml_tensor * llm_graph_context::build_attn(
 
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
+    const bool turbo_k = k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0;
+    const int64_t v_head = turbo_k ? k->ne[0] : v_cur->ne[0];
+    ggml_tensor * v = ggml_view_4d(ctx0, k, v_head, k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
     cb(cur, "kqv_out", il);
@@ -3229,7 +3269,9 @@ ggml_tensor * llm_graph_context::build_attn(
 
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
+    const bool turbo_k = k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0;
+    const int64_t v_head = turbo_k ? k->ne[0] : v_cur->ne[0];
+    ggml_tensor * v = ggml_view_4d(ctx0, k, v_head, k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask_top_k, sinks, v_mla, top_k->ne[0], kq_scale, il);
     cb(cur, "kqv_out", il);

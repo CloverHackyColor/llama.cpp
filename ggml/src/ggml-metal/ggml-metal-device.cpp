@@ -192,7 +192,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_get_rows(ggml_me
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_set_rows(ggml_metal_library_t lib, const ggml_tensor * op) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_set_rows(ggml_metal_library_t lib, const ggml_tensor * op, bool wave64) {
     char base[256];
     char name[256];
 
@@ -200,7 +200,16 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_set_rows(ggml_me
     const auto tidx = op->src[1]->type;
     const auto tdst = op->type;
 
-    snprintf(base, 256, "kernel_set_rows_%s_%s_%s", ggml_type_name(tsrc), ggml_type_name(tidx), ggml_type_name(tdst));
+    // TurboQuant store kernels are named kernel_set_rows_turbo{2,3,4}_{i32,i64}
+    // (WHT + PolarQuant quantize on write), distinct from the generic quant path.
+    if (tdst == GGML_TYPE_TURBO2_0 || tdst == GGML_TYPE_TURBO3_0 || tdst == GGML_TYPE_TURBO4_0) {
+        const char * tn = tdst == GGML_TYPE_TURBO2_0 ? "turbo2" : (tdst == GGML_TYPE_TURBO3_0 ? "turbo3" : "turbo4");
+        const char * idx = tidx == GGML_TYPE_I64 ? "i64" : "i32";
+        snprintf(base, 256, "kernel_set_rows_%s_%s%s", tn, idx,
+                wave64 && tdst != GGML_TYPE_TURBO2_0 ? "_w64" : "");
+    } else {
+        snprintf(base, 256, "kernel_set_rows_%s_%s_%s", ggml_type_name(tsrc), ggml_type_name(tidx), ggml_type_name(tdst));
+    }
     snprintf(name, 256, "%s", base);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
@@ -822,6 +831,18 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net(
     }
 
     res.nsg = nsg;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_turbo_wht(ggml_metal_library_t lib) {
+    const char * name = "kernel_turbo_wht";
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    res.nsg = 1;
+    res.smem = 0;
 
     return res;
 }

@@ -529,7 +529,6 @@ void dequantize_q4_K_impl(device const block_q4_K * xb, short il, bool lo, threa
     const half2 dm  = as_type<half2>(hdr.x);
 
     short is = (il/4) * 2;
-    q = q + (il/4) * 32 + 16 * (il&1);
     il = il & 3;
     const uchar2 sc = get_scale_min_k4_just2_w<uniform>(is, il/2, hdr.y, hdr.z, hdr.w, lo);
     const float d   = il < 2 ? (float) dm[0] : (float) (dm[0] / 16.h);
@@ -871,5 +870,190 @@ void dequantize_tq2_0(device const block_tq2_0 * xb, short il, thread type4x4 & 
     }
 
     reg = (type4x4) reg_f;
+}
+
+constant float turbo_centroids_2bit[4] = { -0.133462f, -0.039994f, 0.039994f, 0.133462f };
+// 3-bit centroids for d=128
+constant float turbo_centroids_3bit[8] = {
+    -0.190685f, -0.117832f, -0.065717f, -0.021460f,
+     0.021460f,  0.065717f,  0.117832f,  0.190685f
+};
+// Midpoints for 2-bit nearest centroid lookup
+constant float turbo_mid_2bit[3] = { -0.086728f, 0.0f, 0.086728f };
+// Midpoints for 3-bit
+constant float turbo_mid_3bit[7] = { -0.154259f, -0.091775f, -0.043589f, 0.0f, 0.043589f, 0.091775f, 0.154259f };
+
+// 4-bit PolarQuant centroids (16 levels) — optimal for N(0, 1/sqrt(128))
+constant float turbo_centroids_4bit[16] = {
+    -0.173926f, -0.117195f, -0.089527f, -0.068756f,
+    -0.051262f, -0.035597f, -0.020989f, -0.006938f,
+     0.006938f,  0.020989f,  0.035597f,  0.051262f,
+     0.068756f,  0.089527f,  0.117195f,  0.173926f
+};
+constant float turbo_mid_4bit[15] = {
+    -0.145560f, -0.103361f, -0.079142f, -0.060009f,
+    -0.043430f, -0.028293f, -0.013963f,  0.000000f,
+     0.013963f,  0.028293f,  0.043430f,  0.060009f,
+     0.079142f,  0.103361f,  0.145560f
+};
+
+// Half-precision 4-bit centroid LUT for vec path
+constant half turbo_centroids_4bit_h[16] = {
+    -0.173926h, -0.117195h, -0.089527h, -0.068756h,
+    -0.051262h, -0.035597h, -0.020989h, -0.006938h,
+     0.006938h,  0.020989h,  0.035597h,  0.051262h,
+     0.068756h,  0.089527h,  0.117195h,  0.173926h
+};
+
+// magnitudes of the 4-bit centroids, positive half only: they are symmetric, so index 8-15 map
+// to mag[idx & 7] and 0-7 to mag[7 - (idx & 7)] with the sign flipped
+constant half turbo_mag_4bit_h[8] = {
+    0.006938h, 0.020989h, 0.035597h, 0.051262h,
+    0.068756h, 0.089527h, 0.117195h, 0.173926h
+};
+
+// Half-precision 2-bit centroid LUT for vec path
+constant half turbo_centroids_2bit_h[4] = {
+    -0.133462h, -0.039994h, 0.039994h, 0.133462h
+};
+
+// Quantize 32 elements into one block_turbo2_0 (NO rotation — rotation happens
+// at the 128-element group level in kernel_set_rows_turbo)
+void quantize_turbo2_0(device const float * src, device block_turbo2_0 & dst) {
+#pragma METAL fp math_mode(safe)
+    float norm_sq = 0.0f;
+    for (int j = 0; j < QK_TURBO2; j++) norm_sq += src[j] * src[j];
+    float norm = sqrt(norm_sq);
+    float inv_norm = norm > 1e-10f ? 1.0f / norm : 0.0f;
+    dst.norm = half(norm);
+
+    for (int j = 0; j < QK_TURBO2 / 4; j++) dst.qs[j] = 0;
+
+    for (int j = 0; j < QK_TURBO2; j++) {
+        float val = src[j] * inv_norm;
+        uint8_t idx;
+        if      (val < turbo_mid_2bit[0]) idx = 0;
+        else if (val < turbo_mid_2bit[1]) idx = 1;
+        else if (val < turbo_mid_2bit[2]) idx = 2;
+        else                              idx = 3;
+
+        dst.qs[j / 4] |= (idx & 0x3) << ((j % 4) * 2);
+    }
+}
+
+// Quantize 32 elements into one block_turbo3_0 (NO rotation — rotation happens
+// at the 128-element group level in kernel_set_rows_turbo)
+void quantize_turbo3_0(device const float * src, device block_turbo3_0 & dst) {
+#pragma METAL fp math_mode(safe)
+    // Compute norm for this 32-element sub-block
+    float norm_sq = 0.0f;
+    for (int j = 0; j < QK_TURBO3; j++) norm_sq += src[j] * src[j];
+    float norm = sqrt(norm_sq);
+    float inv_norm = norm > 1e-10f ? 1.0f / norm : 0.0f;
+    dst.norm = half(norm);
+
+    // Quantize to 3-bit centroids
+    for (int j = 0; j < QK_TURBO3 / 4; j++) dst.qs[j] = 0;
+    for (int j = 0; j < QK_TURBO3 / 8; j++) dst.signs[j] = 0;
+
+    for (int j = 0; j < QK_TURBO3; j++) {
+        float val = src[j] * inv_norm;
+        uint8_t idx;
+        if      (val < turbo_mid_3bit[0]) idx = 0;
+        else if (val < turbo_mid_3bit[1]) idx = 1;
+        else if (val < turbo_mid_3bit[2]) idx = 2;
+        else if (val < turbo_mid_3bit[3]) idx = 3;
+        else if (val < turbo_mid_3bit[4]) idx = 4;
+        else if (val < turbo_mid_3bit[5]) idx = 5;
+        else if (val < turbo_mid_3bit[6]) idx = 6;
+        else                              idx = 7;
+
+        dst.qs[j / 4] |= (idx & 0x3) << ((j % 4) * 2);
+        if (idx & 0x4) {
+            dst.signs[j / 8] |= (1 << (j % 8));
+        }
+    }
+}
+
+void quantize_turbo4_0(device const float * src, device block_turbo4_0 & dst) {
+#pragma METAL fp math_mode(safe)
+    // 4-bit PolarQuant: normalize → rotate → quantize to 16 centroids → nibble pack
+    float norm_sq = 0.0f;
+    for (int j = 0; j < 128; j++) norm_sq += src[j] * src[j];
+    float grp_norm = sqrt(norm_sq);
+    float inv_norm = grp_norm > 1e-10f ? 1.0f / grp_norm : 0.0f;
+
+    float x[128];
+    for (int j = 0; j < 128; j++) x[j] = src[j] * inv_norm;
+    turbo_rotate_forward(x, turbo_wht_signs1, turbo_wht_signs2);
+
+    for (int j = 0; j < QK_TURBO4 / 2; j++) dst.qs[j] = 0;
+
+    float recon_norm_sq = 0.0f;
+    for (int j = 0; j < 128; j++) {
+        float val = x[j];
+        uint8_t idx;
+        if      (val < turbo_mid_4bit[ 0]) idx = 0;
+        else if (val < turbo_mid_4bit[ 1]) idx = 1;
+        else if (val < turbo_mid_4bit[ 2]) idx = 2;
+        else if (val < turbo_mid_4bit[ 3]) idx = 3;
+        else if (val < turbo_mid_4bit[ 4]) idx = 4;
+        else if (val < turbo_mid_4bit[ 5]) idx = 5;
+        else if (val < turbo_mid_4bit[ 6]) idx = 6;
+        else if (val < turbo_mid_4bit[ 7]) idx = 7;
+        else if (val < turbo_mid_4bit[ 8]) idx = 8;
+        else if (val < turbo_mid_4bit[ 9]) idx = 9;
+        else if (val < turbo_mid_4bit[10]) idx = 10;
+        else if (val < turbo_mid_4bit[11]) idx = 11;
+        else if (val < turbo_mid_4bit[12]) idx = 12;
+        else if (val < turbo_mid_4bit[13]) idx = 13;
+        else if (val < turbo_mid_4bit[14]) idx = 14;
+        else                               idx = 15;
+
+        dst.qs[j / 2] |= (idx & 0xF) << ((j % 2) * 4);
+        recon_norm_sq += turbo_centroids_4bit[idx] * turbo_centroids_4bit[idx];
+    }
+
+    dst.rnorm = half(0.0f);
+    float recon_norm = sqrt(recon_norm_sq);
+    dst.norm = half((recon_norm > 1e-10f) ? grp_norm / recon_norm : grp_norm);
+}
+
+// TurboQuant FA dequant (t4): decode 4 elements of a 128-value block in the
+// WHT-rotated domain (no inverse WHT — the graph un-rotates the attention output).
+// il selects the 4-element chunk (0..31) within the block.
+template <typename type4>
+void dequantize_turbo3_0_t4(device const block_turbo3_0 * xb, short il, thread type4 & reg) {
+    const float norm = (float) xb->norm;
+    // the 4-element chunk shares one qs byte (il) and one signs nibble (il>>1); load once
+    const uint8_t qb = xb->qs[il];
+    const uint8_t sb = xb->signs[il >> 1];
+    const short so = (il & 1) * 4;
+    for (short j = 0; j < 4; j++) {
+        uint8_t low2 = (qb >> (j * 2)) & 0x3;
+        uint8_t hi1  = (sb >> (so + j)) & 0x1;
+        reg[j] = turbo_centroids_3bit[low2 | (hi1 << 2)] * norm;
+    }
+}
+
+template <typename type4>
+void dequantize_turbo2_0_t4(device const block_turbo2_0 * xb, short il, thread type4 & reg) {
+    const float norm = (float) xb->norm;
+    const uint8_t qb = xb->qs[il];  // 4 x 2-bit indices in one byte
+    for (short j = 0; j < 4; j++) {
+        uint8_t idx = (qb >> (j * 2)) & 0x3;
+        reg[j] = turbo_centroids_2bit[idx] * norm;
+    }
+}
+
+template <typename type4>
+void dequantize_turbo4_0_t4(device const block_turbo4_0 * xb, short il, thread type4 & reg) {
+    const float norm = (float) xb->norm;
+    const uint8_t b0 = xb->qs[il*2];      // elements 0,1 (nibbles)
+    const uint8_t b1 = xb->qs[il*2 + 1];  // elements 2,3
+    reg[0] = turbo_centroids_4bit[ b0       & 0xF] * norm;
+    reg[1] = turbo_centroids_4bit[(b0 >> 4) & 0xF] * norm;
+    reg[2] = turbo_centroids_4bit[ b1       & 0xF] * norm;
+    reg[3] = turbo_centroids_4bit[(b1 >> 4) & 0xF] * norm;
 }
 

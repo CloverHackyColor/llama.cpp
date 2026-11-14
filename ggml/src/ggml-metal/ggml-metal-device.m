@@ -2162,7 +2162,11 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 op->src[0]->ne[0] != 192 &&
                 op->src[0]->ne[0] != 256 &&
                 op->src[0]->ne[0] != 320 &&
+                op->src[0]->ne[0] != 384 &&
                 op->src[0]->ne[0] != 512 &&
+                op->src[0]->ne[0] != 576 &&
+                op->src[0]->ne[0] != 640) {
+                return false;
             }
             // AMD dGPUs report no simdgroup_mm and miscompile the upstream vec kernel, so FA is
             // allowed only for the KV pairs our own vec kernel instantiates. This sits before
@@ -2180,7 +2184,14 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 memcpy(&softcap,  ((const int32_t *) op->op_params) + 2, sizeof(float));
                 const enum ggml_type kt = op->src[1]->type;
                 const enum ggml_type vt = op->src[2]->type;
+                const bool k_turbo = (kt == GGML_TYPE_TURBO2_0 || kt == GGML_TYPE_TURBO3_0 || kt == GGML_TYPE_TURBO4_0);
+                const bool v_turbo = (vt == GGML_TYPE_TURBO2_0 || vt == GGML_TYPE_TURBO3_0 || vt == GGML_TYPE_TURBO4_0);
+                const bool k_std = (kt == GGML_TYPE_F16 || kt == GGML_TYPE_Q8_0 || kt == GGML_TYPE_Q4_0 || k_turbo);
+                const bool v_std = (vt == GGML_TYPE_F16 || vt == GGML_TYPE_Q8_0 || vt == GGML_TYPE_Q4_0 || v_turbo);
                 const int64_t dk = op->src[0]->ne[0];
+                // Turbo KV is instantiated for every supported 128-element padded head.
+                const bool turbo_dk_ok = (!k_turbo && !v_turbo) ||
+                    dk == 128 || dk == 256 || dk == 384 || dk == 512 || dk == 640;
                 // A NULL mask is bidirectional attention (vision towers); the kernels
                 // read args.has_mask and treat it as a zero bias.
                 // dk 72 is vision-only and f16-only: it is not a whole number of
@@ -2196,6 +2207,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 const bool simple =
                     dk_ok &&
                     op->src[2]->ne[0] == dk &&
+                    k_std && v_std && turbo_dk_ok &&
                     max_bias == 0.0f && softcap == 0.0f;
                 if (simple) {
                     return true;
@@ -2203,7 +2215,13 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 // MLA: asymmetric head, K is the latent plus the rope tail and V is the bare
                 // latent. deepseek2 is 576/512; mistral4 has a 256-wide latent, so 320/256.
                 const int64_t dv = op->src[2]->ne[0];
+                const bool mla_amd =
                     ((dk == 576 && dv == 512) || (dk == 320 && dv == 256)) &&
+                    (kt == GGML_TYPE_F16 || kt == GGML_TYPE_Q8_0) && kt == vt &&
+                    max_bias == 0.0f && softcap == 0.0f;
+                if (mla_amd) {
+                    return true;
+                }
             }
             // dk 384/640 have no generic instantiation; Turbo KV there is AMD-only (above)
             if (op->src[0]->ne[0] == 384 || op->src[0]->ne[0] == 640) {
@@ -2308,9 +2326,11 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_RWKV_WKV7:
             return true;
         case GGML_OP_GATED_DELTA_NET:
-            return has_simdgroup_reduction && op->src[2]->ne[0] % 32 == 0;
             // wave64: the kernel reduces within 32-lane halves (gdn_sum32).
             return (has_simdgroup_reduction || wave64_decode) && op->src[2]->ne[0] % 32 == 0;
+        case GGML_OP_TURBO_WHT:
+            // 128-element group WHT rotation; head_dim must be a multiple of 128.
+            return op->src[0]->type == GGML_TYPE_F32 && op->src[0]->ne[0] % 128 == 0;
         case GGML_OP_SOLVE_TRI:
             return has_simdgroup_reduction && op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_MUL_MAT: {
@@ -2418,6 +2438,9 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                            case GGML_TYPE_Q5_1:
                            case GGML_TYPE_IQ4_NL:
                            case GGML_TYPE_TQ2_0:
+                           case GGML_TYPE_TURBO2_0:
+                           case GGML_TYPE_TURBO3_0:
+                           case GGML_TYPE_TURBO4_0:
                            case GGML_TYPE_I32:
                                 return true;
                            default:
@@ -2454,6 +2477,11 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                             default:
                                 return false;
                         }
+                    case GGML_TYPE_TURBO2_0:
+                    case GGML_TYPE_TURBO3_0:
+                    case GGML_TYPE_TURBO4_0:
+                        // dequant-only (inverse WHT to f32); no turbo->f16 kernel
+                        return op->type == GGML_TYPE_F32;
                     case GGML_TYPE_I32:
                         return op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_I32;
                     default:
@@ -2462,7 +2490,8 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             }
         case GGML_OP_GET_ROWS:
             return op->src[0]->type != GGML_TYPE_NVFP4 &&
-                   op->src[0]->type != GGML_TYPE_TQ1_0;
+                   op->src[0]->type != GGML_TYPE_TQ1_0 &&
+                   !ggml_metal_type_is_ternary(op->src[0]->type);
         case GGML_OP_SET_ROWS:
             {
                 if (op->src[0]->type == GGML_TYPE_F16) {
@@ -2484,6 +2513,9 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_IQ4_NL:
                     case GGML_TYPE_TQ2_0:
+                    case GGML_TYPE_TURBO2_0:
+                    case GGML_TYPE_TURBO3_0:
+                    case GGML_TYPE_TURBO4_0:
                         return true;
                     default:
                         return false;

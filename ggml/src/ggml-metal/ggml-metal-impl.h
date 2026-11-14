@@ -514,6 +514,7 @@ typedef struct {
     int32_t  has_mask;  // 0 for bidirectional attention (vision towers), which has no mask
     int32_t  n_kv_max_padded; // sparse: length of the per-row index list
 } ggml_metal_kargs_flash_attn_ext_amd;
+
 typedef struct {
     int32_t  ne30;
     int32_t  ne31;
@@ -568,6 +569,17 @@ typedef struct {
     int16_t  r2;
     int16_t  r3;
 } ggml_metal_kargs_mul_mv;
+
+// Three independent decode projections sharing the same activation. The Metal
+// backend recognizes adjacent Q/V/K MUL_MAT nodes and launches them as one grid;
+// each segment retains its own strides because mixed GGUF quants are common.
+typedef struct {
+    ggml_metal_kargs_mul_mv q;
+    ggml_metal_kargs_mul_mv v;
+    ggml_metal_kargs_mul_mv k;
+    uint32_t                nwg_q;
+    uint32_t                nwg_v;
+} ggml_metal_kargs_mul_mv_qvk;
 
 typedef struct {
     int32_t  ne00;
@@ -1041,6 +1053,11 @@ typedef struct {
     uint64_t nb3;
     uint64_t nb_out; // 0 => snapshots are appended after the attn scores (unfused)
 } ggml_metal_kargs_gated_delta_net;
+
+typedef struct {
+    int64_t  n_elements;
+    int32_t  direction;
+} ggml_metal_kargs_turbo_wht;
 
 typedef struct {
     int32_t  ne00;

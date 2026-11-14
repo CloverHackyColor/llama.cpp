@@ -2580,6 +2580,9 @@ struct test_set_rows : public test_case {
     }
 
     double max_nmse_err() override {
+        if (type_dst == GGML_TYPE_TURBO3_0 || type_dst == GGML_TYPE_TURBO4_0) {
+            return 5e-4;
+        }
         if (type_dst == GGML_TYPE_Q2_0 || type_dst == GGML_TYPE_Q4_0 || type_dst == GGML_TYPE_Q4_1 ||
             type_dst == GGML_TYPE_IQ4_NL ||
             type_dst == GGML_TYPE_Q5_0 || type_dst == GGML_TYPE_Q5_1 || type_dst == GGML_TYPE_Q8_0) {
@@ -9526,6 +9529,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_I64, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_I32, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_Q8_0, GGML_TYPE_I32, { 256, 5, 1, 3 }, { 1, 1, }, 1, false));
+    for (ggml_type type : {GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0}) {
+        for (int64_t head : {128, 256, 384, 512, 640}) {
+            test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, type, GGML_TYPE_I64, { head, 7, 1, 2 }, { 1, 1 }, 4, false));
+            test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, type, GGML_TYPE_I32, { head, 7, 1, 2 }, { 1, 1 }, 4, true));
+        }
     }
     for (ggml_type src_type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
         for (ggml_type type : all_types) {
@@ -11446,6 +11454,70 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {2, 1},  4096, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {4, 1},  4096, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 4096, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    for (ggml_type type : {GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0}) {
+        for (int64_t head : {128, 384, 640}) {
+            for (int64_t batch : {1, 16}) {
+                test_cases.emplace_back(new test_flash_attn_ext(
+                    head, head, 4, {1, 1}, 113, batch, true, false,
+                    0.0f, 0.0f, GGML_PREC_F32, type, type));
+            }
+        }
+    }
+
+    // Turbo mixed with a standard type on the other side: the app offers q8_0 keys with
+    // turbo values, and q4_0 pairs were only added later, so cover both directions.
+    for (ggml_type turbo : {GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0}) {
+        for (ggml_type std_t : {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
+            for (int64_t head : {128, 384}) {
+                for (int64_t batch : {1, 16}) {
+                    test_cases.emplace_back(new test_flash_attn_ext(
+                        head, head, 4, {1, 1}, 113, batch, true, false,
+                        0.0f, 0.0f, GGML_PREC_F32, std_t, turbo));
+                    test_cases.emplace_back(new test_flash_attn_ext(
+                        head, head, 4, {1, 1}, 113, batch, true, false,
+                        0.0f, 0.0f, GGML_PREC_F32, turbo, std_t));
+                }
+            }
+        }
+    }
+
+    // Directed AMD wave32 coverage. kv=257 makes these cases easy to select as a
+    // compact suite and exercises decode vec, medium-batch tile, and large-batch PF.
+    for (ggml_type type_K : {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
+        for (ggml_type type_V : {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
+            for (int64_t head : {64, 128, 256, 512}) {
+                for (int64_t batch : {1, 16, 32}) {
+                    test_cases.emplace_back(new test_flash_attn_ext(
+                        head, head, 4, {1, 1}, 257, batch, true, false,
+                        0.0f, 0.0f, GGML_PREC_F32, type_K, type_V));
+                }
+            }
+            // Long-cache single-token decode selects the split-WG path at dk256/512.
+            for (int64_t head : {256, 512}) {
+                test_cases.emplace_back(new test_flash_attn_ext(
+                    head, head, 4, {1, 1}, 1025, 1, true, false,
+                    0.0f, 0.0f, GGML_PREC_F32, type_K, type_V));
+            }
+        }
+    }
+    for (int64_t batch : {1, 16, 32}) {
+        test_cases.emplace_back(new test_flash_attn_ext(
+            72, 72, 4, {1, 1}, 257, batch, true, false,
+            0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    }
+    // Directed MLA coverage: asymmetric K=576/V=512 exercises AMD vec decode
+    // and the dedicated tile prefill kernel for both supported cache types.
+    for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        for (int64_t batch : {1, 16, 32}) {
+            test_cases.emplace_back(new test_flash_attn_ext(
+                576, 512, 4, {1, 1}, 257, batch, true, false,
+                0.0f, 0.0f, GGML_PREC_F32, type_KV, type_KV));
+        }
+        // Long-cache decode exercises the 32-way cache split and reduction.
+        test_cases.emplace_back(new test_flash_attn_ext(
+            576, 512, 4, {1, 1}, 1025, 1, true, false,
+            0.0f, 0.0f, GGML_PREC_F32, type_KV, type_KV));
+    }
 
     // dense-allocated (non-view) quant K/V at batch >= 64, in cache and native layouts
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
