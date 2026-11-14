@@ -11,6 +11,8 @@
 #include <Metal/Metal.h>
 
 #include <stdatomic.h>
+#include <unistd.h>
+
 
 #ifndef TARGET_OS_VISION
 #define TARGET_OS_VISION 0
@@ -864,10 +866,6 @@ void ggml_metal_encoder_debug_group_pop (ggml_metal_encoder_t encoder) {
 }
 
 void ggml_metal_encoder_set_pipeline(ggml_metal_encoder_t encoder, struct ggml_metal_pipeline_with_params pipeline) {
-    if (!pipeline.pipeline) {
-        GGML_ABORT("%s: nil Metal pipeline (missing kernel; see compile_pipeline log above)\n", __func__);
-    }
-
     [encoder->obj setComputePipelineState:pipeline.pipeline->obj];
 }
 
@@ -880,9 +878,6 @@ void ggml_metal_encoder_set_buffer(ggml_metal_encoder_t encoder, struct ggml_met
 }
 
 void ggml_metal_encoder_set_threadgroup_memory_size(ggml_metal_encoder_t encoder, size_t size, int idx) {
-    // ref: https://developer.apple.com/documentation/metal/mtlcomputecommandencoder/setthreadgroupmemorylength(_:index:)
-    GGML_ASSERT(size % 16 == 0);
-
     [encoder->obj setThreadgroupMemoryLength:size atIndex:idx];
 }
 
@@ -897,6 +892,8 @@ void ggml_metal_encoder_memory_barrier(ggml_metal_encoder_t encoder) {
 void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder) {
     [encoder->obj endEncoding];
 }
+
+#define GGML_METAL_HOST_WRAP_MAX 256
 
 struct ggml_metal_device {
     id<MTLDevice> mtl_device;
@@ -917,6 +914,32 @@ struct ggml_metal_device {
 
     // virtual address for GPU memory allocations
     atomic_uintptr_t addr_virt;
+
+    // reused host-visible staging buffer for small private-buffer transfers;
+    // wrapping the caller's pointer allocates a fresh kernel resource per call,
+    // which on AMD accumulates across long runs until transfers crawl
+    id<MTLBuffer> stage_buf;
+    NSRecursiveLock * stage_lock;   // recursive: a read batch holds it across stage_get calls
+    // upload ring: the blit shares the compute queue, so the only wait is slot reuse
+    id<MTLBuffer>        stage_set_bufs[4];
+    id<MTLCommandBuffer> stage_set_cmds[4];
+    int                  stage_set_cur;
+    // open read batch: blits accumulate into one command buffer, one wait at end
+    id<MTLBlitCommandEncoder>  stage_batch_enc;
+    size_t                     stage_batch_used;
+    int                        stage_batch_n;
+    struct { void * dst; size_t off; size_t size; } stage_batch_items[16];
+
+    // cached no-copy wraps of host memory regions used as blit sources, so
+    // repeated uploads of the same weights don't churn kernel resources
+    struct {
+        const void *  base;
+        size_t        size;
+        id<MTLBuffer> buf;
+    } host_wraps[GGML_METAL_HOST_WRAP_MAX];
+    int n_host_wraps;
+    size_t host_wrap_bytes;
+    NSLock * wrap_lock;
 };
 
 //
@@ -975,7 +998,7 @@ ggml_metal_rsets_t ggml_metal_rsets_init(ggml_metal_device_t dev) {
     // by default keep the memory wired for 3 minutes
     res->keep_alive_s = 3*60;
 
-    const char * GGML_METAL_RESIDENCY_KEEP_ALIVE_S = getenv("GGML_METAL_RESIDENCY_KEEP_ALIVE_S");
+    const char * GGML_METAL_RESIDENCY_KEEP_ALIVE_S = TOSH_ENV("GGML_METAL_RESIDENCY_KEEP_ALIVE_S");
     if (GGML_METAL_RESIDENCY_KEEP_ALIVE_S) {
         res->keep_alive_s = atoi(GGML_METAL_RESIDENCY_KEEP_ALIVE_S);
     }
@@ -1079,6 +1102,35 @@ static const struct {
 #undef DEV
 };
 
+// macOS can hand out an integrated iGPU (isLowPower, ~1 GB) as the system
+// default. Auto-selection skips it; explicit DEVICE_INDEX/LIST can still pin it.
+static id<MTLDevice> ggml_metal_device_default_discrete(void) {
+    id<MTLDevice> def = MTLCreateSystemDefaultDevice();
+    if (def == nil || !def.isLowPower) {
+        return def;
+    }
+    NSArray<id<MTLDevice>> * all = MTLCopyAllDevices();
+    id<MTLDevice> best = nil;
+    for (id<MTLDevice> d in all) {
+        if (d.isLowPower) continue;
+        if (best == nil || d.recommendedMaxWorkingSetSize > best.recommendedMaxWorkingSetSize) {
+            best = d;
+        }
+    }
+    if (best != nil) {
+        fprintf(stderr, "ggml_metal: system default GPU is integrated (%s); using %s instead (pin GGML_METAL_DEVICE_INDEX to override)\n",
+                def.name.UTF8String, best.name.UTF8String);
+        [best retain];
+        [def release];
+        [all release];
+        return best;
+    }
+    [all release];
+    return def;
+}
+
+    const char * s = TOSH_ENV("TOSH_MTL_QUEUE_DEPTH");
+
 static enum ggml_metal_device_id ggml_metal_device_id_parse(const char * name) {
     if (!name) {
         return GGML_METAL_DEVICE_GENERIC;
@@ -1114,7 +1166,51 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
 
     @autoreleasepool {
         if (dev->mtl_device == nil) {
-            dev->mtl_device = MTLCreateSystemDefaultDevice();
+            // `device` is the logical slot and indexes buffer types downstream, so it must stay as
+            // given; the env vars below only choose which MTLCopyAllDevices() GPU each slot maps to.
+            //   GGML_METAL_DEVICE_INDEX=N    pin the single device to physical GPU N
+            //   GGML_METAL_DEVICES=K         register K devices, slot i -> physical i
+            //   GGML_METAL_DEVICE_LIST=a,b   register the listed GPUs, slot i -> physical list[i]
+            const char * env_idx  = TOSH_ENV("GGML_METAL_DEVICE_INDEX");
+            const char * env_num  = TOSH_ENV("GGML_METAL_DEVICES");
+            const char * env_list = TOSH_ENV("GGML_METAL_DEVICE_LIST");
+            const int    num_dev = env_num ? atoi(env_num) : 1;
+            if (env_idx != NULL || num_dev > 1 || env_list != NULL) {
+                const int base = env_idx ? atoi(env_idx) : 0;
+                int phys = base + device;
+                if (env_list != NULL) {
+                    phys = -1;
+                    const char * p = env_list;
+                    for (int i = 0; ; ++i) {
+                        if (i == device) { phys = atoi(p); break; }
+                        while (*p != '\0' && *p != ',') ++p;
+                        if (*p == '\0') break;
+                        ++p;
+                    }
+                }
+                NSArray<id<MTLDevice>> * all = MTLCopyAllDevices();
+                if (env_list == NULL && env_idx == NULL && num_dev > 1) {
+                    // DEVICES=K without index/list: slot i -> i-th discrete GPU;
+                    // raw index when there aren't enough discrete devices.
+                    int found = -1;
+                    int discrete = -1;
+                    for (int i = 0; i < (int) all.count; ++i) {
+                        if (all[i].isLowPower) continue;
+                        if (++found == device) { discrete = i; break; }
+                    }
+                    if (discrete >= 0) {
+                        phys = discrete;
+                    }
+                }
+                if (phys >= 0 && phys < (int) all.count) {
+                    dev->mtl_device = [all[phys] retain];
+                } else {
+                    dev->mtl_device = ggml_metal_device_default_discrete();
+                }
+                [all release];
+            } else {
+                dev->mtl_device = ggml_metal_device_default_discrete();
+            }
 
             if (dev->mtl_device) {
                 dev->mtl_queue = [dev->mtl_device newCommandQueue];
@@ -1122,6 +1218,8 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
                     GGML_LOG_ERROR("%s: error: failed to create command queue\n", __func__);
                 }
 
+                dev->stage_lock = [[NSRecursiveLock alloc] init];
+                dev->wrap_lock  = [[NSLock alloc] init];
                 dev->addr_virt = 0x000000400ULL;
 
                 dev->props.device = device;
@@ -1131,20 +1229,95 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
                 dev->props.device_phys = 0;
                 dev->props.device_virt = device;
 
+                // Probe the hardware SIMD-group width (threadExecutionWidth). All Metal
+                // kernels here assume a 32-wide simdgroup, which holds on Apple Silicon and
+                // AMD RDNA. AMD GCN/Vega report 64, where that assumption breaks (garbled
+                // output). We compile a trivial pipeline and read its threadExecutionWidth.
+                dev->props.simd_width = 32; // safe default
+                {
+                    NSError * probe_err = nil;
+                    id<MTLLibrary> probe_lib = [dev->mtl_device newLibraryWithSource:
+                        @"#include <metal_stdlib>\nusing namespace metal;\nkernel void ggml_probe_simd(device float* x [[buffer(0)]], uint i [[thread_position_in_grid]]) { x[i] = x[i]; }"
+                        options:nil error:&probe_err];
+                    if (probe_lib) {
+                        id<MTLFunction> probe_fn = [probe_lib newFunctionWithName:@"ggml_probe_simd"];
+                        if (probe_fn) {
+                            id<MTLComputePipelineState> probe_ps =
+                                [dev->mtl_device newComputePipelineStateWithFunction:probe_fn error:&probe_err];
+                            if (probe_ps && probe_ps.threadExecutionWidth > 0) {
+                                dev->props.simd_width = (int) probe_ps.threadExecutionWidth;
+                            }
+                            [probe_ps release];
+                            [probe_fn release];
+                        }
+                        [probe_lib release];
+                    }
+                    GGML_LOG_INFO("%s: probed SIMD-group width = %d\n", __func__, dev->props.simd_width);
+                    // Also print unconditionally so the value is visible in captured logs even when
+                    // the ggml log callback filters init-time INFO messages. macOS renumbers the
+                    // devices on every reboot, so the slot index alone does not identify the card.
+                    fprintf(stderr, "ggml_metal: device %d: %s (peer group %llu, %s) probed SIMD-group width = %d (32 = Apple/AMD RDNA, 64 = AMD GCN/Vega)\n",
+                            device, dev->mtl_device.name.UTF8String,
+                            (unsigned long long) dev->mtl_device.peerGroupID,
+                            dev->mtl_device.peerGroupID == 0 ? "not bridged" : "bridged",
+                            dev->props.simd_width);
+                    // Expose the measured width to ToshLLM's graph-level AMD FA policy.
+                    // A wave64 process records 64 and therefore never takes the RDNA-only
+                    // head-64 prefill path below.
+                    char simd_width_env[16];
+                    snprintf(simd_width_env, sizeof(simd_width_env), "%d", dev->props.simd_width);
+                    setenv("TOSH_METAL_SIMD_WIDTH", simd_width_env, 1);
+                }
                 dev->props.has_simdgroup_reduction  = [dev->mtl_device supportsFamily:MTLGPUFamilyApple7];
                 dev->props.has_simdgroup_reduction |= [dev->mtl_device supportsFamily:MTLGPUFamilyMetal3_GGML];
+                // simdgroup reduction kernels produce corrupted output on AMD RDNA 2 (e.g. RX 6700 XT)
+                if (TOSH_ENV("GGML_METAL_SIMDGROUP_REDUCTION_DISABLE") != NULL) {
+                    dev->props.has_simdgroup_reduction = false;
+                }
+
+                // wave64 GPUs (AMD GCN/Vega): the 32-wide simdgroup reduction and mat-vec
+                // kernels corrupt output, so route them to the CPU; only the wave-agnostic
+                // manual mul_mm below runs on the GPU. Gated off for wave32 (Apple/RDNA).
+                // GGML_METAL_WAVE64_UNSAFE=1 keeps the GPU paths for debugging.
+                const bool is_wave64 =
+                    dev->props.simd_width != 32 &&
+                    ![dev->mtl_device supportsFamily:MTLGPUFamilyApple1] &&
+                    TOSH_ENV("GGML_METAL_WAVE64_UNSAFE") == NULL;
+                if (is_wave64) {
+                    fprintf(stderr, "ggml_metal: wave64 mode (SIMD width %d): GPU prefill matmul, "
+                                    "CPU decode/reductions for correct output\n",
+                            dev->props.simd_width);
+                    dev->props.has_simdgroup_reduction = false;
+                }
+                    const char * force = TOSH_ENV("TOSH_MV_ALIGN");
+                // (large tg win, validated on GCN); escape hatch forces it off.
+                // GGML_METAL_WAVE64_SAFEMODE is the user-facing alias the app documents.
+                dev->props.wave64_decode = is_wave64 && TOSH_ENV("GGML_METAL_WAVE64_DECODE_DISABLE") == NULL
+                                                     && TOSH_ENV("GGML_METAL_WAVE64_SAFEMODE") == NULL;
+                if (dev->props.wave64_decode) {
 
                 dev->props.has_simdgroup_mm = [dev->mtl_device supportsFamily:MTLGPUFamilyApple7];
+
+                // Manual tiled mul_mm replaces the missing simdgroup-matrix path on AMD.
+                // wave32 gates on simdgroup reduction; wave64 uses the same wave-agnostic kernel.
+                dev->props.use_mm_manual =
+                    !dev->props.has_simdgroup_mm &&
+                    ![dev->mtl_device supportsFamily:MTLGPUFamilyApple1] &&
+                    (dev->props.simd_width == 32 ? dev->props.has_simdgroup_reduction : is_wave64);
+                if (TOSH_ENV("GGML_METAL_MM_MANUAL_DISABLE") != NULL) {
+                    dev->props.use_mm_manual = false;
+                }
+
                 dev->props.has_unified_memory = dev->mtl_device.hasUnifiedMemory;
 
                 dev->props.has_bfloat  = [dev->mtl_device supportsFamily:MTLGPUFamilyMetal3_GGML];
                 dev->props.has_bfloat |= [dev->mtl_device supportsFamily:MTLGPUFamilyApple6];
-                if (getenv("GGML_METAL_BF16_DISABLE") != NULL) {
+                if (TOSH_ENV("GGML_METAL_BF16_DISABLE") != NULL) {
                     dev->props.has_bfloat = false;
                 }
 
                 dev->props.has_tensor = [dev->mtl_device supportsFamily:MTLGPUFamilyMetal4_GGML];
-                if (getenv("GGML_METAL_TENSOR_DISABLE") != NULL) {
+                if (TOSH_ENV("GGML_METAL_TENSOR_DISABLE") != NULL) {
                     dev->props.has_tensor = false;
                 }
 
@@ -1153,7 +1326,7 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
                 // - M4, M4 Max: no significant difference
                 //
                 // TODO: try to update the tensor API kernels to at least match the simdgroup performance
-                if (getenv("GGML_METAL_TENSOR_ENABLE") == NULL &&
+                if (TOSH_ENV("GGML_METAL_TENSOR_ENABLE") == NULL &&
                     ![[dev->mtl_device name] containsString:@"M5"] &&
                     ![[dev->mtl_device name] containsString:@"M6"] &&
                     ![[dev->mtl_device name] containsString:@"A19"] &&
@@ -1264,7 +1437,7 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
 
                 dev->props.use_residency_sets = true;
 #if defined(GGML_METAL_HAS_RESIDENCY_SETS)
-                dev->props.use_residency_sets = getenv("GGML_METAL_NO_RESIDENCY") == nil;
+                dev->props.use_residency_sets = TOSH_ENV("GGML_METAL_NO_RESIDENCY") == nil;
 #endif
 
                 dev->props.use_shared_buffers = dev->props.has_unified_memory;
@@ -1272,18 +1445,30 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
                 // In case of eGPU, shared memory may be preferable.
                 dev->props.use_shared_buffers |= [dev->mtl_device location] == MTLDeviceLocationExternal;
 #endif
-                if (getenv("GGML_METAL_SHARED_BUFFERS_DISABLE") != NULL) {
+                if (TOSH_ENV("GGML_METAL_SHARED_BUFFERS_DISABLE") != NULL) {
                     dev->props.use_shared_buffers = false;
                 }
-                if (getenv("GGML_METAL_SHARED_BUFFERS_ENABLE") != NULL) {
+                if (TOSH_ENV("GGML_METAL_SHARED_BUFFERS_ENABLE") != NULL) {
                     dev->props.use_shared_buffers = true;
                 }
 
                 dev->props.device_id = ggml_metal_device_id_parse([[dev->mtl_device name] UTF8String]);
 
-                dev->props.op_offload_min_batch_size  = getenv("GGML_OP_OFFLOAD_MIN_BATCH") ? atoi(getenv("GGML_OP_OFFLOAD_MIN_BATCH")) : 32;
+                dev->props.op_offload_min_batch_size  = TOSH_ENV("GGML_OP_OFFLOAD_MIN_BATCH") ? atoi(TOSH_ENV("GGML_OP_OFFLOAD_MIN_BATCH")) : 32;
 
                 dev->props.max_buffer_size            = dev->mtl_device.maxBufferLength;
+
+                // a driver that advertises a large maxBufferLength can still refuse one allocation
+                // of that size. Capping what we advertise makes ggml split the weights into several
+                // buffers itself, which is the one place that knows no tensor may straddle them.
+                // The 4 GiB failure that motivated this was reported by Slice on an RX 570:
+                // https://www.insanelymac.com/forum/profile/112217-slice/
+                if (TOSH_ENV("TOSH_METAL_MAX_BUFFER_MB")) {
+                    const size_t cap = (size_t) atoll(TOSH_ENV("TOSH_METAL_MAX_BUFFER_MB")) * 1024 * 1024;
+                    if (cap > 0 && cap < dev->props.max_buffer_size) {
+                        dev->props.max_buffer_size = cap;
+                        fprintf(stderr, "ggml_metal: max single buffer capped to %zu MiB by TOSH_METAL_MAX_BUFFER_MB\n", cap / 1024 / 1024);
+                    }
                 dev->props.max_theadgroup_memory_size = dev->mtl_device.maxThreadgroupMemoryLength;
                 if (@available(macOS 10.12, iOS 16.0, *)) {
                     dev->props.max_working_set_size   = dev->mtl_device.recommendedMaxWorkingSetSize;
@@ -1381,6 +1566,33 @@ void ggml_metal_device_free(ggml_metal_device_t dev) {
         ggml_metal_library_free(dev->library);
         dev->library = NULL;
 
+        if (dev->stage_buf) {
+            [dev->stage_buf release];
+            dev->stage_buf = nil;
+        }
+
+        ggml_metal_device_upload_drain(dev);
+        for (int i = 0; i < 4; i++) {
+            [dev->stage_set_bufs[i] release];
+            dev->stage_set_bufs[i] = nil;
+        }
+
+        if (dev->stage_lock) {
+            [dev->stage_lock release];
+            dev->stage_lock = nil;
+        }
+
+        for (int i = 0; i < dev->n_host_wraps; i++) {
+            [dev->host_wraps[i].buf release];
+        }
+        dev->n_host_wraps = 0;
+        dev->host_wrap_bytes = 0;
+
+        if (dev->wrap_lock) {
+            [dev->wrap_lock release];
+            dev->wrap_lock = nil;
+        }
+
         if (dev->mtl_queue) {
             [dev->mtl_queue release];
             dev->mtl_queue = nil;
@@ -1403,6 +1615,105 @@ void * ggml_metal_device_get_queue(ggml_metal_device_t dev) {
     return dev->mtl_queue;
 }
 
+// prefetch contexts get their own queue so their blits can overlap the
+// primary context's compute; falls back to the shared queue on failure
+void * ggml_metal_device_acquire_queue(ggml_metal_device_t dev, bool * owned) {
+    *owned = false;
+
+    if (queue == nil) {
+        return dev->mtl_queue;
+    }
+
+    GGML_LOG_INFO("%s: created a secondary command queue for a prefetch context\n", __func__);
+
+    *owned = true;
+    return queue;
+}
+
+void ggml_metal_device_release_queue(ggml_metal_device_t dev, void * queue_raw, bool owned) {
+    if (owned) {
+        id<MTLCommandQueue> queue = (id<MTLCommandQueue>) queue_raw;
+        [queue release];
+    }
+
+    GGML_UNUSED(dev);
+}
+
+// cached no-copy wrap of the host pages containing [data, data + size), so
+// repeated uploads of stable host memory need no allocation or memcpy
+void * ggml_metal_device_wrap_host(ggml_metal_device_t dev, const void * data, size_t size, size_t * offs) {
+    if (size == 0 || data == NULL) {
+        return NULL;
+    }
+
+    const uintptr_t page = (uintptr_t) sysconf(_SC_PAGESIZE);
+
+    const uintptr_t base = (uintptr_t) data & ~(page - 1);
+    const size_t    len  = (((uintptr_t) data + size + page - 1) & ~(page - 1)) - base;
+
+    [dev->wrap_lock lock];
+
+    for (int i = 0; i < dev->n_host_wraps; i++) {
+        if (base >= (uintptr_t) dev->host_wraps[i].base &&
+            base + len <= (uintptr_t) dev->host_wraps[i].base + dev->host_wraps[i].size) {
+            id<MTLBuffer> buf = [[dev->host_wraps[i].buf retain] autorelease];
+            [dev->wrap_lock unlock];
+
+            *offs = (uintptr_t) data - (uintptr_t) dev->host_wraps[i].base;
+            return buf;
+        }
+    }
+
+    atomic_store_explicit(&dev->rsets->d_loop, dev->rsets->loops_per_s*dev->rsets->keep_alive_s, memory_order_relaxed);
+}
+    }
+
+    // Left uncapped, a large MoE offload maps its whole host-resident expert set here and the
+    // device stops granting any new shared buffer: measured failing a 1.21 GiB allocation with
+    // 142.75 GiB wrapped against a 34.34 GiB working set. The cap costs no speed (measured
+    // identical at 8 and 16 GiB) and sends the overflow to the bounded staging ring instead.
+    // GGML_METAL_HOST_WRAP_LIMIT_MB overrides it; 0 restores the uncapped behaviour.
+    size_t limit = (size_t) dev->props.max_working_set_size;
+    const char * limit_mb = TOSH_ENV("GGML_METAL_HOST_WRAP_LIMIT_MB");
+    if (limit_mb != NULL) {
+        limit = (size_t) strtoull(limit_mb, NULL, 10)*1024*1024;
+    }
+    if (limit > 0 && (len > limit || dev->host_wrap_bytes > limit - len)) {
+        [dev->wrap_lock unlock];
+        return NULL;
+    }
+
+    id<MTLBuffer> buf = [dev->mtl_device newBufferWithBytesNoCopy:(void *) base
+                                                           length:len
+                                                          options:MTLResourceStorageModeShared
+                                                      deallocator:nil];
+    if (buf == nil) {
+        [dev->wrap_lock unlock];
+        return NULL;
+    }
+
+    if (dev->n_host_wraps == GGML_METAL_HOST_WRAP_MAX) {
+        // evict the oldest entry; in-flight command buffers retain the resource
+        dev->host_wrap_bytes -= dev->host_wraps[0].size;
+        [dev->host_wraps[0].buf release];
+        memmove(&dev->host_wraps[0], &dev->host_wraps[1], (GGML_METAL_HOST_WRAP_MAX - 1)*sizeof(dev->host_wraps[0]));
+        dev->n_host_wraps--;
+    }
+
+    dev->host_wraps[dev->n_host_wraps].base = (const void *) base;
+    dev->host_wraps[dev->n_host_wraps].size = len;
+    dev->host_wraps[dev->n_host_wraps].buf  = buf;
+    dev->n_host_wraps++;
+    dev->host_wrap_bytes += len;
+
+    [[buf retain] autorelease];
+
+    [dev->wrap_lock unlock];
+
+    *offs = (uintptr_t) data - base;
+    return buf;
+}
+
 ggml_metal_library_t ggml_metal_device_get_library(ggml_metal_device_t dev) {
     return dev->library;
 }
@@ -1423,28 +1734,6 @@ void ggml_metal_device_rsets_add(ggml_metal_device_t dev, ggml_metal_rset_t rset
 
 void ggml_metal_device_rsets_rm(ggml_metal_device_t dev, ggml_metal_rset_t rset) {
     if (rset == nil) {
-        return;
-    }
-
-    GGML_ASSERT(dev->rsets);
-
-    [dev->rsets->lock lock];
-
-    [dev->rsets->data removeObject:rset];
-
-    [dev->rsets->lock unlock];
-}
-
-void ggml_metal_device_rsets_keep_alive(ggml_metal_device_t dev) {
-    if (dev->rsets == NULL) {
-        return;
-    }
-
-    atomic_store_explicit(&dev->rsets->d_loop, dev->rsets->loops_per_s*dev->rsets->keep_alive_s, memory_order_relaxed);
-}
-
-struct ggml_metal_event {
-    void * obj; // id<MTLSharedEvent>
 
     atomic_int value;
 };
@@ -1535,9 +1824,17 @@ static bool ggml_metal_supports_mul_mat_op(
     return mm_path;
 }
 
+// TQ1_0/TQ2_0 have no Metal kernels at all: claiming them compiles a pipeline that does
+// not exist, which aborts instead of falling back to the CPU backend
+static bool ggml_metal_type_is_ternary(enum ggml_type t) {
+    return t == GGML_TYPE_TQ1_0 || t == GGML_TYPE_TQ2_0;
+}
+
 bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_tensor * op) {
     const bool has_simdgroup_mm        = dev->props.has_simdgroup_mm;
     const bool has_simdgroup_reduction = dev->props.has_simdgroup_reduction;
+    const bool use_mm_manual           = dev->props.use_mm_manual;
+    const bool wave64_decode           = dev->props.wave64_decode;
     const bool has_bfloat              = dev->props.has_bfloat;
 
     if (!has_bfloat) {
@@ -1674,13 +1971,16 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             return has_simdgroup_reduction && ggml_is_contiguous(op->src[0]);
         case GGML_OP_TRI:
             return ggml_is_contiguous_rows(op->src[0]);
+        case GGML_OP_SOFT_MAX:
+            // wave64: soft_max is now width-agnostic, so allow it on GPU behind the decode opt-in.
+            return (has_simdgroup_reduction || wave64_decode) && ggml_is_contiguous_rows(op->src[0]);
         case GGML_OP_SUM_ROWS:
         case GGML_OP_CUMSUM:
         case GGML_OP_MEAN:
-        case GGML_OP_SOFT_MAX:
         case GGML_OP_GROUP_NORM:
         case GGML_OP_L2_NORM:
-            return has_simdgroup_reduction && ggml_is_contiguous_rows(op->src[0]);
+            // wave64: width-agnostic kernels (real-width shmem and lane indexing).
+            return (has_simdgroup_reduction || wave64_decode) && ggml_is_contiguous_rows(op->src[0]);
         case GGML_OP_COUNT_EQUAL:
             return has_simdgroup_reduction &&
                 op->src[0]->type == GGML_TYPE_I32 &&
@@ -1690,7 +1990,9 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             return has_simdgroup_reduction;
         case GGML_OP_NORM:
         case GGML_OP_RMS_NORM:
-            return has_simdgroup_reduction && (ggml_is_contiguous_rows(op->src[0]));
+            // wave64: norm/rms_norm kernels are width-agnostic (simd_sum + shmem sized by
+            // the real width), so allow them on GPU behind the decode opt-in.
+            return (has_simdgroup_reduction || wave64_decode) && (ggml_is_contiguous_rows(op->src[0]));
         case GGML_OP_ROPE:
         case GGML_OP_ROPE_BACK:
             return true;
@@ -1738,7 +2040,34 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 op->src[0]->ne[0] != 256 &&
                 op->src[0]->ne[0] != 320 &&
                 op->src[0]->ne[0] != 512 &&
-                op->src[0]->ne[0] != 576) {
+            }
+            // AMD dGPUs report no simdgroup_mm and miscompile the upstream vec kernel, so FA is
+            // allowed only for the KV pairs our own vec kernel instantiates. This sits before
+            // the K==V gate because that kernel takes K and V independently.
+            const bool fa_amd_width_ok = dev->props.simd_width == 32
+                ? has_simdgroup_reduction
+                : wave64_decode;
+            if (TOSH_ENV("TOSH_FA_AMD") != NULL &&
+                !has_simdgroup_mm && fa_amd_width_ok &&
+                float max_bias = 0.0f;
+                float softcap  = 0.0f;
+                memcpy(&max_bias, ((const int32_t *) op->op_params) + 1, sizeof(float));
+                memcpy(&softcap,  ((const int32_t *) op->op_params) + 2, sizeof(float));
+                const enum ggml_type kt = op->src[1]->type;
+                const enum ggml_type vt = op->src[2]->type;
+                const int64_t dk = op->src[0]->ne[0];
+                // A NULL mask is bidirectional attention (vision towers); the kernels
+                // read args.has_mask and treat it as a zero bias.
+                // dk 72 is vision-only and f16-only: it is not a whole number of
+                // 32-element quant blocks, so K/V can never be quantized there.
+                const bool f16_kv = kt == GGML_TYPE_F16 && vt == GGML_TYPE_F16;
+                const bool dk_ok =
+                const bool simple =
+                    dk_ok &&
+                    op->src[2]->ne[0] == dk &&
+                    max_bias == 0.0f && softcap == 0.0f;
+                if (simple) {
+                    return true;
                 return false;
             }
             if (op->src[1]->ne[0] == 72 && op->src[1]->ne[0] != op->src[2]->ne[0]) {
@@ -1833,28 +2162,98 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_SSM_SCAN:
             return has_simdgroup_reduction;
         case GGML_OP_SSM_CONV:
-            return has_simdgroup_reduction;
+            // wave64: per-thread serial dot, no simdgroup reduction needed.
+            return has_simdgroup_reduction || wave64_decode;
         case GGML_OP_RWKV_WKV6:
         case GGML_OP_RWKV_WKV7:
             return true;
         case GGML_OP_GATED_DELTA_NET:
             return has_simdgroup_reduction && op->src[2]->ne[0] % 32 == 0;
+            // wave64: the kernel reduces within 32-lane halves (gdn_sum32).
+            return (has_simdgroup_reduction || wave64_decode) && op->src[2]->ne[0] % 32 == 0;
         case GGML_OP_SOLVE_TRI:
             return has_simdgroup_reduction && op->src[0]->type == GGML_TYPE_F32;
-        case GGML_OP_MUL_MAT:
+        case GGML_OP_MUL_MAT: {
             // the FWHT kernels read an F16 source directly; every other F16 src1 path
             // still goes through ggml_metal_supports_mul_mat_op
             if (op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F16 &&
                 ggml_metal_op_mul_mat_use_fwht(op, dev->props.max_theadgroup_memory_size)) {
                 return has_simdgroup_reduction;
             }
-            return ggml_metal_supports_mul_mat_op(
-                    has_simdgroup_reduction, op, true,
-                    ggml_metal_op_mul_mat_use_mm(op, has_simdgroup_mm));
-        case GGML_OP_MUL_MAT_ID:
-            return ggml_metal_supports_mul_mat_op(
-                    has_simdgroup_reduction, op, false,
-                    ggml_metal_op_mul_mat_id_use_mm(op, has_simdgroup_mm));
+            if (op->src[0]->type == GGML_TYPE_NVFP4 || ggml_metal_type_is_ternary(op->src[0]->type)) {
+                return false;
+            }
+            if (has_simdgroup_reduction) {
+                return ggml_metal_supports_mul_mat_op(
+                        has_simdgroup_reduction, op, true,
+                        ggml_metal_op_mul_mat_use_mm(op, has_simdgroup_mm));
+            }
+            // wave64 prefill: the manual tiled mul_mm (batched). Mirror the dispatch check.
+            const bool prefill =
+                use_mm_manual &&
+                !ggml_is_transposed(op->src[0]) && !ggml_is_transposed(op->src[1]) &&
+                op->src[0]->ne[0] >= 64 && op->src[1]->ne[1] > 8;
+            // wave64 decode (experimental, opt-in): the width-parameterized mat-vec kernels.
+            const bool decode =
+                wave64_decode && op->src[0]->ne[0] >= 32 &&
+                (op->src[0]->type == GGML_TYPE_F16 ||
+                 op->src[0]->type == GGML_TYPE_F32 ||
+                 op->src[0]->type == GGML_TYPE_BF16 ||
+                 op->src[0]->type == GGML_TYPE_Q8_0 ||
+                 op->src[0]->type == GGML_TYPE_Q4_K ||
+                 op->src[0]->type == GGML_TYPE_Q5_K ||
+                 op->src[0]->type == GGML_TYPE_Q6_K ||
+                 op->src[0]->type == GGML_TYPE_Q2_K ||
+                 op->src[0]->type == GGML_TYPE_Q3_K ||
+                 op->src[0]->type == GGML_TYPE_MXFP4 ||
+                 op->src[0]->type == GGML_TYPE_IQ2_XXS ||
+                 op->src[0]->type == GGML_TYPE_IQ2_XS ||
+                 op->src[0]->type == GGML_TYPE_IQ3_XXS ||
+                 op->src[0]->type == GGML_TYPE_IQ3_S ||
+                 op->src[0]->type == GGML_TYPE_IQ2_S ||
+                 op->src[0]->type == GGML_TYPE_IQ1_S ||
+                 op->src[0]->type == GGML_TYPE_IQ1_M ||
+                 op->src[0]->type == GGML_TYPE_IQ4_NL ||
+                 op->src[0]->type == GGML_TYPE_IQ4_XS ||
+                 op->src[0]->type == GGML_TYPE_Q4_0 ||
+                 op->src[0]->type == GGML_TYPE_Q4_1 ||
+                 op->src[0]->type == GGML_TYPE_Q5_0 ||
+            return prefill || decode;
+        }
+        case GGML_OP_MUL_MAT_ID: {
+            if (op->src[0]->type == GGML_TYPE_NVFP4 || ggml_metal_type_is_ternary(op->src[0]->type)) {
+                return false;
+            }
+            if (has_simdgroup_reduction) {
+                return ggml_metal_supports_mul_mat_op(
+                        has_simdgroup_reduction, op, false,
+                        ggml_metal_op_mul_mat_id_use_mm(op, has_simdgroup_mm));
+            }
+            // wave64: mul_mv_id reuses the width-parameterized decode impls and the
+            // manual mm_id prefill uses virtual 32-wide indices; both run on the GPU.
+            return wave64_decode && op->src[0]->ne[0] >= 32 &&
+                (op->src[0]->type == GGML_TYPE_F16 ||
+                 op->src[0]->type == GGML_TYPE_F32 ||
+                 op->src[0]->type == GGML_TYPE_BF16 ||
+                 op->src[0]->type == GGML_TYPE_Q8_0 ||
+                 op->src[0]->type == GGML_TYPE_Q4_K ||
+                 op->src[0]->type == GGML_TYPE_Q5_K ||
+                 op->src[0]->type == GGML_TYPE_Q6_K ||
+                 op->src[0]->type == GGML_TYPE_Q2_K ||
+                 op->src[0]->type == GGML_TYPE_Q3_K ||
+                 op->src[0]->type == GGML_TYPE_MXFP4 ||
+                 op->src[0]->type == GGML_TYPE_IQ2_XXS ||
+                 op->src[0]->type == GGML_TYPE_IQ2_XS ||
+                 op->src[0]->type == GGML_TYPE_IQ3_XXS ||
+                 op->src[0]->type == GGML_TYPE_IQ3_S ||
+                 op->src[0]->type == GGML_TYPE_IQ2_S ||
+                 op->src[0]->type == GGML_TYPE_IQ1_S ||
+                 op->src[0]->type == GGML_TYPE_IQ1_M ||
+                 op->src[0]->type == GGML_TYPE_IQ4_NL ||
+                 op->src[0]->type == GGML_TYPE_IQ4_XS ||
+                 op->src[0]->type == GGML_TYPE_Q4_0 ||
+                 op->src[0]->type == GGML_TYPE_Q4_1 ||
+                 op->src[0]->type == GGML_TYPE_Q5_0 ||
         case GGML_OP_SET:
         case GGML_OP_CPY:
         case GGML_OP_DUP:
@@ -2103,6 +2502,19 @@ static void * ggml_metal_host_malloc(size_t n) {
     return data;
 }
 
+// release what a half-built buffer already owns, without touching the residency set
+static void ggml_metal_buffer_free_owned(ggml_metal_buffer_t buf) {
+    for (int i = 0; i < buf->n_buffers; i++) {
+        [buf->buffers[i].metal release];
+    }
+
+    if (buf->is_shared && buf->owned && buf->all_data != NULL) {
+#if TARGET_OS_OSX
+        vm_deallocate((vm_map_t)mach_task_self(), (vm_address_t)buf->all_data, buf->all_size);
+#else
+        free(buf->all_data);
+#endif
+    }
 ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size, bool shared) {
     ggml_metal_buffer_t res = calloc(1, sizeof(struct ggml_metal_buffer));
 
@@ -2152,8 +2564,10 @@ ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size,
         res->buffers[0].data = res->all_data;
     }
 
+    // the host allocation outlives res on these paths unless it is handed back
     if (size_aligned > 0 && (res->all_data == NULL || res->buffers[0].metal == nil)) {
         GGML_LOG_ERROR("%s: error: failed to allocate buffer, size = %8.2f MiB\n", __func__, size_aligned / 1024.0 / 1024.0);
+        ggml_metal_buffer_free_owned(res);
         free(res);
         return NULL;
     }
@@ -2162,6 +2576,7 @@ ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size,
 
     if (!ggml_metal_buffer_rset_init(res)) {
         GGML_LOG_ERROR("%s: error: failed to initialize residency set\n", __func__);
+        ggml_metal_buffer_free_owned(res);
         free(res);
         return NULL;
     }
@@ -2213,6 +2628,7 @@ ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, s
 
             if (res->buffers[res->n_buffers].metal == nil) {
                 GGML_LOG_ERROR("%s: error: failed to allocate buffer, size = %8.2f MiB\n", __func__, size_aligned / 1024.0 / 1024.0);
+                ggml_metal_buffer_free_owned(res);
                 free(res);
                 return NULL;
             }
@@ -2240,6 +2656,7 @@ ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, s
 
                 if (res->buffers[res->n_buffers].metal == nil) {
                     GGML_LOG_ERROR("%s: error: failed to allocate buffer, size = %8.2f MiB\n", __func__, size_step_aligned / 1024.0 / 1024.0);
+                    ggml_metal_buffer_free_owned(res);
                     free(res);
                     return NULL;
                 }
@@ -2259,6 +2676,7 @@ ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, s
 
     if (!ggml_metal_buffer_rset_init(res)) {
         GGML_LOG_ERROR("%s: error: failed to initialize residency set\n", __func__);
+        ggml_metal_buffer_free_owned(res);
         free(res);
         return NULL;
     }
@@ -2326,25 +2744,429 @@ void ggml_metal_buffer_memset_tensor(ggml_metal_buffer_t buf, struct ggml_tensor
     }
 }
 
+// transfers up to this size reuse one persistent staging buffer; larger one-shot
+// transfers (model load, KV persistence) keep the direct no-copy wrap
+#define GGML_METAL_STAGE_BUF_MAX ((size_t) 16*1024*1024)
+
+// TOSH_MOE_PROFILE=1: count the synchronous host<->VRAM transfers (the per-token
+// traffic of MoE-offload / multi-GPU) and log a summary every ~5 s.
+enum { TOSH_PROF_D2H_STAGE, TOSH_PROF_H2D_STAGE, TOSH_PROF_D2H_DIRECT, TOSH_PROF_H2D_DIRECT, TOSH_PROF_N };
+
+static struct {
+    _Atomic int      state; // 0 unknown, 1 off, 2 on
+    _Atomic uint64_t calls  [TOSH_PROF_N];
+    _Atomic uint64_t bytes  [TOSH_PROF_N];
+    _Atomic uint64_t wait_ns[TOSH_PROF_N];
+    _Atomic uint64_t t_last;
+    // big D2H reads (logits class) split into GPU-busy time vs the blit itself
+    _Atomic uint64_t big_calls, big_dep_ns, big_xfer_ns;
+} g_tosh_prof;
+
+static bool tosh_prof_on(void) {
+    int s = atomic_load_explicit(&g_tosh_prof.state, memory_order_relaxed);
+    if (s == 0) {
+        const char * v = TOSH_ENV("TOSH_MOE_PROFILE");
+        s = (v && v[0] == '1') ? 2 : 1;
+        atomic_store_explicit(&g_tosh_prof.state, s, memory_order_relaxed);
+    }
+    return s == 2;
+}
+
+// name-class buckets, filled by the callers that know the tensor
+enum { TOSH_CLS_MOE, TOSH_CLS_LOGITS, TOSH_CLS_OTHER, TOSH_CLS_N };
+static _Atomic uint64_t g_tosh_cls_calls[2][TOSH_CLS_N]; // [d2h][cls]
+static _Atomic uint64_t g_tosh_cls_bytes[2][TOSH_CLS_N];
+
+void ggml_metal_prof_note(const char * name, size_t size, bool d2h) {
+    if (!tosh_prof_on()) {
+        return;
+    }
+    int cls = TOSH_CLS_OTHER;
+    if (name) {
+        if (strstr(name, "moe") || strstr(name, "exps")) {
+            cls = TOSH_CLS_MOE;
+        } else if (strstr(name, "result_output")) {
+            cls = TOSH_CLS_LOGITS;
+        }
+    }
+    atomic_fetch_add_explicit(&g_tosh_cls_calls[d2h][cls], 1,    memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_tosh_cls_bytes[d2h][cls], size, memory_order_relaxed);
+
+    // first distinct "other" names, to identify unexplained traffic
+    if (cls == TOSH_CLS_OTHER && name &&
+        (d2h || atomic_load_explicit(&g_tosh_prof.t_last, memory_order_relaxed) != 0)) {
+        static char seen[16][48];
+        static atomic_flag lock = ATOMIC_FLAG_INIT;
+        if (!atomic_flag_test_and_set(&lock)) {
+            for (int i = 0; i < 16; i++) {
+                if (seen[i][0] == '\0') {
+                    snprintf(seen[i], sizeof(seen[i]), "%s", name);
+                    fprintf(stderr, "ggml_metal: moe-profile: other[%s] %s %zuB\n",
+                            d2h ? "D2H" : "H2D", name, size);
+                    break;
+                }
+                if (strcmp(seen[i], name) == 0) {
+                    break;
+                }
+            }
+            atomic_flag_clear(&lock);
+        }
+    }
+}
+
+static void tosh_prof_cls_flush(void) {
+    static const char * dirs[2] = { "H2D", "D2H" };
+    static const char * clss[TOSH_CLS_N] = { "moe", "logits", "other" };
+    char line[256];
+    int n = 0;
+    for (int d = 0; d < 2; d++) {
+        for (int c = 0; c < TOSH_CLS_N; c++) {
+            const uint64_t calls = atomic_exchange(&g_tosh_cls_calls[d][c], 0);
+            const uint64_t bytes = atomic_exchange(&g_tosh_cls_bytes[d][c], 0);
+            if (calls == 0) {
+                continue;
+            }
+            n += snprintf(line + n, sizeof(line) - n, "%s%s-%s %llux %.1fMB",
+                          n > 0 ? " | " : "", dirs[d], clss[c],
+                          (unsigned long long) calls, bytes / 1e6);
+        }
+    }
+    if (n > 0) {
+        fprintf(stderr, "ggml_metal: moe-profile:   %s\n", line);
+    }
+}
+
+static void tosh_prof_add(int idx, size_t size, uint64_t t0) {
+    const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    atomic_fetch_add_explicit(&g_tosh_prof.calls[idx],   1,        memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_tosh_prof.bytes[idx],   size,     memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_tosh_prof.wait_ns[idx], now - t0, memory_order_relaxed);
+
+    uint64_t last = atomic_load_explicit(&g_tosh_prof.t_last, memory_order_relaxed);
+    if (now - last < 5000000000ULL ||
+        !atomic_compare_exchange_strong(&g_tosh_prof.t_last, &last, now)) {
+        return;
+    }
+    static const char * names[TOSH_PROF_N] = { "D2H-stage", "H2D-stage", "D2H-direct", "H2D-direct" };
+    char line[256];
+    int n = 0;
+    for (int i = 0; i < TOSH_PROF_N; i++) {
+        const uint64_t c = atomic_exchange(&g_tosh_prof.calls[i],   0);
+        const uint64_t b = atomic_exchange(&g_tosh_prof.bytes[i],   0);
+        const uint64_t w = atomic_exchange(&g_tosh_prof.wait_ns[i], 0);
+        if (c == 0) {
+            continue;
+        }
+        n += snprintf(line + n, sizeof(line) - n, "%s%s %llux %.1fMB %.0fms",
+                      n > 0 ? " | " : "", names[i],
+                      (unsigned long long) c, b / 1e6, w / 1e6);
+    }
+    if (n > 0) {
+        // raw stderr: llama-server filters backend INFO logs at default verbosity
+        fprintf(stderr, "ggml_metal: moe-profile: %s\n", line);
+    }
+    const uint64_t bc = atomic_exchange(&g_tosh_prof.big_calls, 0);
+    if (bc > 0) {
+        const uint64_t bd = atomic_exchange(&g_tosh_prof.big_dep_ns,  0);
+        const uint64_t bx = atomic_exchange(&g_tosh_prof.big_xfer_ns, 0);
+        fprintf(stderr, "ggml_metal: moe-profile:   D2H-big %llux gpu-busy %.0fms blit %.1fms\n",
+                (unsigned long long) bc, bd / 1e6, bx / 1e6);
+    }
+    tosh_prof_cls_flush();
+}
+
+// caller must hold dev->stage_lock; nil on allocation failure
+static id<MTLBuffer> ggml_metal_device_stage_buf(ggml_metal_device_t dev) {
+    if (dev->stage_buf == nil) {
+        dev->stage_buf = [dev->mtl_device newBufferWithLength:GGML_METAL_STAGE_BUF_MAX
+                                                      options:MTLResourceStorageModeShared];
+    }
+    return dev->stage_buf;
+}
+
+// waits out and releases every in-flight upload; caller must hold stage_lock
+static void ggml_metal_device_stage_set_drain(ggml_metal_device_t dev) {
+    for (int i = 0; i < 4; i++) {
+        if (dev->stage_set_cmds[i]) {
+            [dev->stage_set_cmds[i] waitUntilCompleted];
+            [dev->stage_set_cmds[i] release];
+            dev->stage_set_cmds[i] = nil;
+        }
+    }
+}
+
+void ggml_metal_device_upload_drain(ggml_metal_device_t dev) {
+    [dev->stage_lock lock];
+    ggml_metal_device_stage_set_drain(dev);
+    [dev->stage_lock unlock];
+}
+
+bool ggml_metal_device_stage_set(ggml_metal_device_t dev, struct ggml_metal_buffer_id bid_dst, const void * data, size_t size) {
+    if (size == 0) {
+        return true;
+    }
+    if (size > GGML_METAL_STAGE_BUF_MAX || bid_dst.metal == nil) {
+        return false;
+    }
+
+    const uint64_t t0 = tosh_prof_on() ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
+
+    [dev->stage_lock lock];
+
+    const int slot = dev->stage_set_cur;
+    dev->stage_set_cur = (slot + 1) % 4;
+
+    if (dev->stage_set_cmds[slot]) {
+        [dev->stage_set_cmds[slot] waitUntilCompleted];
+        [dev->stage_set_cmds[slot] release];
+        dev->stage_set_cmds[slot] = nil;
+    }
+
+    id<MTLBuffer> stage = dev->stage_set_bufs[slot];
+    if (stage == nil || stage.length < size) {
+        [stage release];
+        if (wc_off < 0) { wc_off = TOSH_ENV("TOSH_STAGE_WC_OFF") != NULL; }
+        stage = [dev->mtl_device newBufferWithLength:MAX(size, (size_t) 256*1024)
+        dev->stage_set_bufs[slot] = stage;
+    }
+    if (stage == nil) {
+        [dev->stage_lock unlock];
+        return false;
+    }
+
+    memcpy(stage.contents, data, size);
+
+    id<MTLCommandBuffer> cmd_buf = [dev->mtl_queue commandBuffer];
+
+    {
+        id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
+
+        [encoder copyFromBuffer:stage
+                   sourceOffset:0
+                       toBuffer:bid_dst.metal
+              destinationOffset:bid_dst.offs
+                           size:size];
+
+        [encoder endEncoding];
+    }
+
+    [cmd_buf commit];
+    // no wait: every consumer is queued behind the blit on the same queue
+    dev->stage_set_cmds[slot] = [cmd_buf retain];
+
+    [dev->stage_lock unlock];
+
+    if (t0) {
+        tosh_prof_add(TOSH_PROF_H2D_STAGE, size, t0);
+    }
+
+    return true;
+}
+
+// one commit + wait covers every queued blit; caller must hold stage_lock
+static void ggml_metal_device_stage_batch_flush(ggml_metal_device_t dev) {
+    if (dev->stage_batch_n == 0) {
+        return;
+    }
+    [dev->stage_batch_enc endEncoding];
+    [dev->stage_batch_cmd commit];
+    [dev->stage_batch_cmd waitUntilCompleted];
+    for (int i = 0; i < dev->stage_batch_n; i++) {
+        memcpy(dev->stage_batch_items[i].dst,
+               (char *) dev->stage_buf.contents + dev->stage_batch_items[i].off,
+               dev->stage_batch_items[i].size);
+    }
+    dev->stage_batch_n    = 0;
+    dev->stage_batch_used = 0;
+    dev->stage_batch_enc  = nil;
+    dev->stage_batch_cmd  = nil;
+}
+
+void ggml_metal_device_read_batch_begin(ggml_metal_device_t dev) {
+    // shared-buffer devices never take the stage path; skip the empty batch
+    if (dev->props.use_shared_buffers) {
+        return;
+    }
+    [dev->stage_lock lock];   // held until read_batch_end
+
+void ggml_metal_device_read_batch_end(ggml_metal_device_t dev) {
+    if (dev->props.use_shared_buffers) {
+        return;
+    [dev->stage_lock unlock];
+}
+bool ggml_metal_device_stage_get(ggml_metal_device_t dev, struct ggml_metal_buffer_id bid_src, void * data, size_t size) {
+    if (size == 0) {
+        return true;
+    }
+    if (size > GGML_METAL_STAGE_BUF_MAX || bid_src.metal == nil) {
+        return false;
+    }
+
+    const uint64_t t0 = tosh_prof_on() ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
+
+    [dev->stage_lock lock];
+
+    // inside an open read batch: queue the blit, defer the wait to batch end
+            [dev->stage_lock unlock];
+        [dev->stage_batch_enc copyFromBuffer:bid_src.metal
+                                sourceOffset:bid_src.offs
+                                    toBuffer:dev->stage_buf
+                           destinationOffset:dev->stage_batch_used
+                                        size:size];
+        dev->stage_batch_items[dev->stage_batch_n++] =
+            (typeof(dev->stage_batch_items[0])) { data, dev->stage_batch_used, size };
+        dev->stage_batch_used += size;
+        [dev->stage_lock unlock];
+        if (t0) {
+            tosh_prof_add(TOSH_PROF_D2H_STAGE, size, t0);
+        }
+        return true;
+    }
+
+    id<MTLBuffer> stage = ggml_metal_device_stage_buf(dev);
+    if (stage == nil) {
+        [dev->stage_lock unlock];
+        return false;
+    }
+
+    id<MTLCommandBuffer> cmd_buf = [dev->mtl_queue commandBufferWithUnretainedReferences];
+
+    {
+        id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
+
+        [encoder copyFromBuffer:bid_src.metal
+                   sourceOffset:bid_src.offs
+                       toBuffer:stage
+              destinationOffset:0
+                           size:size];
+
+        [encoder endEncoding];
+    }
+
+    [cmd_buf commit];
+    [cmd_buf waitUntilCompleted];
+
+    // split the big-read wait: time before the blit ran is GPU compute, not readback
+    if (t0 && size >= (size_t) 256*1024) {
+        atomic_fetch_add_explicit(&g_tosh_prof.big_calls, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_tosh_prof.big_dep_ns,
+            (uint64_t) ((cmd_buf.GPUStartTime - cmd_buf.kernelStartTime) * 1e9), memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_tosh_prof.big_xfer_ns,
+            (uint64_t) ((cmd_buf.GPUEndTime - cmd_buf.GPUStartTime) * 1e9), memory_order_relaxed);
+    }
+
+    memcpy(data, stage.contents, size);
+
+    [dev->stage_lock unlock];
+
+    if (t0) {
+        tosh_prof_add(TOSH_PROF_D2H_STAGE, size, t0);
+    }
+
+    return true;
 void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    if (size == 0) {
+        return;
+    }
+
     if (buf->is_shared) {
         memcpy((char *) tensor->data + offset, data, size);
         return;
     }
 
     @autoreleasepool {
+        ggml_metal_prof_note(tensor->name, size, false);
+        // Small transfers (the per-token copies of MoE-offload and multi-GPU
+        // runs) go through the reused staging buffer: wrapping the caller's
+        // pointer below allocates a kernel resource per call, and on AMD those
+        // accumulate across a long generation until transfers crawl.
+        {
+            struct ggml_metal_buffer_id bid_dst = ggml_metal_buffer_get_id(buf, tensor);
+            bid_dst.offs += offset;
+
+            if (ggml_metal_device_stage_set(buf->dev, bid_dst, data, size)) {
+                return;
+            }
+
+            // A large transfer wrapped whole registers the caller's pages with the device for the
+            // whole blit; feeding it through the ring in slices keeps the copy pipelined instead.
+            // Only measured with one device so far, so several cards keep the wrap until it is.
+            static int stage_load = -1;
+            if (stage_load < 0) {
+                if (TOSH_ENV("TOSH_STAGE_LOAD_DISABLE") != NULL) {
+                    stage_load = 0;
+                } else if (TOSH_ENV("TOSH_STAGE_LOAD") != NULL) {
+                    stage_load = 1;
+                } else {
+                    const char * n = TOSH_ENV("GGML_METAL_DEVICES");
+                    stage_load = (n == NULL || atoi(n) <= 1) && TOSH_ENV("GGML_METAL_DEVICE_LIST") == NULL;
+                }
+            }
+                        const char * v = TOSH_ENV("TOSH_STAGE_SLICE_MB");
+
+
+        const uint64_t t0 = tosh_prof_on() ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
+
         // src
         void * data_ptr = (void *)(uintptr_t) data; // "const cast" the src data
         id<MTLBuffer> buf_src = [buf->dev->mtl_device newBufferWithBytesNoCopy:data_ptr
+        if (no_wrap < 0) { no_wrap = TOSH_ENV("TOSH_NO_HOST_WRAP") != NULL; }
                                                                length:size
                                                               options:MTLResourceStorageModeShared
                                                           deallocator:nil];
 
-        GGML_ASSERT(buf_src);
-
         // dst
         struct ggml_metal_buffer_id bid_dst = ggml_metal_buffer_get_id(buf, tensor);
         bid_dst.offs += offset;
+
+        if (buf_src == nil) {
+            // newBufferWithBytesNoCopy requires page-aligned data, and some drivers cap the size of
+            // host-visible allocations; copy through a small staging buffer in chunks instead
+            size_t stage_size = MIN(size, (size_t) 8*1024*1024);
+            id<MTLBuffer> buf_stage = nil;
+            while (stage_size > 0) {
+                buf_stage = [buf->dev->mtl_device newBufferWithLength:stage_size options:MTLResourceStorageModeShared];
+                if (buf_stage != nil) {
+                    break;
+                }
+                stage_size /= 2;
+            }
+            if (buf_stage == nil) {
+                GGML_LOG_ERROR("%s: failed to allocate staging buffer, size = %zu\n", __func__, size);
+            }
+            GGML_ASSERT(buf_stage);
+
+            for (size_t done = 0; done < size;) {
+                const size_t n = MIN(stage_size, size - done);
+
+                memcpy(buf_stage.contents, (const char *) data + done, n);
+
+                id<MTLCommandBuffer> cmd_buf = [buf->dev->mtl_queue commandBufferWithUnretainedReferences];
+
+                {
+                    id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
+
+                    [encoder copyFromBuffer:buf_stage
+                               sourceOffset:0
+                                   toBuffer:bid_dst.metal
+                          destinationOffset:bid_dst.offs + done
+                                       size:n];
+
+                    [encoder endEncoding];
+                }
+
+                [cmd_buf commit];
+                [cmd_buf waitUntilCompleted];
+
+                done += n;
+            }
+
+            if (t0) {
+                tosh_prof_add(TOSH_PROF_H2D_DIRECT, size, t0);
+            }
+
+            return;
+        }
 
         // note: for experimentation purposes, here we use a semaphore to wait for the copy to complete
         //       this is alternative to waitUntilCompleted, which should be faster, but don't seem to make much difference
@@ -2375,23 +3197,41 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * 
 
         dispatch_semaphore_wait(completion_semaphore, DISPATCH_TIME_FOREVER);
         dispatch_release(completion_semaphore);
+        // the wrap is an owned object here, and keeping it leaves the host pages registered
+        // with the device for the rest of the load
+        [buf_src release];
 
         //[cmd_buf waitUntilCompleted];
 
-        [buf_src release];
+        if (t0) {
+            tosh_prof_add(TOSH_PROF_H2D_DIRECT, size, t0);
+        }
     }
 }
 
+        const char * e = TOSH_ENV("TOSH_CB_PROFILE");
 void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    if (size == 0) {
+        return;
+    }
+
     if (buf->is_shared) {
         memcpy(data, (const char *) tensor->data + offset, size);
         return;
     }
 
     @autoreleasepool {
+        ggml_metal_prof_note(tensor->name, size, true);
         // src
         struct ggml_metal_buffer_id bid_src = ggml_metal_buffer_get_id(buf, tensor);
         bid_src.offs += offset;
+
+        // small transfers reuse the persistent staging buffer (see set_tensor)
+        if (ggml_metal_device_stage_get(buf->dev, bid_src, data, size)) {
+            return;
+        }
+
+        const uint64_t t0 = tosh_prof_on() ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
 
         // dst
         id<MTLBuffer> buf_dst = [buf->dev->mtl_device newBufferWithBytesNoCopy:data
@@ -2399,26 +3239,78 @@ void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_ten
                                                               options:MTLResourceStorageModeShared
                                                           deallocator:nil];
 
-        GGML_ASSERT(buf_dst);
+        if (buf_dst != nil) {
+            id<MTLCommandBuffer> cmd_buf = [buf->dev->mtl_queue commandBufferWithUnretainedReferences];
 
-        id<MTLCommandBuffer> cmd_buf = [buf->dev->mtl_queue commandBufferWithUnretainedReferences];
+            {
+                id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
 
-        {
-            id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
+                [encoder copyFromBuffer:bid_src.metal
+                           sourceOffset:bid_src.offs
+                               toBuffer:buf_dst
+                      destinationOffset:0
+                                   size:size];
 
-            [encoder copyFromBuffer:bid_src.metal
-                       sourceOffset:bid_src.offs
-                           toBuffer:buf_dst
-                  destinationOffset:0
-                               size:size];
+                [encoder endEncoding];
+            }
 
-            [encoder endEncoding];
+            [cmd_buf commit];
+            [cmd_buf waitUntilCompleted];
+
+            // the wrap is owned here too; the write path already releases its own
+            [buf_dst release];
+
+            if (t0) {
+                tosh_prof_add(TOSH_PROF_D2H_DIRECT, size, t0);
+            }
+
+            return;
         }
 
-        [cmd_buf commit];
-        [cmd_buf waitUntilCompleted];
+        // newBufferWithBytesNoCopy requires page-aligned data, and some drivers cap the size of
+        // host-visible allocations; copy through a small staging buffer in chunks instead
+        size_t stage_size = MIN(size, (size_t) 8*1024*1024);
+        id<MTLBuffer> buf_stage = nil;
+        while (stage_size > 0) {
+            buf_stage = [buf->dev->mtl_device newBufferWithLength:stage_size options:MTLResourceStorageModeShared];
+            if (buf_stage != nil) {
+                break;
+            }
+            stage_size /= 2;
+        }
+        if (buf_stage == nil) {
+            GGML_LOG_ERROR("%s: failed to allocate staging buffer, size = %zu\n", __func__, size);
+        }
+        GGML_ASSERT(buf_stage);
 
-        [buf_dst release];
+        for (size_t done = 0; done < size;) {
+            const size_t n = MIN(stage_size, size - done);
+
+            id<MTLCommandBuffer> cmd_buf = [buf->dev->mtl_queue commandBufferWithUnretainedReferences];
+
+            {
+                id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
+
+                [encoder copyFromBuffer:bid_src.metal
+                           sourceOffset:bid_src.offs + done
+                               toBuffer:buf_stage
+                      destinationOffset:0
+                                   size:n];
+
+                [encoder endEncoding];
+            }
+
+            [cmd_buf commit];
+            [cmd_buf waitUntilCompleted];
+
+            memcpy((char *) data + done, buf_stage.contents, n);
+
+            done += n;
+        }
+
+        if (t0) {
+            tosh_prof_add(TOSH_PROF_D2H_DIRECT, size, t0);
+        }
     }
 }
 
@@ -2431,6 +3323,11 @@ bool ggml_metal_buffer_cpy_tensor(ggml_metal_buffer_t buf_dst, const struct ggml
     if (buf_dst->is_shared && buf_src->is_shared) {
         memcpy(dst->data, src->data, size);
         return true;
+    }
+
+    // a blit can't reference a buffer owned by another device
+    if (buf_src->dev != buf_dst->dev) {
+        return false;
     }
 
     // for private buffers, we need to use Metal blit commands
@@ -2475,9 +3372,11 @@ void ggml_metal_buffer_clear(ggml_metal_buffer_t buf, uint8_t value) {
         {
             id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
 
-            [encoder fillBuffer:buf->buffers[0].metal
-                          range:NSMakeRange(0, buf->buffers[0].size)
-                          value:value];
+            for (int i = 0; i < buf->n_buffers; ++i) {
+                [encoder fillBuffer:buf->buffers[i].metal
+                              range:NSMakeRange(0, buf->buffers[i].size)
+                              value:value];
+            }
 
             [encoder endEncoding];
         }

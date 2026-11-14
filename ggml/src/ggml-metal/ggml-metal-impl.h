@@ -30,7 +30,7 @@
 #define N_SG_Q2_0 2
 
 #define N_R0_Q4_0 4
-#define N_SG_Q4_0 2
+#define N_SG_Q4_0 1
 
 #define N_R0_Q4_1 4
 #define N_SG_Q4_1 2
@@ -44,22 +44,22 @@
 #define N_R0_Q8_0 2
 #define N_SG_Q8_0 4
 
-#define N_R0_MXFP4 2
-#define N_SG_MXFP4 2
+#define N_R0_MXFP4 4
+#define N_SG_MXFP4 1
 
 #define N_R0_Q2_K 4
-#define N_SG_Q2_K 2
+#define N_SG_Q2_K 1
 
-#define N_R0_Q3_K 2
+#define N_R0_Q3_K 4
 #define N_SG_Q3_K 2
 
 #define N_R0_Q4_K 2
 #define N_SG_Q4_K 2
 
-#define N_R0_Q5_K 1
-#define N_SG_Q5_K 2
+#define N_R0_Q5_K 2
+#define N_SG_Q5_K 1
 
-#define N_R0_Q6_K 2
+#define N_R0_Q6_K 4
 #define N_SG_Q6_K 2
 
 #define N_R0_IQ1_S 4
@@ -481,8 +481,28 @@ typedef struct {
     int32_t  n_head_log2;
     float    logit_softcap;
     int32_t  n_kv_max_padded;
+    int32_t  has_sinks; // read by the AMD kernels; upstream uses a function constant
+    int32_t  has_mask;  // 0 for bidirectional attention (vision towers), which has no mask
 } ggml_metal_kargs_flash_attn_ext_vec;
 
+    uint64_t nb23;
+    int32_t  ne31;
+    int32_t  ne32;
+    int32_t  ne33;
+    uint64_t nb31;
+    uint64_t nb32;
+    uint64_t nb33;
+    int32_t  ne1;
+    int32_t  ne2;
+    int32_t  ne3;
+    float    scale;
+    float    max_bias;
+    float    m0;
+    float    m1;
+    int32_t  n_head_log2;
+    float    logit_softcap;
+    int32_t  has_sinks; // read by the AMD kernels; upstream uses a function constant
+    int32_t  has_mask;  // 0 for bidirectional attention (vision towers), which has no mask
 typedef struct {
     int32_t  ne30;
     int32_t  ne31;
@@ -1396,5 +1416,17 @@ typedef struct {
 typedef struct {
     int64_t ne;
 } ggml_metal_kargs_silu_back;
+
+#if !defined(__METAL_VERSION__)
+#include <stdlib.h>
+// getenv walks the whole environment under a lock, and the encode path asks the same names once
+// per node and token: each call site reads its variable once
+#ifdef __cplusplus
+#define TOSH_ENV(name) ([]() -> const char * { static const char * tosh_env_v = getenv(name); return tosh_env_v; }())
+#else
+#define TOSH_ENV(name) ({ static int tosh_env_i = 0; static const char * tosh_env_v = NULL; \
+    if (!tosh_env_i) { tosh_env_v = getenv(name); tosh_env_i = 1; } tosh_env_v; })
+#endif
+#endif
 
 #endif // GGML_METAL_IMPL

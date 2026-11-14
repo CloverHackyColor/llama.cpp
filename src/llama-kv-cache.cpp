@@ -1391,6 +1391,7 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
     const int64_t n_head      = v_cur->ne[1];
     const int64_t n_tokens    = v_cur->ne[2];
 
+
     const int64_t n_embd_gqa = n_embd_head*n_head;
 
     // we can merge dims 0 and 1
@@ -1974,9 +1975,14 @@ ggml_tensor * llama_kv_cache::build_rope_shift(
         tmp = ggml_rope_ext(ctx, tmp,
                 shift, factors, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                 yarn_ext_factor, yarn_attn_factor, yarn_beta_fast, yarn_beta_slow);
+        // rotate back. `rot` is null when no Hadamard rotation was set up for
+        // this quantized cache (head dim not a multiple of 64); guard or the KV
+        // shift (cache-reuse / context-shift) null-derefs.
+        if (rot) tmp = llama_mul_mat_hadamard(ctx, tmp, rot);
+
 
         // rotate fwd
-        tmp = llama_mul_mat_hadamard(ctx, tmp, rot);
+        if (rot) tmp = llama_mul_mat_hadamard(ctx, tmp, rot);
 
         tmp = ggml_cpy(ctx, tmp, cur);
     } else {

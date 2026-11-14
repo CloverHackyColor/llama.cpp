@@ -2116,7 +2116,9 @@ struct markdown_printer : public printer {
     }
 
     void print_footer() override {
-        fprintf(fout, "\nbuild: %s (%d)\n", test::build_commit.c_str(), test::build_number);
+        // the build number only tracks upstream, so name the engine version too
+        fprintf(fout, "\nbuild: %s (%d), ToshLLM engine %s\n", test::build_commit.c_str(), test::build_number,
+                common_tosh_version());
     }
 };
 

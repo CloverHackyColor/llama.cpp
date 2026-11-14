@@ -501,7 +501,13 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 
         const int64_t K = (int64_t) cparams.n_rs_seq + 1;
 
-        for (int64_t t = 1; t <= K; ++t) {
+        // a rollback cannot reach past this ubatch, so slots deeper than its token count would
+        // only ever be restored as the wrong state: skip their copies. The ubatch token count is
+        // part of the graph reuse key, so the two topologies never share a cached graph.
+        const int64_t n_ut  = conv_input->ne[0] - conv_states->ne[0];
+        const int64_t K_eff = getenv("TOSH_RS_SLOTS_FULL") ? K : std::min<int64_t>(K, n_ut + 1);
+
+        for (int64_t t = K - K_eff + 1; t <= K; ++t) {
             const int64_t s_idx  = std::max<int64_t>(0, conv_input->ne[0] - conv_states->ne[0] - K + t);
             const int64_t s_slot = K - t;
 

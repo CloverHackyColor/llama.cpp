@@ -205,6 +205,13 @@ static ggml_backend_buffer_t ggml_backend_metal_buffer_type_alloc_buffer(ggml_ba
     ggml_metal_device_t ctx_dev = (ggml_metal_device_t)buft->device->context;
     ggml_metal_buffer_t res = ggml_metal_buffer_init(ctx_dev, size, shared);
 
+    // an allocation that fails returns null here, and reading is_shared off it turned an
+    // out-of-memory into a segfault. Diagnosed by Slice on the RX 570:
+    // https://www.insanelymac.com/forum/profile/112217-slice/
+    if (res == NULL) {
+        return NULL;
+    }
+
     if (res == NULL) {
         GGML_LOG_ERROR("%s: failed to allocate Metal buffer of %zu bytes (out of memory)\n", __func__, size);
         return NULL;
@@ -527,6 +534,15 @@ static void ggml_backend_metal_get_tensor_async(ggml_backend_t backend, const gg
 }
 
 static bool ggml_backend_metal_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
+#ifdef GGML_BACKEND_READ_BATCH
+static void ggml_backend_metal_read_batch_begin(ggml_backend_t backend) {
+    ggml_metal_read_batch_begin((ggml_metal_t) backend->context);
+}
+
+static void ggml_backend_metal_read_batch_end(ggml_backend_t backend) {
+    ggml_metal_read_batch_end((ggml_metal_t) backend->context);
+}
+#endif
     if (!ggml_backend_is_metal(backend_src) || !ggml_backend_is_metal(backend_dst)) {
         return false;
     }
@@ -604,6 +620,10 @@ static ggml_backend_i ggml_backend_metal_i = {
     /* .event_record            = */ ggml_backend_metal_event_record,
     /* .event_wait              = */ ggml_backend_metal_event_wait,
     /* .graph_optimize          = */ ggml_backend_metal_graph_optimize,
+#ifdef GGML_BACKEND_READ_BATCH
+    /* .read_batch_begin        = */ ggml_backend_metal_read_batch_begin,
+    /* .read_batch_end          = */ ggml_backend_metal_read_batch_end,
+#endif
 };
 
 static ggml_guid_t ggml_backend_metal_guid(void) {
@@ -615,7 +635,7 @@ ggml_backend_t ggml_backend_metal_init(void) {
     ggml_backend_dev_t dev = ggml_backend_reg_dev_get(ggml_backend_metal_reg(), 0);
     ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
 
-    ggml_metal_t ctx = ggml_metal_init(ctx_dev);
+    ggml_metal_t ctx = ggml_metal_init(ctx_dev, false);
     if (ctx == NULL) {
         GGML_LOG_ERROR("%s: error: failed to allocate context\n", __func__);
         return NULL;
@@ -698,10 +718,14 @@ static void ggml_backend_metal_device_get_props(ggml_backend_dev_t dev, ggml_bac
 
     ggml_backend_metal_device_get_memory(dev, &props->memory_free, &props->memory_total);
 
+    // zero-copy only loses when the fallback would be private VRAM: on a discrete GPU a mapped weight buffer streams weights over PCIe on every access (~25x slower decode).
+    // eGPUs default to shared buffers (#17866), so their fallback is shared memory too and they keep zero-copy.
+    const ggml_metal_device_props * props_dev = ggml_metal_device_get_props((ggml_metal_device_t) dev->context);
+
     props->caps = {
         /* .async                = */ true,
         /* .host_buffer          = */ false,
-        /* .buffer_from_host_ptr = */ true,
+        /* .buffer_from_host_ptr = */ props_dev->has_unified_memory || props_dev->use_shared_buffers,
         /* .events               = */ true,
         /* .mmap_support         = */ true,
     };
@@ -710,7 +734,7 @@ static void ggml_backend_metal_device_get_props(ggml_backend_dev_t dev, ggml_bac
 static ggml_backend_t ggml_backend_metal_device_init_backend(ggml_backend_dev_t dev, const char * params) {
     ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
 
-    ggml_metal_t ctx = ggml_metal_init(ctx_dev);
+    ggml_metal_t ctx = ggml_metal_init(ctx_dev, params != NULL && strcmp(params, "prefetch") == 0);
     if (ctx == NULL) {
         GGML_LOG_ERROR("%s: error: failed to allocate context\n", __func__);
         return NULL;
@@ -1027,6 +1051,17 @@ ggml_backend_reg_t ggml_backend_metal_reg(void) {
             g_devices = atoi(env);
         }
 
+        // an explicit device list registers one slot per listed physical GPU
+        const char * env_list = getenv("GGML_METAL_DEVICE_LIST");
+        if (env_list && *env_list) {
+            g_devices = 1;
+            for (const char * p = env_list; *p; ++p) {
+                if (*p == ',') {
+                    ++g_devices;
+                }
+            }
+        }
+
         static std::vector<ggml_backend_device_ptr> devs;
 
         if (!initialized) {
@@ -1037,6 +1072,10 @@ ggml_backend_reg_t ggml_backend_metal_reg(void) {
             static ggml_backend_metal_reg_ptr reg_ctx(ggml_backend_metal_reg_init());
 
             for (int i = 0; i < g_devices; ++i) {
+                // i is the logical slot (0..g_devices-1) used everywhere as the
+                // device index (buffer types, naming). Physical GPU selection lives
+                // in ggml_metal_device_init, which maps the slot to a real Metal
+                // device via GGML_METAL_DEVICE_INDEX (see there).
                 auto * dev = ggml_backend_metal_device_init(&reg, i);
                 devs.emplace_back(dev);
 

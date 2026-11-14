@@ -283,6 +283,8 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
         }
     }
 
+    if ((node->op == GGML_OP_RMS_NORM || node->op == GGML_OP_ADD) && ctx->use_fusion() && !ctx->use_concurrency) {
+    const int n_fwht = ctx->use_fusion() && (node->op == GGML_OP_MUL || node->op == GGML_OP_CONT) ?
     switch (node->op) {
         case GGML_OP_CONCAT:
             {
@@ -539,6 +541,22 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
     return n_fuse;
 }
 
+static uint64_t g_opprof_n [GGML_OP_COUNT];
+static bool tosh_opprof_on(void) {
+    static int v = -1;
+    if (v < 0) { v = TOSH_ENV("TOSH_OPPROF") != nullptr; }
+    return v;
+}
+static void tosh_opprof_dump(void) {
+    if (!tosh_opprof_on()) return;
+    for (int i = 0; i < GGML_OP_COUNT; i++) {
+        if (g_opprof_n[i] == 0) continue;
+        fprintf(stderr, "TOSH_OPPROF %-22s n=%-7llu total_us=%-10.1f us/op=%.3f\n",
+                ggml_op_name((enum ggml_op) i),
+                (unsigned long long) g_opprof_n[i],
+                g_opprof_ns[i]/1e3, (double) g_opprof_ns[i]/g_opprof_n[i]/1e3);
+    }
+}
 int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx) {
     if (ctx->use_capture) {
         ggml_metal_encoder_debug_group_push(ctx->enc, ggml_op_desc(ctx->node(idx)));
@@ -1099,7 +1117,8 @@ int ggml_metal_op_cumsum(ggml_metal_op_t ctx, int idx) {
     const uint64_t nbt2 = net1*nbt1;
     const uint64_t nbt3 = net2*nbt2;
 
-    const size_t smem = GGML_PAD(32*sizeof(float), 16);
+    // one float per lane of the real simd width (64 on wave64)
+    const size_t smem = GGML_PAD(ggml_metal_device_get_props(ctx->dev)->simd_width*sizeof(float), 16);
 
     ggml_metal_buffer_id bid_src0 = ggml_metal_get_buffer_id(op->src[0]);
     ggml_metal_buffer_id bid_dst  = ggml_metal_get_buffer_id(op);
@@ -1732,6 +1751,7 @@ int ggml_metal_op_ssm_conv(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_dispatch_threadgroups(enc, ne01, n_token_batches, ne02, BATCH_SIZE, 1, 1);
     } else {
         auto pipeline = ggml_metal_library_get_pipeline_ssm_conv(lib, op, (int32_t) ne10, use_silu);
+        auto pipeline = ggml_metal_library_get_pipeline_ssm_conv_decode(lib, op, use_silu);
 
         ggml_metal_encoder_set_pipeline(enc, pipeline);
         ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
@@ -1739,7 +1759,9 @@ int ggml_metal_op_ssm_conv(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[1]), 2);
         ggml_metal_encoder_set_buffer(enc, bid_dst, 3);
 
-        ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne1, ne02, 1, 1, 1);
+        const int nth  = 64;
+        const int ntgx = (ne01 + nth - 1) / nth;
+        ggml_metal_encoder_dispatch_threadgroups(enc, ntgx, ne1, ne02, nth, 1, 1);
     }
 
     if (n_fuse > 1 && ggml_metal_fusion_info_debug(ctx->finfo) > 1) {
@@ -1923,6 +1945,8 @@ int ggml_metal_op_rwkv(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+    static const bool disabled = TOSH_ENV("TOSH_GDN_STATE_FUSION_DISABLE") != nullptr;
+    return ctx->use_fusion() && !ctx->use_concurrency && !disabled;
 int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -2025,6 +2049,7 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_dispatch_threadgroups(enc, op->src[2]->ne[0]/nsg, op->src[2]->ne[1], op->src[2]->ne[3], 32, nsg, 1);
 
     return n_fuse;
+    return 1;
 }
 
 int ggml_metal_op_solve_tri(ggml_metal_op_t ctx, int idx) {
@@ -2076,10 +2101,11 @@ int ggml_metal_op_solve_tri(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
 
     const int nsg = pipeline.nsg;
+    const int nw  = ggml_metal_device_get_props(ctx->dev)->simd_width;
 
     ggml_metal_encoder_set_threadgroup_memory_size(enc, pipeline.smem, 0);
 
-    ggml_metal_encoder_dispatch_threadgroups(enc, (ne10 + nsg - 1)/nsg, ne02, ne03, 32, nsg, 1);
+    ggml_metal_encoder_dispatch_threadgroups(enc, (ne10 + nsg - 1)/nsg, ne02, ne03, nw, nsg, 1);
 
     return 1;
 }
@@ -2224,6 +2250,8 @@ int ggml_metal_op_cpy(ggml_metal_op_t ctx, int idx) {
     GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
 
     auto pipeline = ggml_metal_library_get_pipeline_cpy(lib, op->src[0]->type, op->type);
+                        TOSH_ENV("TOSH_CPY_CONTIG_DISABLE") == nullptr;
+
 
     GGML_ASSERT(ne00 % ggml_blck_size(op->src[0]->type) == 0);
 
@@ -2374,6 +2402,7 @@ int ggml_metal_op_fwht(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+    static const bool disabled = TOSH_ENV("TOSH_NORM_FWHT_FUSION_DISABLE") != nullptr;
 int ggml_metal_op_pool_2d(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -2573,18 +2602,56 @@ static int ggml_metal_op_mul_mat_mv(ggml_metal_op_t ctx, int idx) {
 
     ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
+    // wave64 decode dispatches a full 64-wide threadgroup so the kernel's lane
+    // partitioning and reduction match the hardware simdgroup; 32 everywhere else.
+    int nth = 32;
+    if (props_dev->wave64_decode &&
+        (op->src[0]->type == GGML_TYPE_F16 ||
+         op->src[0]->type == GGML_TYPE_F32 ||
+         op->src[0]->type == GGML_TYPE_BF16 ||
+         op->src[0]->type == GGML_TYPE_Q8_0 ||
+         op->src[0]->type == GGML_TYPE_Q4_K ||
+         op->src[0]->type == GGML_TYPE_Q5_K ||
+         op->src[0]->type == GGML_TYPE_Q6_K ||
+         op->src[0]->type == GGML_TYPE_Q2_K ||
+         op->src[0]->type == GGML_TYPE_Q3_K ||
+         op->src[0]->type == GGML_TYPE_MXFP4 ||
+         op->src[0]->type == GGML_TYPE_IQ2_XXS ||
+         op->src[0]->type == GGML_TYPE_IQ2_XS ||
+         op->src[0]->type == GGML_TYPE_IQ3_XXS ||
+         op->src[0]->type == GGML_TYPE_IQ3_S ||
+         op->src[0]->type == GGML_TYPE_IQ2_S ||
+         op->src[0]->type == GGML_TYPE_IQ1_S ||
+         op->src[0]->type == GGML_TYPE_IQ1_M ||
+         op->src[0]->type == GGML_TYPE_IQ4_NL ||
+         op->src[0]->type == GGML_TYPE_IQ4_XS ||
+         op->src[0]->type == GGML_TYPE_Q4_0 ||
+         op->src[0]->type == GGML_TYPE_Q4_1 ||
+         op->src[0]->type == GGML_TYPE_Q5_0 ||
+        nth = props_dev->simd_width;
+    }
+
     if (op->src[0]->type == GGML_TYPE_F32 ||
         op->src[0]->type == GGML_TYPE_F16 ||
         op->src[0]->type == GGML_TYPE_BF16 ||
         op->src[0]->type == GGML_TYPE_Q8_0) {
-        ggml_metal_encoder_dispatch_threadgroups(enc, ((ne01 + nr0 - 1)/(nr0)), ((ne11 + nr1 - 1)/nr1), ne12*ne13, 32, nsg, 1);
+        ggml_metal_encoder_dispatch_threadgroups(enc, ((ne01 + nr0 - 1)/(nr0)), ((ne11 + nr1 - 1)/nr1), ne12*ne13, nth, nsg, 1);
     } else {
-        ggml_metal_encoder_dispatch_threadgroups(enc, ((ne01 + nr0*nsg - 1)/(nr0*nsg)), ((ne11 + nr1 - 1)/nr1), ne12*ne13, 32, nsg, 1);
+        ggml_metal_encoder_dispatch_threadgroups(enc, ((ne01 + nr0*nsg - 1)/(nr0*nsg)), ((ne11 + nr1 - 1)/nr1), ne12*ne13, nth, nsg, 1);
     }
 
     return 1;
 }
 
+    static const bool disabled = TOSH_ENV("TOSH_QKV_FUSION_DISABLE") != nullptr;
+
+    const bool qvk_w64 = props_dev->simd_width == 64 && TOSH_ENV("TOSH_QVK_W64_DISABLE") == nullptr;
+        const char * s = TOSH_ENV("TOSH_EXT_KQ_FLOOR");
+        const char * s = TOSH_ENV("TOSH_EXT_MAX");
+        return s ? atoi(s) : 0;
+    }();
+    static const bool disabled = TOSH_ENV("TOSH_SWIGLU_FUSION_DISABLE") != nullptr;
+    if (disabled || !ctx->use_fusion() || idx + 2 >= ctx->n_nodes()) {
 int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -2619,6 +2686,8 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     // first try to use small-batch mat-mv kernels
     // these should be efficient for BS [2, ~8]
     if (op->src[1]->type == GGML_TYPE_F32 && (ne00%128 == 0) &&
+    static const bool ext_disabled = TOSH_ENV("TOSH_EXT_DISABLE") != nullptr;
+        op->src[1]->type == GGML_TYPE_F32 && (ne00%128 == 0) &&
         (
          (
           (
@@ -2655,9 +2724,12 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         //       my current hypothesis is that the work grid is not evenly divisible for different nsg
         //       values and there can be some tail effects when nsg is high. need to confirm this
         //
-        const int nsg    = 2;                 // num simdgroups per threadgroup
+        const int nsg    = 1;                 // num simdgroups per threadgroup
 
         // num threads along row per simdgroup
+            const char * s = TOSH_ENV("TOSH_EXT_NXPSG");
+            return s ? atoi(s) : 0;
+        }();
         int16_t nxpsg = 0;
         if (ne00 % 256 == 0 && ne11 < 3) {
             nxpsg = 16;
@@ -2665,6 +2737,8 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
             nxpsg = 8;
         } else {
             nxpsg = 4;
+                (props_dev->simd_width == 64 || TOSH_ENV("TOSH_EXT_NXPSG_X2") != nullptr) &&
+                TOSH_ENV("TOSH_EXT_NXPSG_X2_DISABLE") == nullptr) {
         }
 
         const int16_t nypsg  = 32/nxpsg;          // num threads along col per simdgroup (i.e. a simdgroup processes that many src0 rows at a time)
@@ -2689,6 +2763,20 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         };
 
         auto pipeline = ggml_metal_library_get_pipeline_mul_mv_ext(lib, op, nsg, nxpsg, r1ptg);
+        // 2 rows per thread: the activation chunk is loaded once and reused across them
+        const bool nr0_2 = op->src[0]->type == GGML_TYPE_Q4_K ||
+                           op->src[0]->type == GGML_TYPE_Q5_K ||
+                           op->src[0]->type == GGML_TYPE_Q6_K ||
+                           op->src[0]->type == GGML_TYPE_Q2_K ||
+                           op->src[0]->type == GGML_TYPE_Q3_K;
+
+        static const int nr0_env = []() {
+            const char * s = TOSH_ENV("TOSH_EXT_NR0");
+            return s ? atoi(s) : 0;
+        }();
+            const char * s = TOSH_ENV("TOSH_EXT_NR0_MINROWS");
+        static const bool ext_w64_disable = TOSH_ENV("TOSH_EXT_W64_DISABLE") != nullptr;
+        auto pipeline = ggml_metal_library_get_pipeline_mul_mv_ext(lib, op, nsg, nxpsg, r1ptg, nr0);
 
         ggml_metal_kargs_mul_mv_ext args = {
             /*.ne00  =*/ ne00,
@@ -2830,6 +2918,10 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
 
     const uint32_t r2 = 1;
     const uint32_t r3 = 1;
+    // escape hatch: revert wave64 MoE prefill to the mat-vec route
+    const bool mm_id_manual_ok = props_dev->simd_width == 32 ||
+        TOSH_ENV("TOSH_W64_MMID_PREFILL_DISABLE") == NULL;
+
 
     if (ggml_metal_op_mul_mat_id_use_mm(op, props_dev->has_simdgroup_mm)) {
         // some Metal matrix data types require aligned pointers
@@ -2962,6 +3054,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
             ggml_metal_encoder_dispatch_threadgroups(enc, (ne21 + 31)/32, (ne01 + 63)/64, ne02, 128, 1, 1);
+                TOSH_ENV("TOSH_MMID_ODD_GRID_DISABLE") == nullptr) {
         }
     } else {
         auto pipeline = ggml_metal_library_get_pipeline_mul_mv_id(lib, op);
@@ -3008,6 +3101,47 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
 
         const int64_t _ne1 = 1;
         const int64_t ne123 = ne20*ne21;
+        ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
+
+        // wave64 decode: run the MoE mat-vec on a full 64-wide simdgroup (matches the
+        // kernel's FC_mul_mv_nw); 32 for wave32 and the CPU-bound types.
+        int id_nth = 32;
+        if (props_dev->wave64_decode &&
+            (op->src[0]->type == GGML_TYPE_F16 ||
+             op->src[0]->type == GGML_TYPE_F32 ||
+             op->src[0]->type == GGML_TYPE_BF16 ||
+             op->src[0]->type == GGML_TYPE_Q8_0 ||
+             op->src[0]->type == GGML_TYPE_Q4_K ||
+             op->src[0]->type == GGML_TYPE_Q5_K ||
+             op->src[0]->type == GGML_TYPE_Q6_K ||
+             op->src[0]->type == GGML_TYPE_Q2_K ||
+             op->src[0]->type == GGML_TYPE_Q3_K ||
+             op->src[0]->type == GGML_TYPE_MXFP4 ||
+             op->src[0]->type == GGML_TYPE_IQ2_XXS ||
+             op->src[0]->type == GGML_TYPE_IQ2_XS ||
+             op->src[0]->type == GGML_TYPE_IQ3_XXS ||
+             op->src[0]->type == GGML_TYPE_IQ3_S ||
+             op->src[0]->type == GGML_TYPE_IQ2_S ||
+             op->src[0]->type == GGML_TYPE_IQ1_S ||
+             op->src[0]->type == GGML_TYPE_IQ1_M ||
+             op->src[0]->type == GGML_TYPE_IQ4_NL ||
+             op->src[0]->type == GGML_TYPE_IQ4_XS ||
+             op->src[0]->type == GGML_TYPE_Q4_0 ||
+             op->src[0]->type == GGML_TYPE_Q4_1 ||
+             op->src[0]->type == GGML_TYPE_Q5_0 ||
+            id_nth = props_dev->simd_width;
+        }
+
+        if (op->src[0]->type == GGML_TYPE_F32 ||
+            op->src[0]->type == GGML_TYPE_F16 ||
+            op->src[0]->type == GGML_TYPE_BF16 ||
+            op->src[0]->type == GGML_TYPE_Q8_0) {
+            ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nr0 - 1)/(nr0), (_ne1 + nr1 - 1)/nr1, ne123, id_nth, nsg, 1);
+        } else {
+            ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nr0*nsg - 1)/(nr0*nsg), (_ne1 + nr1 - 1)/nr1, ne123, id_nth, nsg, 1);
+        }
+    }
+
 
         ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
@@ -3068,6 +3202,16 @@ int ggml_metal_op_add_id(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, 1, nth, 1, 1);
 
     return 1;
+}
+
+// Suffix for the AMD vec FA pipeline name, or nullptr for types we don't instantiate.
+static const char * ggml_metal_fa_amd_type_suffix(enum ggml_type t) {
+    switch (t) {
+        case GGML_TYPE_F16:  return "f16";
+        case GGML_TYPE_Q8_0: return "q8_0";
+        case GGML_TYPE_Q4_0: return "q4_0";
+        default:             return nullptr;
+    }
 }
 
 bool ggml_metal_op_flash_attn_ext_use_vec(const ggml_tensor * op) {
@@ -3466,6 +3610,177 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
 
     ggml_metal_buffer_id bid_tmp = bid_blk;
     bid_tmp.offs += ggml_metal_op_flash_attn_ext_extra_blk(op);
+
+    // AMD discrete GPUs miscompile the templated vec kernel, so route attention (decode
+    // and prefill) to the dedicated AMD kernel for the standard K/V pairs it covers.
+    // Keeps quantized KV on the GPU instead of the CPU fallback. Gated by TOSH_FA_AMD.
+    char fa_amd_pipeline[80] = {0};
+    // dk 72 is instantiated for f16 K/V only (vision towers); see the .metal side.
+        op->src[1]->type == GGML_TYPE_F16 && op->src[2]->type == GGML_TYPE_F16;
+        const char * ks = ggml_metal_fa_amd_type_suffix(op->src[1]->type);
+        const char * vs = ggml_metal_fa_amd_type_suffix(op->src[2]->type);
+            snprintf(fa_amd_pipeline, sizeof(fa_amd_pipeline), "kernel_flash_attn_ext_vec_amd_dk%d_k%s_v%s%s", (int) ne00, ks, vs,
+                     props_dev->simd_width == 64 ? "_w64" : "");
+        }
+        const char * ks = ggml_metal_fa_amd_type_suffix(op->src[1]->type);
+        const char * vs = ggml_metal_fa_amd_type_suffix(op->src[2]->type);
+    }
+    // wave32 rides on simdgroup_reduction; wave64 uses the _w64 instantiations and
+    // is gated by wave64_decode (simdgroup_reduction is forced off there).
+    const bool fa_amd_width_ok = props_dev->simd_width == 32
+        ? props_dev->has_simdgroup_reduction
+        : props_dev->wave64_decode;
+    if (TOSH_ENV("TOSH_FA_AMD") != NULL && fa_amd_pipeline[0] != '\0' &&
+        !props_dev->has_simdgroup_mm && fa_amd_width_ok &&
+        !has_bias && !has_scap) {
+
+        ggml_metal_kargs_flash_attn_ext_amd args = {
+            /*.ne01          =*/ ne01,
+            /*.ne02          =*/ ne02,
+            /*.ne03          =*/ ne03,
+            /*.nb01          =*/ nb01,
+            /*.nb02          =*/ nb02,
+            /*.nb03          =*/ nb03,
+            /*.ne11          =*/ ne11,
+            /*.ne_12_2       =*/ ne12,
+            /*.ne_12_3       =*/ ne13,
+            /*.ns10          =*/ int32_t(nb11/nb10),
+            /*.nb11          =*/ nb11,
+            /*.nb12          =*/ nb12,
+            /*.nb13          =*/ nb13,
+            /*.ns20          =*/ int32_t(nb21/nb20),
+            /*.nb21          =*/ nb21,
+            /*.nb22          =*/ nb22,
+            /*.nb23          =*/ nb23,
+            /*.ne31          =*/ ne31,
+            /*.ne32          =*/ ne32,
+            /*.ne33          =*/ ne33,
+            /*.nb31          =*/ nb31,
+            /*.nb32          =*/ nb32,
+            /*.nb33          =*/ nb33,
+            /*.ne1           =*/ ne1,
+            /*.ne2           =*/ ne2,
+            /*.ne3           =*/ ne3,
+            /*.scale         =*/ scale,
+            /*.max_bias      =*/ max_bias,
+            /*.m0            =*/ m0,
+            /*.m1            =*/ m1,
+            /*.n_head_log2   =*/ n_head_log2,
+            /*.logit_softcap =*/ logit_softcap,
+            /*.has_sinks     =*/ has_sinks ? 1 : 0,
+            /*.has_mask      =*/ has_mask ? 1 : 0,
+
+        // queries per threadgroup, matching the instantiation for this head size
+        static const bool pf512 = TOSH_ENV("TOSH_FA_PF_DK512") != nullptr;
+        static const bool pfmla = TOSH_ENV("TOSH_FA_PF_MLA_DISABLE") == nullptr;
+        const bool fa_pf_head_ok =
+        if (TOSH_ENV("TOSH_FA_PF_DEBUG") != nullptr) {
+            ne01 >= 32 && fa_pf_head_ok && TOSH_ENV("TOSH_FA_PF_DISABLE") == NULL) {
+            char fa_pf_pipeline[80];
+            snprintf(fa_pf_pipeline, sizeof(fa_pf_pipeline), "kernel_flash_attn_ext_pf_amd_dk%d_k%s_v%s", (int) ne00,
+                     ggml_metal_fa_amd_type_suffix(op->src[1]->type), ggml_metal_fa_amd_type_suffix(op->src[2]->type));
+                    const char * s = TOSH_ENV("TOSH_FA_PF_LG");
+                    const char * s = TOSH_ENV("TOSH_FA_PF_BQ");
+                    const char * s = TOSH_ENV("TOSH_FA_PF_BK");
+                    TOSH_ENV("TOSH_FA_PF_W64_DISABLE") == nullptr) {
+                TOSH_ENV("TOSH_FA_PF_W64_DISABLE") == nullptr) {
+                const char * slg = TOSH_ENV("TOSH_FA_PF_LG");
+            if (TOSH_ENV("TOSH_FA_PF_DEBUG") != nullptr) {
+            // it fits in registers with nothing to spare; a compiler bump could
+                ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+                ggml_metal_encoder_set_buffer  (enc, bid_src0, 1);
+                ggml_metal_encoder_set_buffer  (enc, bid_src1, 2);
+                ggml_metal_encoder_set_buffer  (enc, bid_src2, 3);
+                ggml_metal_encoder_set_buffer  (enc, bid_src3, 4);
+                ggml_metal_encoder_set_buffer  (enc, bid_src4, 5);
+                ggml_metal_encoder_set_buffer  (enc, bid_pad,  6);
+                ggml_metal_encoder_set_buffer  (enc, bid_dst,  7);
+
+                ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + fa_pf_bq - 1)/fa_pf_bq, ne02, ne03,
+                                                         props_dev->simd_width, 256/props_dev->simd_width, 1);
+
+                return 1;
+            }
+        }
+
+        // prefill goes to the tile kernel (K/V shared across 16 queries);
+        // decode keeps the per-query vec kernel
+        if (ne01 >= 16 && TOSH_ENV("TOSH_FA_TILE_DISABLE") == NULL) {
+            char fa_tile_pipeline[80];
+                         ggml_metal_fa_amd_type_suffix(op->src[1]->type), ggml_metal_fa_amd_type_suffix(op->src[2]->type),
+                         props_dev->simd_width == 64 ? "_w64" : "");
+            } else {
+                snprintf(fa_tile_pipeline, sizeof(fa_tile_pipeline), "kernel_flash_attn_ext_tile_amd_dk%d_k%s_v%s%s", (int) ne00,
+                         ggml_metal_fa_amd_type_suffix(op->src[1]->type), ggml_metal_fa_amd_type_suffix(op->src[2]->type),
+                         props_dev->simd_width == 64 ? "_w64" : "");
+            }
+
+        // must match the .metal instantiations: q4_0 dequant caps the pipeline, so those
+        // pairs drop to 24 (dk128 q4_0 keys, dk64 subw=8 with q4_0 in either K or V).
+        int fa_amd_nsg = ne00 == 128 ? 16 : ne00 <= 128 ? 32 : 16;
+        if (props_dev->simd_width == 32) {
+            const bool k_q4 = op->src[1]->type == GGML_TYPE_Q4_0;
+            const bool v_q4 = op->src[2]->type == GGML_TYPE_Q4_0;
+                fa_amd_nsg = 24;
+            }
+        }
+        if (props_dev->simd_width == 64) {
+            fa_amd_nsg /= 2;
+        }
+            const char * s = TOSH_ENV("TOSH_FA_AMD_NSG_64");
+            const char * s = TOSH_ENV("TOSH_FA_AMD_NSG_128");
+            const char * s = TOSH_ENV("TOSH_FA_AMD_NSG_WIDE");
+        // one threadgroup per query head leaves most of the GPU idle on models with
+        // few heads; split the cache across 32 and let upstream's reduce merge them
+            const char * s = TOSH_ENV("TOSH_FA_WG_DK128_MIN_KV");
+            const char * s = TOSH_ENV("TOSH_FA_WG_DK64");
+        const int fa_amd_nwg =
+            TOSH_ENV("TOSH_FA_WG_DISABLE") == NULL ? 32 : 1;
+
+        char fa_amd_wg_pipeline[96];
+        if (fa_amd_nwg > 1) {
+            snprintf(fa_amd_wg_pipeline, sizeof(fa_amd_wg_pipeline), "%s_wg32", fa_amd_pipeline);
+        }
+
+        // dispatching more threads than the pipeline admits hangs the GPU, and how many
+        // it admits depends on the K type's dequant; fall through rather than risk it
+            GGML_LOG_WARN("%s: %s wants %d threads, pipeline allows %d; using the generic kernels\n",
+                          __func__, fa_amd_pipeline, fa_amd_nsg*props_dev->simd_width,
+                          ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+        } else {
+
+        ggml_metal_encoder_set_pipeline(enc, pipeline);
+        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer  (enc, bid_src0, 1);
+        ggml_metal_encoder_set_buffer  (enc, bid_src1, 2);
+        ggml_metal_encoder_set_buffer  (enc, bid_src2, 3);
+        ggml_metal_encoder_set_buffer  (enc, bid_src3, 4);
+        ggml_metal_encoder_set_buffer  (enc, bid_src4, 5);
+        ggml_metal_encoder_set_buffer  (enc, bid_pad,  6);
+        ggml_metal_encoder_set_buffer  (enc, fa_amd_nwg > 1 ? bid_tmp : bid_dst, 7);
+        ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, ne03*fa_amd_nwg, props_dev->simd_width, fa_amd_nsg, 1);
+
+        if (fa_amd_nwg > 1) {
+            ggml_metal_op_concurrency_reset(ctx);
+
+            ggml_metal_kargs_flash_attn_ext_vec_reduce args0 = { (int32_t) (ne1*ne2*ne3) };
+
+            auto pipeline0 = ggml_metal_library_get_pipeline_flash_attn_ext_vec_reduce(lib, op, ne20, fa_amd_nwg);
+
+            ggml_metal_encoder_set_pipeline(enc, pipeline0);
+            ggml_metal_encoder_set_bytes   (enc, &args0, sizeof(args0), 0);
+            ggml_metal_encoder_set_buffer  (enc, bid_tmp, 1);
+            ggml_metal_encoder_set_buffer  (enc, bid_dst, 2);
+
+            ggml_metal_encoder_dispatch_threadgroups(enc, ne1*ne2*ne3, 1, 1, 32*fa_amd_nwg, 1, 1);
+        }
+
+        return 1;
+        }
+    }
+
+    // The generic Metal kernels below need K and V to share a type.
+    GGML_ASSERT(op->src[1]->type == op->src[2]->type);
 
     ggml_metal_buffer_id bid_kv_f16 = bid_tmp;
     bid_kv_f16.offs += ggml_metal_op_flash_attn_ext_extra_tmp(op);

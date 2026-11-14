@@ -2699,6 +2699,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
              int64_t   n_kv_max,
                float   kq_scale,
                  int   il) const {
+
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -2715,7 +2716,53 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
     ggml_tensor * cur;
 
-    const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
+    // AMD FA wins decode, while the decomposed graph wins long prefill for the
+    // measured head sizes.
+    const char * metal_simd_width = getenv("TOSH_METAL_SIMD_WIDTH");
+    const bool measured_head_size =
+        q->ne[0] == 64 || q->ne[0] == 128 || q->ne[0] == 256 || q->ne[0] == 512;
+    // Head 64/128 beat the decomposed route at every depth on both wave widths; bias
+    // and softcap have no blocked kernel and would land on the slow generic path.
+    const bool amd_prefill_fa_blocked =
+        (q->ne[0] == 64 || q->ne[0] == 128) &&
+        metal_simd_width != nullptr &&
+        (strcmp(metal_simd_width, "32") == 0 || strcmp(metal_simd_width, "64") == 0) &&
+        hparams.f_max_alibi_bias == 0.0f && !hparams.attn_soft_cap &&
+        getenv("TOSH_FA_PF_DISABLE") == nullptr;
+    // Head-256 is neutral through 1024 tokens and only pulls ahead on longer
+    // prompts; keep FA for pp512, where it measured slightly faster.
+    const int64_t decomposed_min_tokens = q->ne[0] == 256 ? 512 : 32;
+    // Quantized caches ride the same route: K stays quantized as mul_mat's left
+    // operand and quantized V is dequantized once before its transpose. Covers
+    // every pair the app offers (f16/q8_0/q4_0). Escape hatch for just these.
+    const bool decomposed_k_ok =
+        k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_Q8_0 || k->type == GGML_TYPE_Q4_0;
+    const bool decomposed_v_ok =
+        v->type == GGML_TYPE_F16 || v->type == GGML_TYPE_Q8_0 || v->type == GGML_TYPE_Q4_0;
+    const bool decomposed_kv_ok =
+        (k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16) ||
+        (getenv("TOSH_QK_PREFILL_DISABLE") == nullptr && decomposed_k_ok && decomposed_v_ok);
+    // the dequantization of a quantized V below only exists on the device, so layers a
+    // partial offload leaves in host memory keep flash attention
+    const ggml_tensor * v_alloc = v;
+    while (v_alloc != nullptr && v_alloc->buffer == nullptr) {
+        v_alloc = v_alloc->view_src;
+    }
+    const bool decomposed_v_on_device =
+        !ggml_is_quantized(v->type) ||
+        (v_alloc != nullptr && !ggml_backend_buft_is_host(ggml_backend_buffer_get_type(v_alloc->buffer)));
+    const bool amd_prefill_decomposed =
+        getenv("TOSH_FA_AMD") != nullptr &&
+        decomposed_v_on_device &&
+        getenv("TOSH_FA_AMD_PREFILL_DECOMPOSED_DISABLE") == nullptr &&
+        getenv("TOSH_FA_AMD_HEAD64_PREFILL_DISABLE") == nullptr &&
+        metal_simd_width != nullptr &&
+        // wave64 validated on GCN/Vega (parity + long-prompt wins); hatch opts out
+        (strcmp(metal_simd_width, "32") == 0 ||
+         (strcmp(metal_simd_width, "64") == 0 && getenv("TOSH_W64_PREFILL_DISABLE") == nullptr)) &&
+        n_tokens > decomposed_min_tokens && measured_head_size &&
+        decomposed_kv_ok && !amd_prefill_fa_blocked;
+    const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr && !amd_prefill_decomposed;
     if (use_flash_attn) {
         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
 
@@ -2741,6 +2788,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
         ggml_prec_set_acc(cur, GGML_PREC_F32);
 
+
         if (v_mla) {
 #if 0
             // v_mla can be applied as a matrix-vector multiplication with broadcasting across dimension 3 == n_tokens.
@@ -2760,6 +2808,11 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
     } else {
+        // sinks models (gpt-oss) lose with the quantized-K mul_mat here while
+        // winning on the f16 one; dequantize K once instead of falling back to FA
+        if (sinks && ggml_is_quantized(k->type)) {
+            k = ggml_cast(ctx0, k, GGML_TYPE_F16);
+        }
         ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
         cb(kq, "kq", il);
 
@@ -2800,6 +2853,11 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         if (!v_trans) {
             // note: avoid this branch
+            // quantized V reaches this route via the RDNA prefill selector; the
+            // transposed mul_mat operand must be dequantized first
+            if (ggml_is_quantized(v->type)) {
+                v = ggml_cast(ctx0, v, GGML_TYPE_F16);
+            }
             v = ggml_cont(ctx0, ggml_transpose(ctx0, v));
             cb(v, "v_cont", il);
         }
