@@ -3468,9 +3468,9 @@ static bool ggml_metal_ranges_overlap(const ggml_tensor * a, const ggml_tensor *
     return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
 }
 
-// PQ2_0 gate and up mat-vecs of one token followed by their swiglu: one kernel writes the swiglu
-// output. The three nodes are adjacent, so writing that output early only needs it apart from
-// the activation the kernel reads.
+// gate and up mat-vecs of one token (PQ2_0, or the dense types on 32 lanes) followed by their swiglu: one
+// kernel writes the swiglu output. The three nodes are adjacent, so writing that output early only
+// needs it apart from the activation the kernel reads.
 static int ggml_metal_op_mul_mat_swiglu(ggml_metal_op_t ctx, int idx) {
     static const bool disabled = TOSH_ENV("TOSH_SWIGLU_FUSION_DISABLE") != nullptr;
     if (disabled || !ctx->use_fusion() || idx + 2 >= ctx->n_nodes()) {
@@ -3495,14 +3495,23 @@ static int ggml_metal_op_mul_mat_swiglu(ggml_metal_op_t ctx, int idx) {
     const ggml_cgraph * gf = ctx->graph();
     const ggml_tensor * x  = gate->src[1];
 
+    // the dense kernels copy the 32-lane standalone mat-vecs (q4_K only where those run two groups of
+    // two rows); measured on discrete cards only, so unified memory keeps the separate ones
+    static const bool dense_disabled = TOSH_ENV("TOSH_DENSE_SWIGLU_FUSION_DISABLE") != nullptr;
+    const ggml_type wt = gate->src[0]->type;
+    const ggml_metal_device_props * props = ggml_metal_device_get_props(ctx->dev);
+    const bool dense = !dense_disabled && props->simd_width == 32 && !props->has_unified_memory &&
+        (wt == GGML_TYPE_Q4_0 || wt == GGML_TYPE_Q5_K || wt == GGML_TYPE_Q8_0 ||
+         (wt == GGML_TYPE_Q4_K && gate->src[0]->ne[0] > 2048 && gate->src[0]->ne[1] > 2048));
+
     const bool ok =
-        gate->src[0]->type == GGML_TYPE_PQ2_0 && up->src[0]->type == GGML_TYPE_PQ2_0 &&
+        (wt == GGML_TYPE_PQ2_0 || dense) && up->src[0]->type == wt &&
         ggml_are_same_shape(gate->src[0], up->src[0]) && up->src[1] == x &&
         ggml_get_op_params_i32(gate, 1) == 0 && ggml_get_op_params_i32(up, 1) == 0 &&
         gate->src[0]->ne[2] == 1 && gate->src[0]->ne[3] == 1 &&
         ggml_is_contiguous(gate->src[0]) && ggml_is_contiguous(up->src[0]) &&
         x->type == GGML_TYPE_F32 && ggml_is_contiguous(x) && x->ne[1] == 1 && x->ne[2] == 1 && x->ne[3] == 1 &&
-        gate->src[0]->ne[0] % 128 == 0 &&
+        (wt != GGML_TYPE_PQ2_0 || gate->src[0]->ne[0] % 128 == 0) &&
         glu->type == GGML_TYPE_F32 && ggml_is_contiguous(glu) && ggml_nelements(glu) == gate->ne[0] &&
         ggml_metal_use_count(gf, gate) == 1 && ggml_metal_use_count(gf, up) == 1 &&
         !(gate->flags & GGML_TENSOR_FLAG_OUTPUT) && !(up->flags & GGML_TENSOR_FLAG_OUTPUT) &&
@@ -3511,7 +3520,8 @@ static int ggml_metal_op_mul_mat_swiglu(ggml_metal_op_t ctx, int idx) {
         return 0;
     }
 
-    auto pipeline = ggml_metal_library_get_pipeline_mul_mv_pq2_swiglu(ctx->lib);
+    auto pipeline = wt == GGML_TYPE_PQ2_0 ? ggml_metal_library_get_pipeline_mul_mv_pq2_swiglu(ctx->lib)
+                                          : ggml_metal_library_get_pipeline_mul_mv_dense_swiglu(ctx->lib, gate->src[0]);
 
     const ggml_tensor * w = gate->src[0];
 
@@ -3547,7 +3557,12 @@ static int ggml_metal_op_mul_mat_swiglu(ggml_metal_op_t ctx, int idx) {
 
     const int nr0 = pipeline.nr0;
     const int nsg = pipeline.nsg;
-    ggml_metal_encoder_dispatch_threadgroups(enc, (w->ne[1] + nr0*nsg - 1)/(nr0*nsg), 1, 1, pipeline.nr1, nsg, 1);
+    if (wt == GGML_TYPE_Q8_0) {
+        ggml_metal_encoder_set_threadgroup_memory_size(enc, pipeline.smem, 0);
+        ggml_metal_encoder_dispatch_threadgroups(enc, (w->ne[1] + nr0 - 1)/nr0, 1, 1, pipeline.nr1, nsg, 1);
+    } else {
+        ggml_metal_encoder_dispatch_threadgroups(enc, (w->ne[1] + nr0*nsg - 1)/(nr0*nsg), 1, 1, pipeline.nr1, nsg, 1);
+    }
 
     return 3;
 }

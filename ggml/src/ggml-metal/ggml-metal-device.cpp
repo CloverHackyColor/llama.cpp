@@ -1378,6 +1378,60 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_pq2_swigl
     return res;
 }
 
+// gate, up and their swiglu in one 32-lane dispatch, with the geometry of the standalone mat-vec
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_dense_swiglu(ggml_metal_library_t lib, const ggml_tensor * w) {
+    const auto * props = ggml_metal_device_get_props(ggml_metal_library_get_device(lib));
+
+    const ggml_type type = w->type;
+
+    int16_t nsg = 0;
+    int     nr0 = 0;
+    switch (type) {
+        case GGML_TYPE_Q4_0: nsg = N_SG_Q4_0; nr0 = N_R0_Q4_0; break;
+        case GGML_TYPE_Q4_K: nsg = N_SG_Q4_K; nr0 = N_R0_Q4_K; break;
+        case GGML_TYPE_Q5_K: nsg = N_SG_Q5_K; nr0 = N_R0_Q5_K; break;
+        case GGML_TYPE_Q8_0: nsg = N_SG_Q8_0; nr0 = N_R0_Q8_0; break;
+        default: GGML_ABORT("unsupported dense swiglu type");
+    }
+
+    // the word-wide reads the standalone q8_0 mat-vec takes for this stride
+    const bool row8  = type == GGML_TYPE_Q8_0 && w->nb[1] % 4 == 0 &&
+                       TOSH_ENV("TOSH_MV_ROW4_DISABLE") == nullptr && TOSH_ENV("TOSH_MV_ROW8_DISABLE") == nullptr;
+    const bool align = props->needs_aligned_loads;
+
+    char base[256];
+    char name[256];
+
+    snprintf(base, 256, "kernel_mul_mv_%s_swiglu_f32", ggml_type_name(type));
+    snprintf(name, 256, "%s_nsg=%d_r8=%d_al=%d", base, nsg, row8, align);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+
+        ggml_metal_cv_set_int16(cv, nsg,   FC_MUL_MV + 0);
+        ggml_metal_cv_set_int16(cv, 1,     FC_MUL_MV + 2);
+        ggml_metal_cv_set_int16(cv, 1,     FC_MUL_MV + 3);
+        ggml_metal_cv_set_int16(cv, 1,     FC_MUL_MV + 4);
+        ggml_metal_cv_set_int16(cv, 32,    FC_MUL_MV + 5);
+        ggml_metal_cv_set_bool (cv, row8,  FC_MUL_MV + 6);
+        ggml_metal_cv_set_bool (cv, row8,  FC_MUL_MV + 7);
+        ggml_metal_cv_set_bool (cv, align, FC_MUL_MV + 8);
+
+        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+
+        ggml_metal_cv_free(cv);
+    }
+
+    res.nsg  = nsg;
+    res.nr0  = nr0/2; // rows of each matrix, so a group reads what it did alone
+    res.nr1  = 32;    // threads per simdgroup for the dispatch
+    // q8_0 splits each row across its simdgroups and reduces gate and up rows in threadgroup memory
+    res.smem = type == GGML_TYPE_Q8_0 ? 32*sizeof(float)*nr0 : 0;
+
+    return res;
+}
+
 // a pair of columns shares one read of each block, where one pass per column would read and
 // unpack the weights twice. Four columns go as two pairs where that measured faster.
 // TOSH_MV_NC2_PROBE=R opens the untuned widths with R rows, for measuring
