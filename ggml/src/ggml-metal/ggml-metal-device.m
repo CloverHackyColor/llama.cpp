@@ -1,9 +1,12 @@
 #import "ggml-metal-device.h"
 #import "ggml-metal-fusion.h"
 
+#include <sys/resource.h>
+
 #import "ggml-impl.h"
 #import "ggml-backend-impl.h"
 #import "ggml-metal-impl.h"
+
 #import "ggml-metal-common.h"
 
 #include <Foundation/Foundation.h>
@@ -1734,6 +1737,28 @@ void ggml_metal_device_rsets_add(ggml_metal_device_t dev, ggml_metal_rset_t rset
 
 void ggml_metal_device_rsets_rm(ggml_metal_device_t dev, ggml_metal_rset_t rset) {
     if (rset == nil) {
+        return;
+    }
+
+    GGML_ASSERT(dev->rsets);
+
+    [dev->rsets->lock lock];
+
+    [dev->rsets->data removeObject:rset];
+
+    [dev->rsets->lock unlock];
+}
+
+void ggml_metal_device_rsets_keep_alive(ggml_metal_device_t dev) {
+    if (dev->rsets == NULL) {
+        return;
+    }
+
+    atomic_store_explicit(&dev->rsets->d_loop, dev->rsets->loops_per_s*dev->rsets->keep_alive_s, memory_order_relaxed);
+}
+
+struct ggml_metal_event {
+    void * obj; // id<MTLSharedEvent>
 
     atomic_int value;
 };
@@ -1785,6 +1810,7 @@ void ggml_metal_device_event_synchronize(ggml_metal_device_t dev, ggml_metal_eve
 
     GGML_UNUSED(dev);
 }
+
 
 void ggml_metal_device_get_memory(ggml_metal_device_t dev, size_t * free, size_t * total) {
     if (@available(macOS 10.12, iOS 16.0, *)) {
@@ -2925,8 +2951,11 @@ bool ggml_metal_device_stage_set(ggml_metal_device_t dev, struct ggml_metal_buff
     id<MTLBuffer> stage = dev->stage_set_bufs[slot];
     if (stage == nil || stage.length < size) {
         [stage release];
+        static int wc_off = -1;
         if (wc_off < 0) { wc_off = TOSH_ENV("TOSH_STAGE_WC_OFF") != NULL; }
         stage = [dev->mtl_device newBufferWithLength:MAX(size, (size_t) 256*1024)
+                                             options:wc_off ? MTLResourceStorageModeShared
+                                                            : (MTLResourceStorageModeShared | MTLResourceCPUCacheModeWriteCombined)];
         dev->stage_set_bufs[slot] = stage;
     }
     if (stage == nil) {
@@ -3064,7 +3093,32 @@ bool ggml_metal_device_stage_get(ggml_metal_device_t dev, struct ggml_metal_buff
     }
 
     return true;
+}
+
+_Atomic uint64_t g_tosh_d2h_ns, g_tosh_d2h_bytes, g_tosh_d2h_n;
+_Atomic uint64_t g_tosh_h2d_ns, g_tosh_h2d_bytes, g_tosh_h2d_n;
+static _Atomic int g_tosh_xfer_state = 0;
+
+static bool tosh_xfer_on(void);
+static void ggml_metal_buffer_set_tensor_impl(ggml_metal_buffer_t buf, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size);
+static void ggml_metal_buffer_get_tensor_impl(ggml_metal_buffer_t buf, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size);
+
+
 void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    const bool xf = tosh_xfer_on();
+    const uint64_t xf_t0 = xf ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
+    if (xf) {
+        atomic_fetch_add_explicit(&g_tosh_h2d_n, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_tosh_h2d_bytes, size, memory_order_relaxed);
+    }
+    ggml_metal_buffer_set_tensor_impl(buf, tensor, data, offset, size);
+    if (xf) {
+        atomic_fetch_add_explicit(&g_tosh_h2d_ns,
+                clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - xf_t0, memory_order_relaxed);
+    }
+}
+
+static void ggml_metal_buffer_set_tensor_impl(ggml_metal_buffer_t buf, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     if (size == 0) {
         return;
     }
@@ -3102,19 +3156,45 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * 
                     stage_load = (n == NULL || atoi(n) <= 1) && TOSH_ENV("GGML_METAL_DEVICE_LIST") == NULL;
                 }
             }
+            if (stage_load) {
+                bool done_all = true;
+                for (size_t done = 0; done < size;) {
+                    static size_t slice = 0;
+                    if (slice == 0) {
                         const char * v = TOSH_ENV("TOSH_STAGE_SLICE_MB");
+                        slice = v ? MIN((size_t) atoi(v)*1024*1024, GGML_METAL_STAGE_BUF_MAX) : GGML_METAL_STAGE_BUF_MAX;
+                        if (slice == 0) { slice = GGML_METAL_STAGE_BUF_MAX; }
+                    }
+                    const size_t n = MIN(slice, size - done);
 
+                    struct ggml_metal_buffer_id bid = bid_dst;
+                    bid.offs += done;
+
+                    if (!ggml_metal_device_stage_set(buf->dev, bid, (const char *) data + done, n)) {
+                        done_all = false;
+                        break;
+                    }
+
+                    done += n;
+                }
+                if (done_all) {
+                    return;
+                }
+            }
+        }
 
         const uint64_t t0 = tosh_prof_on() ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
 
         // src
         void * data_ptr = (void *)(uintptr_t) data; // "const cast" the src data
-        id<MTLBuffer> buf_src = [buf->dev->mtl_device newBufferWithBytesNoCopy:data_ptr
+        // wrapping the caller's pointer registers the whole tensor as a Metal resource for the
+        // blit; TOSH_NO_HOST_WRAP skips it so the chunked staging path below is used instead
+        static int no_wrap = -1;
         if (no_wrap < 0) { no_wrap = TOSH_ENV("TOSH_NO_HOST_WRAP") != NULL; }
+        id<MTLBuffer> buf_src = no_wrap ? nil : [buf->dev->mtl_device newBufferWithBytesNoCopy:data_ptr
                                                                length:size
                                                               options:MTLResourceStorageModeShared
                                                           deallocator:nil];
-
         // dst
         struct ggml_metal_buffer_id bid_dst = ggml_metal_buffer_get_id(buf, tensor);
         bid_dst.offs += offset;
@@ -3209,8 +3289,33 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * 
     }
 }
 
+// TOSH_CB_PROFILE: coste de las lecturas de vuelta (logits) y de las escrituras, que
+// son lo que queda del hueco de decode una vez descartados commit, creacion y espera
+static bool tosh_xfer_on(void) {
+    int st = atomic_load_explicit(&g_tosh_xfer_state, memory_order_relaxed);
+    if (st == 0) {
         const char * e = TOSH_ENV("TOSH_CB_PROFILE");
+        st = (e != NULL && strcmp(e, "0") != 0) ? 2 : 1;
+        atomic_store_explicit(&g_tosh_xfer_state, st, memory_order_relaxed);
+    }
+    return st == 2;
+}
+
 void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    const bool xf = tosh_xfer_on();
+    const uint64_t xf_t0 = xf ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
+    if (xf) {
+        atomic_fetch_add_explicit(&g_tosh_d2h_n, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_tosh_d2h_bytes, size, memory_order_relaxed);
+    }
+    ggml_metal_buffer_get_tensor_impl(buf, tensor, data, offset, size);
+    if (xf) {
+        atomic_fetch_add_explicit(&g_tosh_d2h_ns,
+                clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - xf_t0, memory_order_relaxed);
+    }
+}
+
+static void ggml_metal_buffer_get_tensor_impl(ggml_metal_buffer_t buf, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     if (size == 0) {
         return;
     }

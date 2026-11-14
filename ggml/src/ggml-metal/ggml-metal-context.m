@@ -21,7 +21,202 @@
 #define GGML_METAL_MAX_COMMAND_BUFFERS 8
 #define GGML_METAL_MAX_PREFETCH_STAGES 8
 
+#include <stdatomic.h>
+#include <time.h>
+
+// TOSH_CB_PROFILE=1: per-command-buffer GPU accounting, bucketed by graph size.
+// Off by default, and it attaches no completion handler when off.
+#define TOSH_CBP_MAX_BUCKETS 24
+
+struct tosh_cbp_bucket {
+    _Atomic int      n_nodes;    // 0 = free slot
+    _Atomic uint64_t n_graphs;
+    _Atomic uint64_t n_cbs;
+    _Atomic uint64_t gpu_ns;     // sum of GPUEndTime - GPUStartTime
+    _Atomic uint64_t ker_ns;     // sum of kernelEndTime - kernelStartTime
+    _Atomic uint64_t enc_ns;     // CPU time inside ggml_metal_graph_compute
+    _Atomic uint64_t span_ns;    // per graph: max(GPUEndTime) - min(GPUStartTime)
+    _Atomic uint64_t gpu_min_ns; // busiest/idlest single graph, to expose the warmup
+    _Atomic uint64_t gpu_max_ns;
+};
+
+// CPU side of synchronize, kept apart from the encode so a blocked wait is not read
+// as scheduler waste
+static _Atomic uint64_t g_cbp_wait_ns;   // blocked in waitUntilCompleted
+static _Atomic uint64_t g_cbp_drain_ns;  // blocked draining staged uploads
+static _Atomic uint64_t g_cbp_sync_n;
+static _Atomic uint64_t g_cbp_ops_ns;    // encoding the ops of a command buffer
+static _Atomic uint64_t g_cbp_commit_ns; // the commit call itself
+static _Atomic uint64_t g_cbp_create_ns; // creating and enqueuing the buffers of a graph
+
+static struct tosh_cbp_bucket g_cbp[TOSH_CBP_MAX_BUCKETS];
+static _Atomic int g_cbp_state = 0; // 0 unknown, 1 off, 2 on
+
+static bool tosh_cbp_on(void) {
+    int st = atomic_load_explicit(&g_cbp_state, memory_order_relaxed);
+    if (st == 0) {
         const char * e = TOSH_ENV("TOSH_CB_PROFILE");
+        st = (e != NULL && strcmp(e, "0") != 0) ? 2 : 1;
+        atomic_store_explicit(&g_cbp_state, st, memory_order_relaxed);
+    }
+    return st == 2;
+}
+
+static struct tosh_cbp_bucket * tosh_cbp_bucket_for(int n_nodes) {
+    for (int i = 0; i < TOSH_CBP_MAX_BUCKETS; ++i) {
+        int cur = atomic_load_explicit(&g_cbp[i].n_nodes, memory_order_relaxed);
+        if (cur == n_nodes) {
+            return &g_cbp[i];
+        }
+        if (cur == 0) {
+            int expected = 0;
+            if (atomic_compare_exchange_strong(&g_cbp[i].n_nodes, &expected, n_nodes)) {
+                return &g_cbp[i];
+            }
+            if (atomic_load_explicit(&g_cbp[i].n_nodes, memory_order_relaxed) == n_nodes) {
+                return &g_cbp[i];
+            }
+        }
+    }
+    return NULL;
+}
+
+// per-graph GPU timeline, filled by the completion handlers of that graph
+struct tosh_cbp_graph {
+    struct tosh_cbp_bucket * bucket;
+    _Atomic uint64_t t_first_ns;  // min GPUStartTime, ns
+    _Atomic uint64_t t_last_ns;   // max GPUEndTime, ns
+    _Atomic uint64_t gpu_ns;      // this graph's own GPU busy time
+    _Atomic int      n_left;      // command buffers still running
+};
+
+static void tosh_cbp_attach(id<MTLCommandBuffer> cb, struct tosh_cbp_graph * g) {
+    if (g == NULL) {
+        return;
+    }
+    atomic_fetch_add_explicit(&g->n_left, 1, memory_order_relaxed);
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> b) {
+        const double t0 = [b GPUStartTime];
+        const double t1 = [b GPUEndTime];
+        const double k0 = [b kernelStartTime];
+        const double k1 = [b kernelEndTime];
+
+        atomic_fetch_add_explicit(&g->bucket->n_cbs, 1, memory_order_relaxed);
+        if (t1 > t0) {
+            const uint64_t d = (uint64_t)((t1 - t0)*1e9);
+            atomic_fetch_add_explicit(&g->bucket->gpu_ns, d, memory_order_relaxed);
+            atomic_fetch_add_explicit(&g->gpu_ns,         d, memory_order_relaxed);
+        }
+        if (k1 > k0) {
+            atomic_fetch_add_explicit(&g->bucket->ker_ns, (uint64_t)((k1 - k0)*1e9), memory_order_relaxed);
+        }
+
+        const uint64_t s_ns = (uint64_t)(t0*1e9);
+        const uint64_t e_ns = (uint64_t)(t1*1e9);
+        uint64_t cur = atomic_load_explicit(&g->t_first_ns, memory_order_relaxed);
+        while (s_ns < cur || cur == 0) {
+            if (atomic_compare_exchange_weak(&g->t_first_ns, &cur, s_ns)) break;
+        }
+        cur = atomic_load_explicit(&g->t_last_ns, memory_order_relaxed);
+        while (e_ns > cur) {
+            if (atomic_compare_exchange_weak(&g->t_last_ns, &cur, e_ns)) break;
+        }
+
+        if (atomic_fetch_sub_explicit(&g->n_left, 1, memory_order_acq_rel) == 1) {
+            const uint64_t a = atomic_load_explicit(&g->t_first_ns, memory_order_relaxed);
+            const uint64_t z = atomic_load_explicit(&g->t_last_ns,  memory_order_relaxed);
+            if (z > a) {
+                atomic_fetch_add_explicit(&g->bucket->span_ns, z - a, memory_order_relaxed);
+            }
+            const uint64_t own = atomic_load_explicit(&g->gpu_ns, memory_order_relaxed);
+            uint64_t m = atomic_load_explicit(&g->bucket->gpu_min_ns, memory_order_relaxed);
+            while (m == 0 || own < m) {
+                if (atomic_compare_exchange_weak(&g->bucket->gpu_min_ns, &m, own)) break;
+            }
+            m = atomic_load_explicit(&g->bucket->gpu_max_ns, memory_order_relaxed);
+            while (own > m) {
+                if (atomic_compare_exchange_weak(&g->bucket->gpu_max_ns, &m, own)) break;
+            }
+            free(g);
+        }
+    }];
+}
+
+// definidos en ggml-metal-device.m
+extern _Atomic uint64_t g_tosh_d2h_ns, g_tosh_d2h_bytes, g_tosh_d2h_n;
+extern _Atomic uint64_t g_tosh_h2d_ns, g_tosh_h2d_bytes, g_tosh_h2d_n;
+
+static void tosh_cbp_dump_dev(ggml_metal_device_t dev) {
+    if (!tosh_cbp_on()) {
+        return;
+    }
+    {
+        const uint64_t dn = atomic_load_explicit(&g_tosh_d2h_n, memory_order_relaxed);
+        const uint64_t hn = atomic_load_explicit(&g_tosh_h2d_n, memory_order_relaxed);
+        fprintf(stderr, "TOSH_CBP  readback: %llu lecturas, %.2f MiB, %.1f ms | subidas: %llu, %.2f MiB, %.1f ms\n",
+                (unsigned long long) dn,
+                atomic_load_explicit(&g_tosh_d2h_bytes, memory_order_relaxed)/1048576.0,
+                atomic_load_explicit(&g_tosh_d2h_ns,    memory_order_relaxed)/1e6,
+                (unsigned long long) hn,
+                atomic_load_explicit(&g_tosh_h2d_bytes, memory_order_relaxed)/1048576.0,
+                atomic_load_explicit(&g_tosh_h2d_ns,    memory_order_relaxed)/1e6);
+        atomic_store_explicit(&g_tosh_d2h_n, 0, memory_order_relaxed);
+        atomic_store_explicit(&g_tosh_d2h_bytes, 0, memory_order_relaxed);
+        atomic_store_explicit(&g_tosh_d2h_ns, 0, memory_order_relaxed);
+        atomic_store_explicit(&g_tosh_h2d_n, 0, memory_order_relaxed);
+        atomic_store_explicit(&g_tosh_h2d_bytes, 0, memory_order_relaxed);
+        atomic_store_explicit(&g_tosh_h2d_ns, 0, memory_order_relaxed);
+    }
+    {
+        const uint64_t n = atomic_load_explicit(&g_cbp_sync_n, memory_order_relaxed);
+        fprintf(stderr, "TOSH_CBP  pid=%d  syncs=%llu  cpu_wait=%.1f  upload_drain=%.1f  "
+                "encode_ops=%.1f  commit=%.1f  create=%.1f  (ms totales)\n",
+                getpid(), (unsigned long long) n,
+                atomic_load_explicit(&g_cbp_wait_ns,   memory_order_relaxed)/1e6,
+                atomic_load_explicit(&g_cbp_drain_ns,  memory_order_relaxed)/1e6,
+                atomic_load_explicit(&g_cbp_ops_ns,    memory_order_relaxed)/1e6,
+                atomic_load_explicit(&g_cbp_commit_ns, memory_order_relaxed)/1e6,
+                atomic_load_explicit(&g_cbp_create_ns, memory_order_relaxed)/1e6);
+        atomic_store_explicit(&g_cbp_wait_ns,   0, memory_order_relaxed);
+        atomic_store_explicit(&g_cbp_drain_ns,  0, memory_order_relaxed);
+        atomic_store_explicit(&g_cbp_sync_n,    0, memory_order_relaxed);
+        atomic_store_explicit(&g_cbp_ops_ns,    0, memory_order_relaxed);
+        atomic_store_explicit(&g_cbp_commit_ns, 0, memory_order_relaxed);
+        atomic_store_explicit(&g_cbp_create_ns, 0, memory_order_relaxed);
+    }
+    fprintf(stderr, "TOSH_CBP  %8s %8s %8s %12s %12s %12s %12s %12s %12s\n",
+            "n_nodes", "graphs", "cbs", "gpu_us/g", "gpu_us_min", "gpu_us_max", "kern_us/g", "span_us/g", "encode_us/g");
+    for (int i = 0; i < TOSH_CBP_MAX_BUCKETS; ++i) {
+        const int nn = atomic_load_explicit(&g_cbp[i].n_nodes, memory_order_relaxed);
+        if (nn == 0) {
+            continue;
+        }
+        const uint64_t ng = atomic_load_explicit(&g_cbp[i].n_graphs, memory_order_relaxed);
+        if (ng == 0) {
+            continue;
+        }
+        fprintf(stderr, "TOSH_CBP  %8d %8llu %8llu %12.1f %12.1f %12.1f %12.1f %12.1f %12.1f\n", nn,
+                (unsigned long long) ng,
+                (unsigned long long) atomic_load_explicit(&g_cbp[i].n_cbs, memory_order_relaxed),
+                atomic_load_explicit(&g_cbp[i].gpu_ns,     memory_order_relaxed)/1000.0/ng,
+                atomic_load_explicit(&g_cbp[i].gpu_min_ns, memory_order_relaxed)/1000.0,
+                atomic_load_explicit(&g_cbp[i].gpu_max_ns, memory_order_relaxed)/1000.0,
+                atomic_load_explicit(&g_cbp[i].ker_ns,     memory_order_relaxed)/1000.0/ng,
+                atomic_load_explicit(&g_cbp[i].span_ns,    memory_order_relaxed)/1000.0/ng,
+                atomic_load_explicit(&g_cbp[i].enc_ns,     memory_order_relaxed)/1000.0/ng);
+
+        // reset so each dump covers only the graphs since the previous one
+        atomic_store_explicit(&g_cbp[i].n_graphs,   0, memory_order_relaxed);
+        atomic_store_explicit(&g_cbp[i].n_cbs,      0, memory_order_relaxed);
+        atomic_store_explicit(&g_cbp[i].gpu_ns,     0, memory_order_relaxed);
+        atomic_store_explicit(&g_cbp[i].ker_ns,     0, memory_order_relaxed);
+        atomic_store_explicit(&g_cbp[i].span_ns,    0, memory_order_relaxed);
+        atomic_store_explicit(&g_cbp[i].enc_ns,     0, memory_order_relaxed);
+        atomic_store_explicit(&g_cbp[i].gpu_min_ns, 0, memory_order_relaxed);
+        atomic_store_explicit(&g_cbp[i].gpu_max_ns, 0, memory_order_relaxed);
+    }
+    fflush(stderr);
+}
 
 struct ggml_metal_command_buffer {
     id<MTLCommandBuffer> obj;
@@ -242,6 +437,8 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev, bool prefetch) {
 }
 
 void ggml_metal_free(ggml_metal_t ctx) {
+    tosh_cbp_dump_dev(ctx->dev);
+
     GGML_LOG_INFO("%s: deallocating\n", __func__);
 
     for (int i = 0; i < ctx->prefetch_stage_count; ++i) {
@@ -332,12 +529,25 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
     }
 
     // wait for any backend operations to finish
+    const bool cbp_on = tosh_cbp_on();
+    uint64_t cbp_t = cbp_on ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
     if (ctx->cmd_buf_last) {
         [ctx->cmd_buf_last waitUntilCompleted];
         ctx->cmd_buf_last = nil;
     }
+    if (cbp_on) {
+        const uint64_t t1 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        atomic_fetch_add_explicit(&g_cbp_wait_ns, t1 - cbp_t, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_cbp_sync_n, 1, memory_order_relaxed);
+        cbp_t = t1;
+    }
+
     // in-flight staged uploads count as pending backend operations
     ggml_metal_device_upload_drain(ctx->dev);
+    if (cbp_on) {
+        atomic_fetch_add_explicit(&g_cbp_drain_ns,
+                clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - cbp_t, memory_order_relaxed);
+    }
 
     // check status of all command buffers
     {
@@ -365,6 +575,22 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
     if (ctx->cmd_bufs_ext.count > 0) {
         for (size_t i = 0; i < ctx->cmd_bufs_ext.count; ++i) {
             id<MTLCommandBuffer> cmd_buf = ctx->cmd_bufs_ext[i];
+    // release any completed extra command buffers
+    if (ctx->cmd_bufs_ext.count > 0) {
+        for (size_t i = 0; i < ctx->cmd_bufs_ext.count; ++i) {
+            id<MTLCommandBuffer> cmd_buf = ctx->cmd_bufs_ext[i];
+
+            MTLCommandBufferStatus status = [cmd_buf status];
+            if (status != MTLCommandBufferStatusCompleted) {
+                GGML_LOG_ERROR("%s: error: command buffer %d failed with status %d\n", __func__, (int) i, (int) status);
+                if (status == MTLCommandBufferStatusError) {
+                    GGML_LOG_ERROR("error: %s\n", [[cmd_buf error].localizedDescription UTF8String]);
+                }
+
+                // release this and all remaining command buffers before returning
+                for (size_t j = i; j < ctx->cmd_bufs_ext.count; ++j) {
+                    [ctx->cmd_bufs_ext[j] release];
+                }
                 [ctx->cmd_bufs_ext removeAllObjects];
 
                 ctx->has_error = true;
@@ -1094,8 +1320,13 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
     }
 
     // number of nodes encoded by the main thread (empirically determined)
-    const int n_main = MAX(64, 0.1*gf->n_nodes);
+    // the split was tuned on unified memory; TOSH_N_MAIN overrides it to A/B the share here
+    static int n_main_env = -2;
+    if (n_main_env == -2) {
         const char * v = TOSH_ENV("TOSH_N_MAIN");
+        n_main_env = v ? atoi(v) : -1;
+    }
+    const int n_main = n_main_env >= 0 ? n_main_env : MAX(64, 0.1*gf->n_nodes);
 
     // number of threads in addition to the main thread
     const int n_cb = ctx->n_cb;
@@ -1109,6 +1340,21 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
     // each thread creates it's own command buffer and enqueues the ops in parallel
     //
     // tests on M1 Pro and M2 Ultra using LLaMA models, show that optimal values for n_cb are 1 or 2
+
+    struct tosh_cbp_graph * cbp = NULL;
+    uint64_t cbp_t0 = 0;
+    if (tosh_cbp_on()) {
+        struct tosh_cbp_bucket * b = tosh_cbp_bucket_for(gf->n_nodes);
+        if (b != NULL) {
+            cbp = (struct tosh_cbp_graph *) calloc(1, sizeof(struct tosh_cbp_graph));
+            if (cbp != NULL) {
+                cbp->bucket = b;
+                atomic_store_explicit(&cbp->n_left, 1, memory_order_relaxed); // released below
+                atomic_fetch_add_explicit(&b->n_graphs, 1, memory_order_relaxed);
+                cbp_t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+            }
+        }
+    }
 
     @autoreleasepool {
         ctx->gf = gf;
@@ -1164,12 +1410,14 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         // short-hand
         id<MTLCommandQueue> queue = ctx->queue;
 
+        const uint64_t cbp_tc = cbp != NULL ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
 
         // the main thread commits the first few commands immediately
         // cmd_buf[n_cb]
         {
             id<MTLCommandBuffer> cmd_buf = [queue commandBufferWithUnretainedReferences];
             [cmd_buf retain];
+            tosh_cbp_attach(cmd_buf, cbp);
 
             if (ctx->cmd_bufs[n_cb].obj) {
                 [ctx->cmd_bufs[n_cb].obj release];
@@ -1188,6 +1436,7 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         // cmd_buf[0.. n_cb)
         for (int cb_idx = 0; cb_idx < n_cb; ++cb_idx) {
             id<MTLCommandBuffer> cmd_buf = [queue commandBufferWithUnretainedReferences];
+            tosh_cbp_attach(cmd_buf, cbp);
             [cmd_buf retain];
 
             if (ctx->cmd_bufs[cb_idx].obj) {
@@ -1206,7 +1455,13 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
             }
         }
 
+        if (cbp != NULL) {
+            atomic_fetch_add_explicit(&g_cbp_create_ns,
+                    clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - cbp_tc, memory_order_relaxed);
+        }
+
         dispatch_apply(n_cb, ctx->d_queue, ctx->encode_async);
+        }
 
         // for debugging: block until graph is computed
         //[ctx->cmd_buf_last waitUntilCompleted];
@@ -1267,6 +1522,15 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
             [[MTLCaptureManager sharedCaptureManager] stopCapture];
 
             ctx->capture_started = false;
+        }
+    }
+
+    if (cbp != NULL) {
+        atomic_fetch_add_explicit(&cbp->bucket->enc_ns,
+                clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - cbp_t0, memory_order_relaxed);
+        // drop the reference held while encoding; the last completion handler frees it
+        if (atomic_fetch_sub_explicit(&cbp->n_left, 1, memory_order_acq_rel) == 1) {
+            free(cbp);
         }
     }
 
@@ -1370,6 +1634,9 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
             ctx->capture_compute == 0,
             ctx->debug_graph);
 
+        const bool cbp_on = tosh_cbp_on();
+        const uint64_t cbp_t0 = cbp_on ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
+
         for (int idx = 0; idx < ggml_metal_op_n_nodes(ctx_op); ++idx) {
             const int res = ggml_metal_op_encode(ctx_op, idx);
             if (res == 0) {
@@ -1381,8 +1648,14 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
 
         ggml_metal_op_free(ctx_op);
 
+        const uint64_t cbp_t1 = cbp_on ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
         if (cb_idx < 2 || ctx->abort_callback == NULL) {
             [cmd_buf commit];
+        }
+        if (cbp_on) {
+            const uint64_t cbp_t2 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+            atomic_fetch_add_explicit(&g_cbp_ops_ns,    cbp_t1 - cbp_t0, memory_order_relaxed);
+            atomic_fetch_add_explicit(&g_cbp_commit_ns, cbp_t2 - cbp_t1, memory_order_relaxed);
         }
     });
 }

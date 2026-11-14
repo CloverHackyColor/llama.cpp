@@ -2774,7 +2774,17 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
             const char * s = TOSH_ENV("TOSH_EXT_NR0");
             return s ? atoi(s) : 0;
         }();
+        // Four rows per thread doubles what a threadgroup covers, so a weight with few
+        // rows stops filling the grid. The threshold is per row count, not per quant type.
+        static const int64_t nr0_min_rows = []() {
             const char * s = TOSH_ENV("TOSH_EXT_NR0_MINROWS");
+            // off by default: the win depends on the weight's shape and one measured model
+            // still regresses at four columns, so it stays opt-in until that is understood
+            return s ? (int64_t) atoll(s) : (int64_t) 0;
+        }();
+        const bool nr0_wide = nr0_min_rows > 0 && props_dev->simd_width == 32 &&
+                              op->src[0]->type == GGML_TYPE_Q4_K && ne01 >= nr0_min_rows;
+
         static const bool ext_w64_disable = TOSH_ENV("TOSH_EXT_W64_DISABLE") != nullptr;
         auto pipeline = ggml_metal_library_get_pipeline_mul_mv_ext(lib, op, nsg, nxpsg, r1ptg, nr0);
 
@@ -3727,13 +3737,41 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         if (props_dev->simd_width == 64) {
             fa_amd_nsg /= 2;
         }
+        // the simdgroup count per head was never swept on either width; the pipeline caps it,
+        // so an override that overruns is dropped below rather than dispatched
+        // one value for every head size overruns the pipelines that cap lower, so the
+        // override is per head size: TOSH_FA_AMD_NSG_64, _128, _WIDE
+        static const int nsg_env_64 = []() {
             const char * s = TOSH_ENV("TOSH_FA_AMD_NSG_64");
+            return s ? atoi(s) : 0;
+        }();
+        static const int nsg_env_128 = []() {
             const char * s = TOSH_ENV("TOSH_FA_AMD_NSG_128");
+            return s ? atoi(s) : 0;
+        }();
+        static const int nsg_env_wide = []() {
             const char * s = TOSH_ENV("TOSH_FA_AMD_NSG_WIDE");
+            return s ? atoi(s) : 0;
+        }();
+        const int nsg_env = ne00 == 64 ? nsg_env_64 : ne00 == 128 ? nsg_env_128 : nsg_env_wide;
+        if (nsg_env > 0) {
+            fa_amd_nsg = nsg_env;
+        }
+
         // one threadgroup per query head leaves most of the GPU idle on models with
         // few heads; split the cache across 32 and let upstream's reduce merge them
+        // Head 128 needs a deeper cache than the wide heads before the 32-way reduce pays
+        // for itself, so it carries its own threshold. The depth it turns at is not the same
+        // on both widths, so each keeps its own.
             const char * s = TOSH_ENV("TOSH_FA_WG_DK128_MIN_KV");
+        const bool wg_wide_head =
+            ne00 == 256 || ne00 == 512 || (ne00 == 576 && ne20 == 512) ||
+            (ne00 == 320 && ne20 == 256);
+        const bool wg_dk128_width_ok = props_dev->simd_width == 32 || props_dev->simd_width == 64;
             const char * s = TOSH_ENV("TOSH_FA_WG_DK64");
+        const bool wg_dk64 = ne00 == 64 && ne20 == 64 && wg_dk128_width_ok &&
+                             wg_dk64_min_kv > 0 && ne11 >= wg_dk64_min_kv;
+        const bool wg_dk128 = (ne00 == 128 && ne20 == 128 && wg_dk128_width_ok &&
         const int fa_amd_nwg =
             TOSH_ENV("TOSH_FA_WG_DISABLE") == NULL ? 32 : 1;
 
