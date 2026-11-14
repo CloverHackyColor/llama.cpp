@@ -3868,32 +3868,99 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         const bool fa_pf_mla320 = ne00 == 320 && ne20 == 256 && op->src[1]->type == op->src[2]->type;
         // BQ must match the instantiation: dispatching in wider blocks than the kernel
         // covers leaves most queries uncomputed
+        int fa_pf_bq = (ne00 == 256 || ne00 == 160) ? 32
             : ((fa_pf_512 || fa_pf_mla || fa_pf_mla320) ? 16 : 64);
         const bool fa_pf_head_ok =
             ne00 == 64 || ne00 == 128 || ne00 == 256 || fa_amd_dk72 || fa_amd_unet || fa_pf_512 ||
             fa_pf_mla || fa_pf_mla320;
         if (TOSH_ENV("TOSH_FA_PF_DEBUG") != nullptr) {
+            fprintf(stderr, "FA_PF gate dk=%d dv=%d ne01=%d head_ok=%d ktype=%s vtype=%s\n",
+                    (int) ne00, (int) ne20, (int) ne01, (int) fa_pf_head_ok,
+                    ggml_type_name(op->src[1]->type), ggml_type_name(op->src[2]->type));
+        }
             ne01 >= 32 && fa_pf_head_ok && TOSH_ENV("TOSH_FA_PF_DISABLE") == NULL) {
             char fa_pf_pipeline[80];
+            bool fa_pf_asym = false;
             if (fa_pf_mla) {
                 snprintf(fa_pf_pipeline, sizeof(fa_pf_pipeline), "kernel_flash_attn_ext_pf_amd_dk576_dv512_k%s_vf16",
                          ggml_metal_fa_amd_type_suffix(op->src[1]->type));
+                fa_pf_asym = true;
             } else if (ne20 != ne00) {
                 snprintf(fa_pf_pipeline, sizeof(fa_pf_pipeline), "kernel_flash_attn_ext_pf_amd_dk%d_dv%d_k%s_v%s",
                          (int) ne00, (int) ne20,
                          ggml_metal_fa_amd_type_suffix(op->src[1]->type), ggml_metal_fa_amd_type_suffix(op->src[2]->type));
+                fa_pf_asym = true;
+            } else {
             snprintf(fa_pf_pipeline, sizeof(fa_pf_pipeline), "kernel_flash_attn_ext_pf_amd_dk%d_k%s_v%s", (int) ne00,
                      ggml_metal_fa_amd_type_suffix(op->src[1]->type), ggml_metal_fa_amd_type_suffix(op->src[2]->type));
+
+                // the 64-lane twin lives in fa_w64.metal, with the lane group as a parameter.
+                // Only the symmetric heads have one; MLA and the asymmetric pairs stay above.
+                // TOSH_FA_PF_LG picks the group so the three can be compared; 16 reproduces
+                // the 32-lane kernel exactly and is the control.
+                static const int pf_lg = []() {
+                    // the cross sweep left the group at sixteen: wider only wins at depth 0,
+                    // where this kernel weighs least, and loses 3 to 37% deeper in
                     const char * s = TOSH_ENV("TOSH_FA_PF_LG");
+                    return s ? atoi(s) : 16;
+                }();
+                // TOSH_FA_PF_BQ picks the query-block twin of that group, which is what keeps
+                // the rows per thread fixed while the group widens
+                static const int pf_bq = []() {
                     const char * s = TOSH_ENV("TOSH_FA_PF_BQ");
+                    return s ? atoi(s) : 0;
+                }();
+                // TOSH_FA_PF_BK picks the key-block twin: the counterpart of BQ on the other
+                // side of the K/V reuse, so a bigger block pays the same traffic fewer times
+                static const int pf_bk = []() {
                     const char * s = TOSH_ENV("TOSH_FA_PF_BK");
+                    return s ? atoi(s) : 0;
+                }();
+                if (props_dev->simd_width == 64 && (pf_lg == 16 || pf_lg == 32 || pf_lg == 64) &&
+                    (ne00 == 64 || ne00 == 128 || ne00 == 256 || ne00 == 512) &&
                     TOSH_ENV("TOSH_FA_PF_W64_DISABLE") == nullptr) {
+                    char w64_name[96];
+                    if (pf_bq > 0) {
+                        snprintf(w64_name, sizeof(w64_name), "%s_w64_lg%dq%dk%d", fa_pf_pipeline, pf_lg, pf_bq,
+                                 pf_bk > 0 ? pf_bk : 64);
+                    } else {
+                        snprintf(w64_name, sizeof(w64_name), "%s_w64_lg%d", fa_pf_pipeline, pf_lg);
+                    }
+                    if (ggml_metal_library_get_pipeline(lib, w64_name).pipeline ||
+                        ggml_metal_library_compile_pipeline(lib, w64_name, w64_name, nullptr).pipeline) {
+                        snprintf(fa_pf_pipeline, sizeof(fa_pf_pipeline), "%s", w64_name);
+                        // the grid steps in query blocks, so it has to follow the twin
+                        if (pf_bq > 0) {
+                            fa_pf_bq = pf_bq;
+                        }
+                    }
+                }
+            }
+
+            // the asymmetric heads compose their name in the branches above, so their twin is
+            // picked here instead. Same group of sixteen; the fallback is the 32-lane kernel.
+            if (fa_pf_asym && props_dev->simd_width == 64 &&
                 TOSH_ENV("TOSH_FA_PF_W64_DISABLE") == nullptr) {
+                char w64_name[96];
+                // sixteen reproduces the 32-lane kernel exactly, so it is the control; the
+                // sweep that closed the symmetric heads there never covered an asymmetric one
                 const char * slg = TOSH_ENV("TOSH_FA_PF_LG");
+                snprintf(w64_name, sizeof(w64_name), "%s_w64_lg%d", fa_pf_pipeline, slg ? atoi(slg) : 16);
                 if (ggml_metal_fa_amd_pipeline(lib, w64_name).pipeline) {
+                    snprintf(fa_pf_pipeline, sizeof(fa_pf_pipeline), "%s", w64_name);
+                }
+            }
+
             auto pipeline = ggml_metal_fa_amd_pipeline(lib, fa_pf_pipeline);
 
+            // Which twin a head actually lands on cannot be read from the timings: a switch that
+            // never reaches the kernel gives the same number on both sides.
             if (TOSH_ENV("TOSH_FA_PF_DEBUG") != nullptr) {
+                fprintf(stderr, "FA_PF dk=%d dv=%d bq=%d -> %s%s\n",
+                        (int) ne00, (int) ne20, fa_pf_bq, fa_pf_pipeline,
+                        pipeline.pipeline ? "" : "  (NO EXISTE, cae al tile)");
+            }
+
             // it fits in registers with nothing to spare; a compiler bump could
             // push it under the 256 threads it dispatches. A driver that refused to build
             // the kernel leaves the pipeline null, which the tile path below covers: older

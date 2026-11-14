@@ -130,6 +130,7 @@ int ggml_metal_pipeline_max_theads_per_threadgroup(struct ggml_metal_pipeline_wi
     X(FA_VEC_Q5_0,     fa_vec_q5_0)    \
     X(FA_VEC_Q5_1,     fa_vec_q5_1)    \
     X(FA_VEC_Q8_0,     fa_vec_q8_0)    \
+    X(FA_W64,          fa_w64)         \
     X(MUL_MV,          mul_mv)         \
     X(MUL_MV_MMA,      mul_mv_mma)     \
     X(MUL_MV_W64,      mul_mv_w64)     \
