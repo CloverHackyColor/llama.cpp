@@ -232,6 +232,9 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     // [CS, S_v, n_chunks, H_v * n_seqs]
     ggml_tensor * v_t = ggml_cont(ctx0, ggml_transpose(ctx0, v));
 
+    // training cannot differentiate through the in-place write of each chunk: the chunks are kept and joined after
+    std::vector<ggml_tensor *> chunk_out;
+
     for (int64_t chunk = 0; chunk < n_chunks; chunk++) {
         ggml_tensor * ch_k_cd    = get_slice_2d(ctx0, k_cd,    chunk); // [S_k,  CS, 1, H_k * n_seqs]
         ggml_tensor * ch_v_t     = get_slice_2d(ctx0, v_t,     chunk); // [ CS, S_v, 1, H_v * n_seqs]
@@ -259,7 +262,11 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
         ggml_tensor * o_ch = ggml_add(ctx0, attn_inter, v_attn);
         cb(o_ch, "dnet_add_ch_attn_out", il);
 
-        v = ggml_set_inplace(ctx0, v, o_ch, v->nb[1], v->nb[2], v->nb[3], chunk * v->nb[2]);
+        if (cparams.training) {
+            chunk_out.push_back(o_ch);
+        } else {
+            v = ggml_set_inplace(ctx0, v, o_ch, v->nb[1], v->nb[2], v->nb[3], chunk * v->nb[2]);
+        }
 
         // kgdmulvnew = (key_gdiff).transpose(-1, -2) @ v_new
         // TODO: head broadcast might not work here - probably will need a transpose
@@ -271,6 +278,21 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
         s = ggml_mul(ctx0, s, ch_g_last_exp_t);
         s = ggml_add(ctx0, s, kgv);
         cb(s, "dnet_add_ch_state", il);
+    }
+
+    // joined pairwise, so each chunk is copied about log2(n_chunks) times
+    while (chunk_out.size() > 1) {
+        std::vector<ggml_tensor *> joined;
+        for (size_t i = 0; i + 1 < chunk_out.size(); i += 2) {
+            joined.push_back(ggml_concat(ctx0, chunk_out[i], chunk_out[i + 1], 2));
+        }
+        if (chunk_out.size() % 2) {
+            joined.push_back(chunk_out.back());
+        }
+        chunk_out.swap(joined);
+    }
+    if (!chunk_out.empty()) {
+        v = chunk_out[0];
     }
 
     // truncate padded tokens
