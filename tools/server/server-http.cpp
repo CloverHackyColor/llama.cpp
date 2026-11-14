@@ -282,7 +282,7 @@ bool server_http_context::init_listener(const common_params & params) {
         }
 
         // validate the API key
-        if (std::find(api_keys.begin(), api_keys.end(), req_api_key) != api_keys.end()) {
+        if (std::any_of(api_keys.begin(), api_keys.end(), [&](const std::string & key) { return same_secret(key, req_api_key); })) {
             return true; // API key is valid
         }
 

@@ -108,6 +108,17 @@ json server_slot_stats::to_json() const {
 // random string / id
 //
 
+bool same_secret(const std::string & a, const std::string & b) {
+    if (a.size() != b.size()) {
+        return false;
+    }
+    volatile unsigned char diff = 0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        diff |= (unsigned char) (a[i] ^ b[i]);
+    }
+    return diff == 0;
+}
+
 std::string random_string() {
     static const std::string str("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz");
 

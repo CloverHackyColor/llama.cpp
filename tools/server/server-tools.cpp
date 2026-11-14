@@ -2091,7 +2091,7 @@ void server_tools::setup(const std::vector<std::string> & enabled_tools,
         if (mcp_tool == nullptr || agent_only.count(mcp_tool->server_name) == 0) {
             return false;
         }
-        return agent_key.empty() || get_header(req.headers, "x-tosh-agent-key") != agent_key;
+        return agent_key.empty() || !same_secret(get_header(req.headers, "x-tosh-agent-key"), agent_key);
     };
 
     // The built-in tools reach this computer's shell and files: another computer gets them only with the
