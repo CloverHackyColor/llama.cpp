@@ -1057,7 +1057,28 @@ static void ggml_backend_metal_comm_free(void * comm_ctx_v) {
         }
     delete comm_ctx;
 }
+
+// TOSH_MGPU_ALLREDUCE_NOOP=1 keeps the split graph and every subgraph submission but performs
+// no reduction and no cross-device synchronisation at all. The output is wrong by construction.
+// It exists for one measurement: what tensor-split decode would cost if communication were free.
+static bool ggml_backend_metal_comm_allreduce_noop(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char * s = getenv("TOSH_MGPU_ALLREDUCE_NOOP");
+        v = (s && s[0] == '1') ? 1 : 0;
+        if (v) {
+            fprintf(stderr, "ggml_metal: WARNING TOSH_MGPU_ALLREDUCE_NOOP=1, the reduction is "
+                            "skipped and the output is meaningless. Benchmark only.\n");
+        }
+    }
+    return v == 1;
+}
+
 static bool ggml_backend_metal_comm_allreduce_tensor(void * comm_ctx_v, ggml_tensor ** tensors) {
+    if (ggml_backend_metal_comm_allreduce_noop()) {
+        return true;
+    }
+
     auto * comm_ctx = (ggml_backend_metal_comm_context *) comm_ctx_v;
 
     const size_t n_backends = comm_ctx->backends.size();
@@ -1147,6 +1168,15 @@ static bool ggml_backend_metal_comm_allreduce_tensor(void * comm_ctx_v, ggml_ten
     // Every exchange of a step must read the partner's tensor before its own add rewrites it,
     // so the copies all go out before any of the adds.
     for (size_t offset = offset_max; offset >= 1; offset /= 2) {
+            // TOSH_MGPU_SUBMIT_ORDER, benchmark only: 0 normal, 1 reversed, 2 alternating.
+            static int order = -1;
+            if (order < 0) {
+                const char * v = getenv("TOSH_MGPU_SUBMIT_ORDER");
+                order = v ? atoi(v) : 0;
+            }
+            const bool flip = order == 1 || (order == 2 && (seq_round & 1));
+            for (size_t jj = 0; jj < 2*offset_max && ok; jj++) {
+                const size_t j = flip ? (2*offset_max - 1 - jj) : jj;
         for (size_t j = 0; j < 2*offset_max; j++) {
         }
         for (size_t j = 0; j < 2*offset_max; j++) {

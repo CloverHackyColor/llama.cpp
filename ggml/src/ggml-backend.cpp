@@ -2073,6 +2073,27 @@ ggml_backend_sched_t ggml_backend_sched_new(
     return sched;
 }
 
+void ggml_backend_sched_share_compute_buffers(ggml_backend_sched_t dst, ggml_backend_sched_t src) {
+    GGML_ASSERT(dst && src);
+    ggml_gallocr_share_buffers(dst->galloc, src->galloc);
+}
+
+void ggml_backend_sched_set_shape_slot(ggml_backend_sched_t sched, int slot) {
+    GGML_ASSERT(sched);
+    for (int i = 0; i < sched->n_backends; i++) {
+        ggml_backend_meta_set_shape_slot(sched->backends[i], slot);
+    }
+    ggml_gallocr_set_shape_slot(sched->galloc, slot);
+}
+
+void ggml_backend_sched_reset_shape_slot(ggml_backend_sched_t sched, int slot) {
+    GGML_ASSERT(sched);
+    for (int i = 0; i < sched->n_backends; i++) {
+        ggml_backend_meta_reset_shape_slot(sched->backends[i], slot);
+    }
+    ggml_gallocr_reset_shape_slot(sched->galloc, slot);
+}
+
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;

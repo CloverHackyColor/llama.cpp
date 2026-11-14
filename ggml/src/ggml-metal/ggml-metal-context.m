@@ -243,7 +243,12 @@ struct ggml_metal {
     int prefetch_stage_count;
     int prefetch_stage_cur;
 
+    ggml_metal_event_t ev_cpy; // for async copies
     ggml_metal_event_t ev_sync; // destination completion signal
+
+    id<MTLCounterSampleBuffer> ct_buf;   // trace only, TOSH_MGPU_CTIME
+    id<MTLSharedEvent>         ev_wait_dummy;   // benchmark only, TOSH_MGPU_WAIT_SATISFIED
+    _Atomic uint64_t           ct_idx;
 
     // Synchronization and resources shared by both cross-device copy paths.
     struct ggml_metal_xdev_link {
@@ -325,7 +330,6 @@ struct ggml_metal {
     id<MTLCommandBuffer> cmd_buf_hold;
 };
 
-ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
 // TOSH_MGPU_DEFER_WAITS folds a cross-device wait into the next command buffer this context
 // submits instead of spending a whole one on it. Opt-in: on a single card both contexts share
 // the device queue, so it measures slightly negative there and only 2 real GPUs can settle it.
@@ -337,12 +341,476 @@ static bool ggml_metal_defer_waits(void) {
     }
     return val;
 }
+
+static _Atomic uint64_t g_tr_cmd_all     = 0; // command buffers created through the tracked paths
+static _Atomic uint64_t g_tr_graphs      = 0; // graph submissions, one per subgraph per card
+static _Atomic uint64_t g_tr_merge_reuse = 0; // subgraphs that continued the collective's buffer
+static _Atomic uint64_t g_tr_merge_waits = 0; // waits that had queued in between, and would have
+                                              // been dropped before this was fixed
+static _Atomic uint64_t g_tr_signals     = 0; // cross-device event signals encoded
+static _Atomic uint64_t g_tr_waits       = 0; // cross-device event waits encoded
+
+
+// TOSH_MGPU_TRACE: where the collective's time and bytes go. The counters are only touched
+// when it is on, so a release run pays one cached branch per crossing.
+static _Atomic uint64_t g_tr_reduce      = 0; // exchange_reduce calls
+static _Atomic uint64_t g_tr_copy        = 0; // plain cross-device copies
+static _Atomic uint64_t g_tr_bytes_peer  = 0; // crossed through a remote buffer view
+static _Atomic uint64_t g_tr_bytes_host  = 0; // crossed through the shared host block
+static _Atomic uint64_t g_tr_cmd_bufs    = 0; // command buffers the collective created
+static _Atomic uint64_t g_tr_rv_new      = 0; // remote views built
+static _Atomic uint64_t g_tr_rv_hit      = 0; // remote views reused
+static _Atomic uint64_t g_tr_encode_ns   = 0; // CPU time inside the collective
+static _Atomic uint64_t g_tr_gpu_ns      = 0; // GPU execution of the collective's buffers
+static _Atomic uint64_t g_tr_sched_ns    = 0; // committed to running: queueing plus event waits
+
+static bool tosh_mgpu_trace(void) {
+    static int on = -1;
+    if (on < 0) {
         const char * v = TOSH_ENV("TOSH_MGPU_TRACE");
+        on = (v && v[0] == '1') ? 1 : 0;
+    }
+    return on == 1;
+}
+
+static uint64_t tosh_now_ns(void) {
+    return clock_gettime_nsec_np(CLOCK_MONOTONIC);
+}
+
+// Separates three things the old instrumentation conflated: when the host committed each
+// side, when each GPU started the collective, and the signed order of both. The collective
+// loop is serial on the CPU, so a GPU-start difference is not evidence of compute imbalance
+// until the commit difference is subtracted from it.
+#define TOSH_SKEW_SLOTS 8192
+static struct {
+    _Atomic uint64_t seq[2];
+    _Atomic uint64_t commit_ns[2];
+    _Atomic uint64_t gpu_ns[2];
+} g_skew[TOSH_SKEW_SLOTS];
+
+static _Atomic uint64_t g_sk_n;
+static _Atomic uint64_t g_sk_gpu_hist[8], g_sk_com_hist[8];
+static _Atomic uint64_t g_sk_gpu_sum, g_sk_com_sum, g_sk_gpu_max;
+static _Atomic uint64_t g_sk_gpu_first0, g_sk_com_first0;   // how often peerIndex 0 leads
+
+static int tosh_skew_bucket(double us) {
+    return us < 1 ? 0 : us < 2 ? 1 : us < 5 ? 2 : us < 10 ? 3 :
+           us < 20 ? 4 : us < 50 ? 5 : us < 200 ? 6 : 7;
+}
+
+static void tosh_skew_commit(uint64_t seq, int side, uint64_t t_ns) {
+    const int slot = (int) (seq % TOSH_SKEW_SLOTS);
+    atomic_store(&g_skew[slot].gpu_ns[side], 0);
+    atomic_store(&g_skew[slot].commit_ns[side], t_ns);
+    atomic_store(&g_skew[slot].seq[side], seq);
+}
+
+static void tosh_skew_started(uint64_t seq, int side, double gpu_start) {
+    const int slot = (int) (seq % TOSH_SKEW_SLOTS);
+    atomic_store(&g_skew[slot].gpu_ns[side], (uint64_t) (gpu_start*1e9));
+
+    const int other = side ^ 1;
+    if (atomic_load(&g_skew[slot].seq[other]) != seq) {
+        return;
+    }
+    const uint64_t g0 = atomic_load(&g_skew[slot].gpu_ns[0]);
+    const uint64_t g1 = atomic_load(&g_skew[slot].gpu_ns[1]);
+    const uint64_t c0 = atomic_load(&g_skew[slot].commit_ns[0]);
+    const uint64_t c1 = atomic_load(&g_skew[slot].commit_ns[1]);
+    if (g0 == 0 || g1 == 0 || c0 == 0 || c1 == 0) {
+        return;                                  // the other side has not started yet
+    }
+    // only the side that completes second gets here with both present
+    if (side != 1 && atomic_load(&g_skew[slot].gpu_ns[other]) == 0) {
+        return;
+    }
+    static _Atomic uint64_t claimed[TOSH_SKEW_SLOTS];
+    uint64_t was = atomic_exchange(&claimed[slot], seq);
+    if (was == seq) {
+        return;                                  // already accounted
+    }
+
+    const uint64_t dg = g0 > g1 ? g0 - g1 : g1 - g0;
+    const uint64_t dc = c0 > c1 ? c0 - c1 : c1 - c0;
+    atomic_fetch_add(&g_sk_n, 1);
+    atomic_fetch_add(&g_sk_gpu_sum, dg);
+    atomic_fetch_add(&g_sk_com_sum, dc);
+    if (g0 <= g1) { atomic_fetch_add(&g_sk_gpu_first0, 1); }
+    if (c0 <= c1) { atomic_fetch_add(&g_sk_com_first0, 1); }
+    uint64_t m = atomic_load(&g_sk_gpu_max);
+    while (dg > m && !atomic_compare_exchange_weak(&g_sk_gpu_max, &m, dg)) { }
+    atomic_fetch_add(&g_sk_gpu_hist[tosh_skew_bucket(dg/1000.0)], 1);
+    atomic_fetch_add(&g_sk_com_hist[tosh_skew_bucket(dc/1000.0)], 1);
+}
+
+static void tosh_mgpu_trace_report(void);
+static bool ggml_metal_collective_nowait(void);
+
+// The subgraph command buffer is timed start and end separately, because a difference in
+// completion can come from starting late or from running longer and those need different
+// answers. Note what this buffer contains: ggml_metal_encode_pending_waits runs at its top,
+// so its duration is graph compute plus any event wait encoded there, not pure compute.
+static _Atomic uint64_t g_gr_ord[2];
+static struct {
+    _Atomic uint64_t ord[2];
+    _Atomic uint64_t start_ns[2];
+    _Atomic uint64_t end_ns[2];
+} g_gr[TOSH_SKEW_SLOTS];
+
+static _Atomic uint64_t g_gr_n;
+static _Atomic uint64_t g_gr_hs[8], g_gr_hd[8], g_gr_he[8];      // |start|, |duration|, |end| deltas
+static _Atomic uint64_t g_gr_ss, g_gr_sd, g_gr_se;               // their sums, ns
+static _Atomic uint64_t g_gr_sign_start, g_gr_sign_dur;          // sign agreement with end delta
+static _Atomic uint64_t g_gr_start0_first, g_gr_dur0_less;       // is either side systematically ahead
+static _Atomic uint64_t g_gr_resid;                              // |end - (start + dur)| residual
+static _Atomic uint64_t g_dur_n[2], g_dur_sum[2], g_dur_h[2][8]; // per-side duration
+
+static int tosh_dur_bucket(double us) {
+    return us <  40 ? 0 : us <  80 ? 1 : us < 120 ? 2 : us < 160 ? 3 :
+           us < 200 ? 4 : us < 300 ? 5 : us < 500 ? 6 : 7;
+}
+
+static void tosh_trace_graph_end(id<MTLCommandBuffer> cmd_buf, int side) {
+    if (!tosh_mgpu_trace()) {
+        return;
+    }
+    static _Atomic int reg = 0;                              // a single GPU runs no collective
+    int exp = 0;
+    if (atomic_compare_exchange_strong(&reg, &exp, 1)) { atexit(tosh_mgpu_trace_report); }
+    const uint64_t ord = atomic_fetch_add(&g_gr_ord[side], 1);
+    [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+        if (cb.GPUStartTime <= 0 || cb.GPUEndTime <= 0) {
+            return;
+        }
+        const int slot = (int) (ord % TOSH_SKEW_SLOTS);
+        const uint64_t st = (uint64_t) (cb.GPUStartTime*1e9);
+        const uint64_t en = (uint64_t) (cb.GPUEndTime*1e9);
+
+        atomic_fetch_add(&g_dur_n[side], 1);
+        atomic_fetch_add(&g_dur_sum[side], en - st);
+        atomic_fetch_add(&g_dur_h[side][tosh_dur_bucket((en - st)/1000.0)], 1);
+
+        atomic_store(&g_gr[slot].start_ns[side], st);
+        atomic_store(&g_gr[slot].end_ns[side], en);
+        atomic_store(&g_gr[slot].ord[side], ord + 1);
+        if (atomic_load(&g_gr[slot].ord[side ^ 1]) != ord + 1) {
+            return;
+        }
+        const int64_t s0 = (int64_t) atomic_load(&g_gr[slot].start_ns[0]);
+        const int64_t s1 = (int64_t) atomic_load(&g_gr[slot].start_ns[1]);
+        const int64_t e0 = (int64_t) atomic_load(&g_gr[slot].end_ns[0]);
+        const int64_t e1 = (int64_t) atomic_load(&g_gr[slot].end_ns[1]);
+        if (s0 == 0 || s1 == 0 || e0 == 0 || e1 == 0) {
+            return;
+        }
+        static _Atomic uint64_t claimed[TOSH_SKEW_SLOTS];
+        uint64_t was = atomic_exchange(&claimed[slot], ord + 1);
+        if (was == ord + 1) {
+            return;
+        }
+
+        const int64_t ds = s0 - s1;
+        const int64_t dd = (e0 - s0) - (e1 - s1);
+        const int64_t de = e0 - e1;
+        const uint64_t as = ds < 0 ? -ds : ds, ad = dd < 0 ? -dd : dd, ae = de < 0 ? -de : de;
+        const int64_t r = de - (ds + dd);
+
+        atomic_fetch_add(&g_gr_n, 1);
+        atomic_fetch_add(&g_gr_ss, as);
+        atomic_fetch_add(&g_gr_sd, ad);
+        atomic_fetch_add(&g_gr_se, ae);
+        atomic_fetch_add(&g_gr_resid, (uint64_t) (r < 0 ? -r : r));
+        if (ds <= 0) { atomic_fetch_add(&g_gr_start0_first, 1); }
+        if (dd <= 0) { atomic_fetch_add(&g_gr_dur0_less, 1); }
+        if ((ds >= 0) == (de >= 0)) { atomic_fetch_add(&g_gr_sign_start, 1); }
+        if ((dd >= 0) == (de >= 0)) { atomic_fetch_add(&g_gr_sign_dur, 1); }
+        atomic_fetch_add(&g_gr_hs[tosh_skew_bucket(as/1000.0)], 1);
+        atomic_fetch_add(&g_gr_hd[tosh_skew_bucket(ad/1000.0)], 1);
+        atomic_fetch_add(&g_gr_he[tosh_skew_bucket(ae/1000.0)], 1);
+    }];
+}
+
+static void tosh_trace_exchange(id<MTLCommandBuffer> cmd_buf, uint64_t seq, int side) {
+    if (!tosh_mgpu_trace()) {
+        return;
+    }
+    tosh_skew_commit(seq, side, clock_gettime_nsec_np(CLOCK_MONOTONIC));
+    [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+        if (cb.GPUStartTime > 0) {
+            tosh_skew_started(seq, side, cb.GPUStartTime);
+        }
+    }];
+}
+
+// Steady-state decode only. Every counter is snapshotted the first time a collective runs on a
+// single-row batch, which is the first generated token, so nothing from load, warm-up or the
+// prompt is amortised into the per-token figures.
+extern _Atomic uint64_t * ggml_backend_meta_pass_counter(void);
+
+static _Atomic int      g_snap_taken = 0;
+static uint64_t g_snap_reduce, g_snap_cmd, g_snap_graphs, g_snap_sig, g_snap_wait,
+                g_snap_peer_b, g_snap_host_b, g_snap_passes;
+
+static void tosh_decode_snapshot(int64_t batch) {
+    if (batch != 1 || atomic_load(&g_snap_taken)) {
+        return;
+    }
+    int expected = 0;
+    if (!atomic_compare_exchange_strong(&g_snap_taken, &expected, 1)) {
+        return;
+    }
+    g_snap_reduce = atomic_load(&g_tr_reduce);
+    g_snap_cmd    = atomic_load(&g_tr_cmd_all);
+    g_snap_graphs = atomic_load(&g_tr_graphs);
+    g_snap_sig    = atomic_load(&g_tr_signals);
+    g_snap_wait   = atomic_load(&g_tr_waits);
+    g_snap_peer_b = atomic_load(&g_tr_bytes_peer);
+    g_snap_host_b = atomic_load(&g_tr_bytes_host);
+    g_snap_passes = atomic_load(ggml_backend_meta_pass_counter());
+}
+
+// TOSH_MGPU_CTIME=1, trace only. GPU timestamps inside the staged exchange, the path batch-1
+// decode actually takes. Four samples, all from one device, so no cross-GPU clock correlation
+// is involved: S0/S1 bracket the publish blit, S2/S3 the staging read. S1 to S2 is a
+// WAIT-WINDOW, not a pure event wait: it spans the signal, the peer wait and the encoder switch.
+#define TOSH_CT_SLOTS 4096
+#define TOSH_CT_PER   4
+
+static bool ggml_metal_ctime(void) {
+    static int v = -1;
     if (v < 0) { const char * s = TOSH_ENV("TOSH_MGPU_CTIME"); v = (s && s[0] == '1') ? 1 : 0; }
+    return v == 1;
+}
+
+static bool ggml_metal_ctime_barrier(void) {
+    static int v = -1;
     if (v < 0) { const char * s = TOSH_ENV("TOSH_MGPU_CTIME_BARRIER"); v = (s && s[0] == '1') ? 1 : 0; }
+    return v == 1;
+}
+
+static _Atomic uint64_t g_ct_n, g_ct_pub, g_ct_wait, g_ct_read, g_ct_fail;
+static _Atomic uint64_t g_ct_hw[8], g_ct_hp[8], g_ct_hr[8];
+static double g_ct_ns_per_tick = 0.0;
+
+static int tosh_ct_bucket(double us) {
+    return us < 1 ? 0 : us < 5 ? 1 : us < 10 ? 2 : us < 20 ? 3 :
+           us < 50 ? 4 : us < 100 ? 5 : us < 200 ? 6 : 7;
+}
+
+static id<MTLCounterSampleBuffer> tosh_ct_buffer(ggml_metal_t ctx) {
+    if (!ggml_metal_ctime()) { return nil; }
+    if (ctx->ct_buf != nil)  { return ctx->ct_buf; }
+    if (@available(macOS 10.15, *)) {
+        id<MTLDevice> dev = ggml_metal_device_get_obj(ctx->dev);
+        id<MTLCounterSet> ts = nil;
+        for (id<MTLCounterSet> cs in dev.counterSets) {
+            if ([cs.name isEqualToString:MTLCommonCounterSetTimestamp]) { ts = cs; break; }
+        }
+        if (ts == nil) { return nil; }
+        MTLCounterSampleBufferDescriptor * d = [MTLCounterSampleBufferDescriptor new];
+        d.counterSet = ts; d.sampleCount = TOSH_CT_SLOTS*TOSH_CT_PER; d.storageMode = MTLStorageModeShared;
+        NSError * err = nil;
+        ctx->ct_buf = [dev newCounterSampleBufferWithDescriptor:d error:&err];
+        if (ctx->ct_buf == nil) {
+            GGML_LOG_WARN("%s: counter sample buffer unavailable\n", __func__);
+            return nil;
+        }
+        if (g_ct_ns_per_tick == 0.0) {
+            g_ct_ns_per_tick = 1.0;
+            MTLTimestamp c0 = 0, g0 = 0, c1 = 0, g1 = 0;
+            [dev sampleTimestamps:&c0 gpuTimestamp:&g0];
+            usleep(20000);
+            [dev sampleTimestamps:&c1 gpuTimestamp:&g1];
+            if (g1 > g0) { g_ct_ns_per_tick = (double) (c1 - c0)/(double) (g1 - g0); }
+            GGML_LOG_INFO("%s: GPU timestamp sampling on, %.4f ns per tick\n", __func__, g_ct_ns_per_tick);
+        }
+    }
+    return ctx->ct_buf;
+}
+
+static void tosh_ct_record(id<MTLCounterSampleBuffer> cs, uint64_t base) {
+    if (@available(macOS 10.15, *)) {
+        NSData * d = [cs resolveCounterRange:NSMakeRange(base, TOSH_CT_PER)];
+        if (d == nil || d.length < TOSH_CT_PER*sizeof(MTLCounterResultTimestamp)) {
+            atomic_fetch_add(&g_ct_fail, 1); return;
+        }
+        const MTLCounterResultTimestamp * t = (const MTLCounterResultTimestamp *) d.bytes;
+        for (int i = 0; i < TOSH_CT_PER; i++) {
+            if (t[i].timestamp == MTLCounterErrorValue) { atomic_fetch_add(&g_ct_fail, 1); return; }
+        }
+        const double k = g_ct_ns_per_tick;
+        const double pub  = (double) (t[1].timestamp - t[0].timestamp)*k;
+        const double wait = (double) (t[2].timestamp - t[1].timestamp)*k;
+        const double read = (double) (t[3].timestamp - t[2].timestamp)*k;
+        if (pub < 0 || wait < 0 || read < 0) { atomic_fetch_add(&g_ct_fail, 1); return; }
+        atomic_fetch_add(&g_ct_n, 1);
+        atomic_fetch_add(&g_ct_pub,  (uint64_t) pub);
+        atomic_fetch_add(&g_ct_wait, (uint64_t) wait);
+        atomic_fetch_add(&g_ct_read, (uint64_t) read);
+        atomic_fetch_add(&g_ct_hp[tosh_ct_bucket(pub /1000.0)], 1);
+        atomic_fetch_add(&g_ct_hw[tosh_ct_bucket(wait/1000.0)], 1);
+        atomic_fetch_add(&g_ct_hr[tosh_ct_bucket(read/1000.0)], 1);
+    }
+}
+
+// TOSH_MGPU_WAIT_SATISFIED=1, benchmark only. The staged collective keeps every encoder, every
+// signal, the same command buffer and the same sampling points; the only change is that the
+// peer-ready wait names a private event that is already signalled, so it can never stall. The
+// read then observes whatever the partner left behind and the output is wrong by construction.
+// Subtracting this run's central window from the normal one isolates the real peer stall
+// without adding an encoder to the interval being measured.
+// The same trick for the other wait in the path, the one guarding reuse of the shared host
+// block. TOSH_MGPU_BP_SATISFIED=1, benchmark only, same warning applies.
+static bool ggml_metal_bp_satisfied(void) {
+    static int v = -1;
+    if (v < 0) {
         const char * s = TOSH_ENV("TOSH_MGPU_BP_SATISFIED");
+        v = (s && s[0] == '1') ? 1 : 0;
+        if (v) {
+            fprintf(stderr, "ggml_metal: WARNING TOSH_MGPU_BP_SATISFIED=1, the collective does not "
+                            "wait before reusing the staging block. Benchmark only.\n");
+        }
+    }
+    return v == 1;
+}
+
         const char * s = TOSH_ENV("TOSH_MGPU_TP2_FUSED_BOUNDARY");
+static bool ggml_metal_wait_satisfied(void) {
+    static int v = -1;
+    if (v < 0) {
         const char * s = TOSH_ENV("TOSH_MGPU_WAIT_SATISFIED");
+        v = (s && s[0] == '1') ? 1 : 0;
+        if (v) {
+            fprintf(stderr, "ggml_metal: WARNING TOSH_MGPU_WAIT_SATISFIED=1, the collective never "
+                            "waits for the peer and the output is meaningless. Benchmark only.\n");
+        }
+    }
+    return v == 1;
+}
+
+static id<MTLSharedEvent> tosh_wait_dummy(ggml_metal_t ctx) {
+    if (ctx->ev_wait_dummy == nil) {
+        ctx->ev_wait_dummy = [ggml_metal_device_get_obj(ctx->dev) newSharedEvent];
+        ctx->ev_wait_dummy.signaledValue = 1;   // satisfied before anything is encoded
+    }
+    return ctx->ev_wait_dummy;
+}
+
+static void tosh_mgpu_trace_report(void) {
+    const uint64_t reduce = atomic_load(&g_tr_reduce);
+    const uint64_t peer   = atomic_load(&g_tr_bytes_peer);
+    const uint64_t host   = atomic_load(&g_tr_bytes_host);
+
+    fprintf(stderr, "TOSH_MGPU_TRACE\n");
+    fprintf(stderr, "  allreduce exchanges   %llu\n", (unsigned long long) reduce);
+    fprintf(stderr, "  plain xdev copies     %llu\n", (unsigned long long) atomic_load(&g_tr_copy));
+    fprintf(stderr, "  peer-direct bytes     %llu\n", (unsigned long long) peer);
+    fprintf(stderr, "  host-staged bytes     %llu\n", (unsigned long long) host);
+    fprintf(stderr, "  peer share            %.1f%%\n",
+            peer + host ? 100.0*(double) peer/(double)(peer + host) : 0.0);
+    fprintf(stderr, "  collective cmd bufs   %llu\n", (unsigned long long) atomic_load(&g_tr_cmd_bufs));
+    fprintf(stderr, "  tracked cmd bufs      %llu\n", (unsigned long long) atomic_load(&g_tr_cmd_all));
+    fprintf(stderr, "  merge reuse / waits   %llu/%llu\n",
+            (unsigned long long) atomic_load(&g_tr_merge_reuse),
+            (unsigned long long) atomic_load(&g_tr_merge_waits));
+    fprintf(stderr, "  graph submissions     %llu\n", (unsigned long long) atomic_load(&g_tr_graphs));
+    {
+        const uint64_t n = atomic_load(&g_sk_n);
+        if (n > 0) {
+            static const char * lbl[8] = {"<1","<2","<5","<10","<20","<50","<200",">=200"};
+            const double nn = (double) n;
+            fprintf(stderr, "  skew n=%llu   commit mean %.1f us   GPU-start mean %.1f us   GPU max %.1f us\n",
+                    (unsigned long long) n, atomic_load(&g_sk_com_sum)/1000.0/nn,
+                    atomic_load(&g_sk_gpu_sum)/1000.0/nn, atomic_load(&g_sk_gpu_max)/1000.0);
+            fprintf(stderr, "    side0 leads: commit %.1f%%   GPU %.1f%%\n",
+                    100.0*atomic_load(&g_sk_com_first0)/nn, 100.0*atomic_load(&g_sk_gpu_first0)/nn);
+            fprintf(stderr, "    commit us   ");
+            for (int i = 0; i < 8; i++) { fprintf(stderr, "%s %.1f%%  ", lbl[i], 100.0*atomic_load(&g_sk_com_hist[i])/nn); }
+            fprintf(stderr, "\n    GPUstart us ");
+            for (int i = 0; i < 8; i++) { fprintf(stderr, "%s %.1f%%  ", lbl[i], 100.0*atomic_load(&g_sk_gpu_hist[i])/nn); }
+            fprintf(stderr, "\n");
+        }
+    }
+    {
+        const uint64_t n = atomic_load(&g_gr_n);
+        if (n > 0) {
+            static const char * lbl[8] = {"<1","<2","<5","<10","<20","<50","<200",">=200"};
+            const double nn = (double) n;
+            fprintf(stderr, "  subgraph deltas n=%llu  |start| %.1f us  |duration| %.1f us  |end| %.1f us  residual %.3f us\n",
+                    (unsigned long long) n, atomic_load(&g_gr_ss)/1000.0/nn,
+                    atomic_load(&g_gr_sd)/1000.0/nn, atomic_load(&g_gr_se)/1000.0/nn,
+                    atomic_load(&g_gr_resid)/1000.0/nn);
+            fprintf(stderr, "    sign of end delta agrees with start %.1f%%, with duration %.1f%%\n",
+                    100.0*atomic_load(&g_gr_sign_start)/nn, 100.0*atomic_load(&g_gr_sign_dur)/nn);
+            fprintf(stderr, "    side0 starts first %.1f%%   side0 shorter %.1f%%\n",
+                    100.0*atomic_load(&g_gr_start0_first)/nn, 100.0*atomic_load(&g_gr_dur0_less)/nn);
+            const char * nm[3] = {"|start|  ", "|duration|", "|end|    "};
+            _Atomic uint64_t * hh[3] = {g_gr_hs, g_gr_hd, g_gr_he};
+            for (int k = 0; k < 3; k++) {
+                fprintf(stderr, "    %s us ", nm[k]);
+                for (int i = 0; i < 8; i++) { fprintf(stderr, "%s %.1f%%  ", lbl[i], 100.0*atomic_load(&hh[k][i])/nn); }
+                fprintf(stderr, "\n");
+            }
+        }
+        static const char * dlb2[8] = {"<40","<80","<120","<160","<200","<300","<500",">=500"};
+        for (int sd = 0; sd < 2; sd++) {
+            const uint64_t dn = atomic_load(&g_dur_n[sd]);
+            if (!dn) continue;
+            fprintf(stderr, "  side%d subgraph duration mean %.1f us  n=%llu  ", sd,
+                    atomic_load(&g_dur_sum[sd])/1000.0/(double) dn, (unsigned long long) dn);
+            for (int i = 0; i < 8; i++) { fprintf(stderr, "%s %.1f%%  ", dlb2[i], 100.0*atomic_load(&g_dur_h[sd][i])/(double) dn); }
+            fprintf(stderr, "\n");
+        }
+    }
+    {
+        const uint64_t n = atomic_load(&g_ct_n);
+        if (n > 0 || atomic_load(&g_ct_fail) > 0) {
+            static const char * lbl[8] = {"<1","<5","<10","<20","<50","<100","<200",">=200"};
+            const double nn = (double) (n ? n : 1);
+            fprintf(stderr, "  staged timeline n=%llu (failed %llu)  publish %.1f us  WAIT-WINDOW %.1f us  read %.1f us\n",
+                    (unsigned long long) n, (unsigned long long) atomic_load(&g_ct_fail),
+                    atomic_load(&g_ct_pub)/1000.0/nn, atomic_load(&g_ct_wait)/1000.0/nn,
+                    atomic_load(&g_ct_read)/1000.0/nn);
+            const char * rn[3] = {"publish    ", "wait-window", "read       "};
+            _Atomic uint64_t * hh[3] = {g_ct_hp, g_ct_hw, g_ct_hr};
+            for (int k = 0; k < 3; k++) {
+                fprintf(stderr, "    %s us ", rn[k]);
+                for (int i = 0; i < 8; i++) { fprintf(stderr, "%s %.1f%%  ", lbl[i], 100.0*atomic_load(&hh[k][i])/nn); }
+                fprintf(stderr, "\n");
+            }
+        }
+    }
+    fprintf(stderr, "  remote views new/hit  %llu/%llu\n",
+            (unsigned long long) atomic_load(&g_tr_rv_new),
+            (unsigned long long) atomic_load(&g_tr_rv_hit));
+    fprintf(stderr, "  encode CPU            %.1f ms\n", atomic_load(&g_tr_encode_ns)/1e6);
+    fprintf(stderr, "  collective GPU        %.1f ms\n", atomic_load(&g_tr_gpu_ns)/1e6);
+    fprintf(stderr, "  commit to GPU start   %.1f ms\n", atomic_load(&g_tr_sched_ns)/1e6);
+    // decode-only, per card per token
+    if (atomic_load(&g_snap_taken)) {
+        const double t = (double) (atomic_load(ggml_backend_meta_pass_counter()) - g_snap_passes);
+        if (t > 0) {
+            fprintf(stderr, "  --- steady-state decode, per card per token (%.0f passes) ---\n", t);
+            fprintf(stderr, "    collectives         %.2f\n", (atomic_load(&g_tr_reduce) - g_snap_reduce)/t);
+            fprintf(stderr, "    tracked cmd bufs    %.2f\n", (atomic_load(&g_tr_cmd_all) - g_snap_cmd)/t);
+            fprintf(stderr, "    graph submissions   %.2f\n", (atomic_load(&g_tr_graphs) - g_snap_graphs)/t);
+            fprintf(stderr, "    event signals       %.2f\n", (atomic_load(&g_tr_signals) - g_snap_sig)/t);
+            fprintf(stderr, "    event waits         %.2f\n", (atomic_load(&g_tr_waits) - g_snap_wait)/t);
+            fprintf(stderr, "    peer bytes          %.0f\n", (atomic_load(&g_tr_bytes_peer) - g_snap_peer_b)/t);
+            fprintf(stderr, "    host-staged bytes   %.0f\n", (atomic_load(&g_tr_bytes_host) - g_snap_host_b)/t);
+        }
+    }
+
+    if (reduce) {
+        fprintf(stderr, "  per exchange          %.1f us GPU, %.1f us to start, %llu B\n",
+                atomic_load(&g_tr_gpu_ns)/1e3/(double) reduce,
+                atomic_load(&g_tr_sched_ns)/1e3/(double) reduce,
+                (unsigned long long) ((peer + host)/reduce));
+    }
+}
+
+// Metal reports both when the buffer was handed over and when the GPU actually ran it; the
+// gap is the queueing and the event waits, which is the number the collective is judged on.
 static void ggml_metal_encode_pending_waits(ggml_metal_t ctx, id<MTLCommandBuffer> cmd_buf) {
     for (int i = 0; i < ctx->n_ev_wait_pending; ++i) {
         ggml_metal_event_encode_wait(ctx->ev_wait_pending[i], (ggml_metal_cmd_buf_t) cmd_buf);
@@ -350,6 +818,7 @@ static void ggml_metal_encode_pending_waits(ggml_metal_t ctx, id<MTLCommandBuffe
     ctx->n_ev_wait_pending = 0;
 
     for (int i = 0; i < ctx->n_peer_waits; ++i) {
+        if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_waits, 1);
         [cmd_buf encodeWaitForEvent:ctx->peer_waits[i].ev value:ctx->peer_waits[i].val];
     }
     ctx->n_peer_waits = 0;
@@ -373,6 +842,7 @@ static void ggml_metal_cmd_buf_hold_flush(ggml_metal_t ctx) {
 }
 
 static id<MTLCommandBuffer> ggml_metal_cmd_buf_new(ggml_metal_t ctx) {
+    if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_cmd_all, 1);
     id<MTLCommandBuffer> cmd_buf = [ctx->queue commandBuffer];
     ggml_metal_encode_pending_waits(ctx, cmd_buf);
 
@@ -415,8 +885,12 @@ static void ggml_metal_peer_wait_add(ggml_metal_t ctx, id<MTLSharedEvent> ev, ui
         ctx->n_peer_waits++;
         return;
     }
+
+    @autoreleasepool {
+        if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_cmd_all, 1);
         id<MTLCommandBuffer> cmd_buf = [ctx->queue commandBuffer];
         ggml_metal_encode_pending_waits(ctx, cmd_buf);
+        if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_waits, 1);
         [cmd_buf encodeWaitForEvent:ev value:val];
         ggml_metal_cmd_buf_submit(ctx, cmd_buf);
     }
@@ -632,6 +1106,7 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
     // pending waits guard memory a peer blit can still be reading, so they must run and complete before synchronize returns
     if (ctx->n_ev_wait_pending > 0 || ctx->n_peer_waits > 0) {
         @autoreleasepool {
+            if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_cmd_all, 1);
             id<MTLCommandBuffer> cmd_buf = [ctx->queue commandBuffer];
             ggml_metal_encode_pending_waits(ctx, cmd_buf);
             ggml_metal_cmd_buf_submit(ctx, cmd_buf);
@@ -785,6 +1260,7 @@ void ggml_metal_read_batch_end(ggml_metal_t ctx) {
             }
 
             if (buf_src != nil) {
+                if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_cmd_all, 1);
                 id<MTLCommandBuffer> cmd_buf = [ctx->queue commandBuffer];
                 ggml_metal_encode_pending_waits(ctx, cmd_buf);
                 id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
@@ -828,6 +1304,8 @@ void ggml_metal_read_batch_end(ggml_metal_t ctx) {
         // queue the copy operation into the queue of the Metal context
         // this will be queued at the end, after any currently ongoing GPU operations
         id<MTLCommandQueue> queue = ctx->queue;
+        if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_cmd_all, 1);
+        id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
         ggml_metal_encode_pending_waits(ctx, cmd_buf);
         id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
 
@@ -888,6 +1366,7 @@ void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * te
         if (buf_dst != nil) {
             // queue the copy operation into the queue of the Metal context
             // this will be queued at the end, after any currently ongoing GPU operations
+            if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_cmd_all, 1);
             id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
             ggml_metal_encode_pending_waits(ctx, cmd_buf);
             id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
@@ -937,6 +1416,7 @@ void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * te
         for (size_t done = 0; done < size;) {
             const size_t n = MIN(stage_size, size - done);
 
+            if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_cmd_all, 1);
             id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
             ggml_metal_encode_pending_waits(ctx, cmd_buf);
 
@@ -1028,7 +1508,23 @@ static bool ggml_metal_xdev_link_reserve(ggml_metal_t ctx_src, ggml_metal_t ctx_
         }
     }
     return true;
+// TOSH_MGPU_NOWAIT=1, benchmark only: the collective still publishes, still signals and still
+// reduces, but never waits for the partner. The output is wrong by construction. Subtracting
+// this from the normal run measures the stall at the wait inside the real collective, instead
+// of inferring it from whole-command-buffer completion timestamps.
+static bool ggml_metal_collective_nowait(void) {
+    static int v = -1;
+    if (v < 0) {
         const char * s = TOSH_ENV("TOSH_MGPU_NOWAIT");
+        v = (s && s[0] == '1') ? 1 : 0;
+        if (v) {
+            fprintf(stderr, "ggml_metal: WARNING TOSH_MGPU_NOWAIT=1, the collective does not wait "
+                            "for the peer and the output is meaningless. Benchmark only.\n");
+        }
+    }
+    return v == 1;
+}
+
 // TOSH_MGPU_PEER_SELF runs the peer hand-off between two logical devices backed by the
 // same GPU (GGML_METAL_DEVICE_LIST=0,0), which needs no bridge: the queues are still
 // separate, so the cross-device ordering is testable on a single card.
@@ -1089,19 +1585,27 @@ static bool ggml_metal_cpy_xdev_peer(ggml_metal_t ctx_src, ggml_metal_t ctx_dst,
 
         const uint64_t seq = ++link->seq;
         @autoreleasepool {
+            if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_cmd_all, 1);
             id<MTLCommandBuffer> cmd_src = [ctx_src->queue commandBuffer];
             ggml_metal_encode_pending_waits(ctx_src, cmd_src);
+            if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_signals, 1);
+        [cmd_src encodeSignalEvent:link->ev_ready value:seq];
             [cmd_src commit];
             [ctx_src->cmd_bufs_ext addObject:cmd_src];
             ctx_src->cmd_buf_last = cmd_src;
             [cmd_src retain];
 
+            if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_cmd_all, 1);
             id<MTLCommandBuffer> cmd_dst = [ctx_dst->queue commandBuffer];
             ggml_metal_encode_pending_waits(ctx_dst, cmd_dst);
+            if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_waits, 1);
+        [cmd_dst encodeWaitForEvent:link->ev_ready value:seq];
             id<MTLBlitCommandEncoder> encoder = [cmd_dst blitCommandEncoder];
             [encoder copyFromBuffer:link->peer_view sourceOffset:bid_src.offs
                            toBuffer:metal_dst destinationOffset:bid_dst.offs size:size];
             [encoder endEncoding];
+            if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_signals, 1);
+        [cmd_dst encodeSignalEvent:link->ev_done value:seq];
             [cmd_dst commit];
             [ctx_dst->cmd_bufs_ext addObject:cmd_dst];
             ctx_dst->cmd_buf_last = cmd_dst;
@@ -1179,19 +1683,25 @@ static bool ggml_metal_cpy_xdev_events(ggml_metal_t ctx_src, ggml_metal_t ctx_ds
         // reuse the host block only after the destination consumed the last hand-off
         id<MTLCommandBuffer> cmd_src = ggml_metal_cmd_buf_continue(ctx_src);
         if (seq > 1) {
+            if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_waits, 1);
+        [cmd_src encodeWaitForEvent:link->ev_done value:seq - 1];
+        }
         id<MTLBlitCommandEncoder> enc_src = [cmd_src blitCommandEncoder];
         [enc_src copyFromBuffer:bid_src.metal sourceOffset:bid_src.offs
                        toBuffer:link->wrap_src destinationOffset:0 size:size];
         [enc_src endEncoding];
+        if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_signals, 1);
         [cmd_src encodeSignalEvent:link->ev_ready value:seq];
         ggml_metal_cmd_buf_end(ctx_src, cmd_src, false);
 
         id<MTLCommandBuffer> cmd_dst = ggml_metal_cmd_buf_new(ctx_dst);
+        if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_waits, 1);
         [cmd_dst encodeWaitForEvent:link->ev_ready value:seq];
         id<MTLBlitCommandEncoder> enc_dst = [cmd_dst blitCommandEncoder];
         [enc_dst copyFromBuffer:link->wrap_dst sourceOffset:0
                        toBuffer:bid_dst.metal destinationOffset:bid_dst.offs size:size];
         [enc_dst endEncoding];
+        if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_signals, 1);
         [cmd_dst encodeSignalEvent:link->ev_done value:seq];
         // the signal lands when the blit does, so holding the buffer open does not keep the
         // source waiting on whatever gets encoded into it afterwards
@@ -1298,6 +1808,8 @@ bool ggml_metal_cpy_tensor_async_ex(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, 
         // queue the copy operation into the Metal context
         // this will be queued at the end, after any currently ongoing GPU operations
         id<MTLCommandQueue> queue = ctx_src->queue;
+        if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_cmd_all, 1);
+        id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
         ggml_metal_encode_pending_waits(ctx_src, cmd_buf);
         ggml_metal_event_encode_wait(ctx_dst->ev_sync, cmd_buf);
         id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
@@ -1423,9 +1935,50 @@ bool ggml_metal_add_inplace_supported(ggml_metal_t ctx, const struct ggml_tensor
         ggml_metal_encoder_free(enc);
 
     if (v < 0) { const char * s = TOSH_ENV("TOSH_MGPU_FB_ADD_RB"); v = (s && s[0] == '0') ? 0 : 1; }
+// rows in the exchanged tensor: one for a generated token, the whole prompt for a prefill
+static int64_t tosh_batch_of(const struct ggml_tensor * t) {
+    if (t == NULL || t->ne[0] <= 0) { return 1; }
+    return ggml_nelements(t)/t->ne[0];
+}
+
         const char * s = TOSH_ENV("TOSH_MGPU_PEER_MIN_BATCH");
+// Leaves the exchange's command buffer open so whatever the graph encodes next lands in it,
+// one submission fewer. On its own this is neutral, which is what the first measurement said;
+// it only pays together with the merge that makes the next subgraph continue the held buffer,
+// and then only when the batch is small. A token of one row crosses 72 times and each crossing
+// carries its own pair of command buffers, so halving them is worth ~3% of decode; a prompt
+// amortises the submissions over the whole batch and loses ~2% instead, hence the batch gate.
+// TOSH_MGPU_HOLD=1 forces it on, =0 off, unset follows the batch.
+static bool ggml_metal_collective_hold_batch(int64_t batch) {
+    static int v = -2;
+    if (v == -2) {
         const char * s = TOSH_ENV("TOSH_MGPU_HOLD");
+        v = s ? (s[0] == '1' ? 1 : 0) : -1;
+    if (v >= 0) {
+        return v == 1;
+    }
+    return batch < ggml_metal_peer_min_batch();
         const char * v = TOSH_ENV("TOSH_MGPU_PEER");
+        if (seq > 2 && !ggml_metal_collective_nowait()) {
+            if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_waits, 1);
+        if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_signals, 1);
+        if (!ggml_metal_collective_nowait()) {
+        if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_waits, 1);
+        }
+            if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_signals, 1);
+        [cmd_buf encodeSignalEvent:link_in->ev_x_done value:seq];
+        if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_signals, 1);
+        tosh_trace_exchange(cmd_buf, seq, (int) (([(id<MTLDevice>) ggml_metal_device_get_obj(ctx_self->dev) peerIndex]) & 1));
+        ggml_metal_cmd_buf_end(ctx_self, cmd_buf, ggml_metal_collective_hold_batch(tosh_batch_of(t_self)));
+        if (seq > 2 && !ggml_metal_collective_nowait()) {
+            if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_waits, 1);
+        if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_signals, 1);
+        if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_waits, 1);
+        if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_signals, 1);
+        tosh_trace_exchange(cmd_buf, seq, (int) (([(id<MTLDevice>) ggml_metal_device_get_obj(ctx_self->dev) peerIndex]) & 1));
+        ggml_metal_cmd_buf_end(ctx_self, cmd_buf, ggml_metal_collective_hold_batch(tosh_batch_of(t_self)));
+        if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_signals, 1);
+        if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_waits, 1);
 
             MTLCommandBufferStatus status = [cmd_buf status];
             if (status != MTLCommandBufferStatusCompleted) {
@@ -1434,11 +1987,8 @@ bool ggml_metal_add_inplace_supported(ggml_metal_t ctx, const struct ggml_tensor
                     GGML_LOG_ERROR("error: %s\n", [[cmd_buf error].localizedDescription UTF8String]);
                 }
 
-                // release this and all remaining command buffers before returning
-                for (size_t j = i; j < ctx->cmd_bufs_ext.count; ++j) {
-                    [ctx->cmd_bufs_ext[j] release];
-                }
-                [ctx->cmd_bufs_ext removeAllObjects];
+        if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_signals, 1);
+        if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_waits, 1);
 
                 ctx->has_error = true;
                 return;
@@ -1446,6 +1996,8 @@ bool ggml_metal_add_inplace_supported(ggml_metal_t ctx, const struct ggml_tensor
 
             [cmd_buf release];
         }
+        tosh_trace_exchange(cmd_buf, seq, (int) (([(id<MTLDevice>) ggml_metal_device_get_obj(ctx_self->dev) peerIndex]) & 1));
+        ggml_metal_cmd_buf_end(ctx_self, cmd_buf, ggml_metal_collective_hold_batch(tosh_batch_of(t_self)));
 
         [ctx->cmd_bufs_ext removeAllObjects];
         const char * s = TOSH_ENV("TOSH_MGPU_ONESHOT");
@@ -1565,6 +2117,10 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
 
         if (bid_src.metal == nil || bid_dst.metal == nil) {
             return false;
+    if (tosh_mgpu_trace()) {
+        tosh_decode_snapshot(t_self->ne[0] > 0 ? ggml_nelements(t_self)/t_self->ne[0] : 1);
+    }
+
         const char * v = TOSH_ENV("TOSH_MGPU_PEER_FUSED");
         }
 
@@ -1587,37 +2143,69 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
         ggml_metal_event_encode_wait(ctx_dst->ev_sync, cmd_buf);
         id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
 
-        [encoder copyFromBuffer:bid_src.metal
-                   sourceOffset:bid_src.offs
-                       toBuffer:bid_dst.metal
-              destinationOffset:bid_dst.offs
-                           size:ggml_nbytes(src)];
+            if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_waits, 1);
+            if (ggml_metal_bp_satisfied()) {
+                [cmd_buf encodeWaitForEvent:tosh_wait_dummy(ctx_self) value:1];
+            } else {
+            }
+        }
 
-        [encoder endEncoding];
+        id<MTLCounterSampleBuffer> cts = tosh_ct_buffer(ctx_self);
+        uint64_t cbase = 0;
+        const bool cbar = ggml_metal_ctime_barrier();
+        if (cts != nil) {
+            cbase = (atomic_fetch_add(&ctx_self->ct_idx, 1) % TOSH_CT_SLOTS)*TOSH_CT_PER;
 
         ggml_metal_event_t ev_cpy = ggml_metal_get_ev_cpy(ctx_src);
         ggml_metal_event_encode_signal(ev_cpy, cmd_buf);
+        if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_signals, 1);
 
         [cmd_buf commit];
+        if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_waits, 1);
+        if (ggml_metal_wait_satisfied()) {
+            [cmd_buf encodeWaitForEvent:tosh_wait_dummy(ctx_self) value:1];
+        } else {
+            [cmd_buf encodeWaitForEvent:link_in->ev_x_ready value:seq_in];
+        }
 
-        // do not wait here for completion
-        //[cmd_buf waitUntilCompleted];
+        if (cts != nil) {
+            id<MTLCounterSampleBuffer> csr = cts;
+            const uint64_t cb2 = cbase;
+            [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) { (void) cb; tosh_ct_record(csr, cb2); }];
+        }
 
         // instead, remember a reference to the command buffer and wait for it later if needed
         [ctx_src->cmd_bufs_ext addObject:cmd_buf];
         ctx_src->cmd_buf_last = cmd_buf;
+        tosh_trace_exchange(cmd_buf, seq, (int) (([(id<MTLDevice>) ggml_metal_device_get_obj(ctx_self->dev) peerIndex]) & 1));
+        ggml_metal_cmd_buf_end(ctx_self, cmd_buf, ggml_metal_collective_hold_batch(tosh_batch_of(t_self)));
 
         [cmd_buf retain];
 
         ggml_metal_event_wait(ctx_dst, ev_cpy);
 
-        return true;
+// TOSH_MGPU_MERGE=1: a tensor split cuts the graph at every partial node, so a token costs one
+// command buffer for each collective plus one for each subgraph that follows it. With this on,
+// the collective leaves its buffer open and the next subgraph encodes into it instead of
+// submitting its own, which halves the command buffers a split token creates.
+static bool ggml_metal_merge_graph(void) {
+    static int v = -1;
+    if (v < 0) {
         const char * s = TOSH_ENV("TOSH_MGPU_MERGE");
+        // on by default: it is inert unless a collective left a buffer held, which only the
+        // batch gate above does, so a prompt never sees it
+        v = s ? (s[0] == '1' ? 1 : 0) : 1;
     }
+    return v == 1;
 }
 
 enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph * gf) {
+    if (tosh_mgpu_trace()) { atomic_fetch_add(&g_tr_graphs, 1); }
     // command buffers run in commit order, so a held one has to go in before this graph
+    if (!ggml_metal_merge_graph()) {
+        ggml_metal_cmd_buf_hold_flush(ctx);
+    }
+
     if (ctx->has_error) {
         GGML_LOG_ERROR("%s: backend is in error state from a previous command buffer failure - recreate the backend to recover\n", __func__);
         return GGML_STATUS_FAILED;
@@ -1723,8 +2311,24 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         // the main thread commits the first few commands immediately
         // cmd_buf[n_cb]
         {
-            id<MTLCommandBuffer> cmd_buf = [queue commandBufferWithUnretainedReferences];
-            [cmd_buf retain];
+            // continue the collective's buffer when it left one open, otherwise start a new one
+            id<MTLCommandBuffer> cmd_buf = nil;
+            if (ggml_metal_merge_graph() && ctx->cmd_buf_hold != nil) {
+                cmd_buf = ctx->cmd_buf_hold;
+                ctx->cmd_buf_hold = nil;
+                // the collective is already encoded in here; anything that queued a wait since
+                // then has to land between it and this subgraph, not be dropped
+                if (tosh_mgpu_trace()) {
+                    if (ctx->n_ev_wait_pending > 0 || ctx->n_peer_waits > 0) {
+                        atomic_fetch_add(&g_tr_merge_waits, ctx->n_ev_wait_pending + ctx->n_peer_waits);
+                    }
+                    atomic_fetch_add(&g_tr_merge_reuse, 1);
+                }
+            } else {
+                if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_cmd_all, 1);
+                cmd_buf = [queue commandBufferWithUnretainedReferences];
+                [cmd_buf retain];
+            }
             ggml_metal_encode_pending_waits(ctx, cmd_buf);
             tosh_cbp_attach(cmd_buf, cbp);
 
@@ -1732,6 +2336,8 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
                 [ctx->cmd_bufs[n_cb].obj release];
             }
             ctx->cmd_bufs[n_cb].obj = cmd_buf;
+
+            tosh_trace_graph_end(cmd_buf, (int) (([(id<MTLDevice>) ggml_metal_device_get_obj(ctx->dev) peerIndex]) & 1));
 
             [cmd_buf enqueue];
 
@@ -1749,6 +2355,7 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         // prepare the rest of the command buffers asynchronously (optional)
         // cmd_buf[0.. n_cb)
         for (int cb_idx = 0; cb_idx < n_cb; ++cb_idx) {
+            if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_cmd_all, 1);
             id<MTLCommandBuffer> cmd_buf = [queue commandBufferWithUnretainedReferences];
             ggml_metal_encode_pending_waits(ctx, cmd_buf);
             tosh_cbp_attach(cmd_buf, cbp);
@@ -1896,6 +2503,7 @@ void ggml_metal_graph_optimize(ggml_metal_t ctx, struct ggml_cgraph * gf) {
 void ggml_metal_event_record(ggml_metal_t ctx, ggml_metal_event_t ev) {
     @autoreleasepool {
         id<MTLCommandQueue> queue = ctx->queue;
+        if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_cmd_all, 1);
         id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
         ggml_metal_encode_pending_waits(ctx, cmd_buf);
 
@@ -1918,6 +2526,7 @@ void ggml_metal_event_wait(ggml_metal_t ctx, ggml_metal_event_t ev) {
 
     @autoreleasepool {
         id<MTLCommandQueue> queue = ctx->queue;
+        if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_cmd_all, 1);
         id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
         ggml_metal_encode_pending_waits(ctx, cmd_buf);
 

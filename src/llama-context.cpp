@@ -485,10 +485,12 @@ llama_context::llama_context(
 
         // TODO: move these checks to ggml_backend_sched
         // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
+        // No device-count check: the scheduler only creates its events when this is on, and
+        // without them every crossing to the CPU drains the GPU instead of waiting on one. That
+        // costs nothing on unified memory, so upstream only asks for it when there are several
+        // devices to overlap.
         bool pipeline_parallel =
-            model.n_devices() > 1 &&
             model.n_gpu_layers() > model.hparams.n_layer_all &&
-            model.split_mode() == LLAMA_SPLIT_MODE_LAYER &&
             cparams.offload_kqv &&
             !model.has_tensor_overrides();
 
@@ -498,6 +500,7 @@ llama_context::llama_context(
                 auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backend.get()));
                 if (dev_type == GGML_BACKEND_DEVICE_TYPE_CPU || dev_type == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
                     // ignore CPU and ACCEL backends: BLAS is always present on macOS and reports
+                    // no async/events, which disabled pipeline parallelism for every GPU
                     continue;
                 }
                 auto * dev = ggml_backend_get_device(backend.get());
@@ -679,6 +682,7 @@ void llama_context::sched_reserve() {
     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
 
     synchronize();
+    shape_cache_disable();
 
     const int64_t t_start_us = ggml_time_us();
 
@@ -819,8 +823,70 @@ void llama_context::sched_reserve() {
 
     const int64_t t_end_us = ggml_time_us();
 
+    // The second scheduler plans into the buffers just reserved, so the pair costs graph
+    // metadata and no device memory. Only a session that alternates between two shapes gains
+    // from it, so it is asked for: without alternation the swap below never hits.
+    {
+        const char * env = getenv("TOSH_MGPU_SHAPE_CACHE");
+        if (env != nullptr && atoi(env) != 0) {
+            gf_res_alt[0].reset(new llm_graph_result(max_nodes));
+            gf_res_alt[1].reset(new llm_graph_result(max_nodes));
+            gf_res_alt_active = nullptr;
+            sched_alt.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
+                        max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+            ggml_backend_sched_share_compute_buffers(sched_alt.get(), sched.get());
+            sched_owner = sched.get();
+            shape_slot  = 0;
+            ggml_backend_sched_set_shape_slot(sched.get(), shape_slot);
+            LLAMA_LOG_INFO("%s: shape cache on, two prepared shapes share the compute buffers\n", __func__);
+            if (getenv("TOSH_MGPU_SHAPE_TRACE") != nullptr) {
+                fprintf(stderr, "SHAPE cache on\n");
+            }
+        }
+    }
+
     LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
+}
+
+void llama_context::shape_cache_disable() {
+    if (!sched_alt) {
+        return;
+    }
+    if (sched.get() != sched_owner) {
+        // the borrowed plan is the active one: put the owner back in place first
+        std::swap(gf_res_prev, gf_res_alt);
+        std::swap(gf_res_prev_active, gf_res_alt_active);
+        std::swap(sched, sched_alt);
+    }
+    ggml_backend_sched_set_shape_slot(sched.get(), -1);
+    sched_alt.reset();
+    for (auto & res : gf_res_alt) {
+        res.reset();
+    }
+    gf_res_alt_active = nullptr;
+    sched_owner = nullptr;
+    shape_slot = 0;
+    shape_slots_filled = 0;
+}
+
+void llama_context::shape_cache_invalidate() {
+    if (!sched_alt) {
+        return;
+    }
+    ggml_backend_sched_synchronize(sched.get());
+    for (auto * set : { &gf_res_prev, &gf_res_alt }) {
+        for (auto & res : *set) {
+            if (res) {
+                res->reset();
+            }
+        }
+    }
+    gf_res_prev_active = nullptr;
+    gf_res_alt_active  = nullptr;
+    ggml_backend_sched_reset_shape_slot(sched.get(), 0);
+    ggml_backend_sched_reset_shape_slot(sched.get(), 1);
+    shape_slots_filled = 0;
 }
 
 void llama_context::synchronize() {
@@ -934,6 +1000,7 @@ bool llama_context::memory_update(bool optimize) {
             }
         }
         gf_res_prev_active = nullptr;
+        shape_cache_invalidate();
 
         if (!mctx->apply()) {
             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
@@ -1464,9 +1531,45 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
-    const auto gparams = graph_params(res, ubatch, mctx, gtype);
+    auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
+    bool shape_reuse = !graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams);
+
+    if (!shape_reuse && sched_alt && !graph_reuse_disable) {
+        // the active shape does not fit this batch: try the other prepared one
+        auto & alt = gf_res_alt[n_outputs > 0];
+        if (!alt) {
+            alt.reset(new llm_graph_result(gf_res_reserve->get_max_nodes()));
+        }
+        const bool hit = shape_slots_filled == 2 && gf_res_alt_active == alt.get() &&
+            alt->can_reuse(graph_params(alt.get(), ubatch, mctx, gtype));
+
+        // Fill the running slot first. Afterwards the inactive slot is the least recently used:
+        // swap to it both on a hit and when a new shape has to evict an old one.
+        if (shape_slots_filled > 0) {
+
+            // the shapes share their compute memory: nothing of the outgoing one may still be running
+            ggml_backend_sched_synchronize(sched.get());
+
+            std::swap(gf_res_prev, gf_res_alt);
+            std::swap(gf_res_prev_active, gf_res_alt_active);
+            std::swap(sched, sched_alt);
+            shape_slot ^= 1;
+            ggml_backend_sched_set_shape_slot(sched.get(), shape_slot);
+
+            res         = get_gf_res_prev();
+            gf          = res->get_gf();
+            gparams     = graph_params(res, ubatch, mctx, gtype);
+            shape_reuse = hit;
+        }
+
+        static const bool shape_trace = getenv("TOSH_MGPU_SHAPE_TRACE") != nullptr;
+        if (shape_trace) {
+            fprintf(stderr, "SHAPE %s slot=%d n_tokens=%u\n", hit ? "hit" : "miss", shape_slot, ubatch.n_tokens);
+        }
+    }
+
+    if (shape_reuse) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1480,6 +1583,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     } else {
         gf_res_prev_active = nullptr;
         res->reset();
+
+        if (sched_alt) {
+            ggml_backend_sched_reset_shape_slot(sched.get(), shape_slot);
+        }
 
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
@@ -1497,9 +1604,28 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
-            LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
-            ret = GGML_STATUS_ALLOC_FAILED;
-            return nullptr;
+            if (sched_alt) {
+                // this shape needs more memory than the shared allocation holds: give up the
+                // second slot and let the owning scheduler grow for it
+                LLAMA_LOG_INFO("%s: shape cache off, this graph does not fit the shared buffers\n", __func__);
+                shape_cache_disable();
+
+                res = get_gf_res_prev();
+                res->reset();
+                ggml_backend_sched_reset(sched.get());
+                ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+
+                gparams = graph_params(res, ubatch, mctx, gtype);
+                gf      = model.build_graph(gparams);
+            }
+            if (!gf || !ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+                LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+                ret = GGML_STATUS_ALLOC_FAILED;
+                return nullptr;
+            }
+        }
+        if (sched_alt && shape_slots_filled < 2) {
+            shape_slots_filled++;
         }
 
         gf_res_prev_active = res;
@@ -2597,6 +2723,7 @@ ggml_cgraph * llama_context::graph_reserve(
         }
     }
     gf_res_prev_active = nullptr;
+    shape_cache_invalidate();
 
     // store the n_outputs as it is, and restore it afterwards
     // TODO: not sure if needed, might simplify in the future by removing this
@@ -2710,6 +2837,7 @@ llm_graph_cb llama_context::graph_get_cb() const {
         // - force the last op of the layer on the specified backend to avoid running it on the backend of the next layer due to scheduling
         // FIXME: fix in ggml_backend_sched
         const bool full_offload = model.n_gpu_layers() > model.hparams.n_layer_all;
+
         if (ubatch.n_tokens < 32 || full_offload) {
             if (il != -1 && (strcmp(name, "norm") == 0 || strcmp(name, "l_last") == 0)) {
                 const auto & dev_layer = model.dev_layer(il);
