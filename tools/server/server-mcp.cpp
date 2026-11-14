@@ -589,12 +589,10 @@ bool server_mcp_stdio::start() {
     argv_s.insert(argv_s.end(), config.args.begin(), config.args.end());
 
     int options = subprocess_option_no_window | subprocess_option_search_user_path;
-    std::vector<std::string> envp_s;
-    if (config.env.empty()) {
-        options |= subprocess_option_inherit_environment;
-    } else {
-        envp_s = mcp_build_env(config.env);
-    }
+    // a server learns how long the engine waits for a call, so an agent can end its turn before that
+    auto env = config.env;
+    env.emplace("TOSH_MCP_TIMEOUT_MS", std::to_string(config.timeout_ms));
+    std::vector<std::string> envp_s = mcp_build_env(env);
 
     auto handle = std::make_unique<process_handle>();
     bool ok = handle->sp.create(argv_s, options, envp_s, config.cwd.empty() ? nullptr : config.cwd.c_str());
