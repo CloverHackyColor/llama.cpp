@@ -477,25 +477,31 @@ void dequantize_q3_K(device const block_q3_K *xb, short il, thread type4x4 & reg
     reg = (type4x4) reg_f;
 }
 
-static inline uchar2 get_scale_min_k4_just2(int j, int k, device const uchar * q) {
-    return j < 4 ? uchar2{uchar(q[j+0+k] & 63), uchar(q[j+4+k] & 63)}
+// uniform: j < 4 comes in as j_lo, known for the whole wave
+template <bool uniform>
+static inline uchar2 get_scale_min_k4_just2(int j, int k, device const uchar * q, bool j_lo) {
+    return (uniform ? j_lo : j < 4) ? uchar2{uchar(q[j+0+k] & 63), uchar(q[j+4+k] & 63)}
                  : uchar2{uchar((q[j+4+k] & 0xF) | ((q[j-4+k] & 0xc0) >> 2)), uchar((q[j+4+k] >> 4) | ((q[j-0+k] & 0xc0) >> 2))};
 }
 
-template <typename type4x4>
-void dequantize_q4_K(device const block_q4_K * xb, short il, thread type4x4 & reg) {
+template <bool uniform>
+static inline uchar2 get_scale_min_k4_just2_w(int j, int k, uint w0, uint w1, uint w2, bool j_lo) {
     const int  a  = j + k;
     const uint sh = 8*(a & 3);
 
     const uint lo = (a < 4 ? w0 : w1) >> sh; // byte a
     const uint hi = (a < 4 ? w1 : w2) >> sh; // byte a+4
 
+    if (uniform ? j_lo : j < 4) {
         return uchar2{uchar(lo & 63), uchar(hi & 63)};
     }
 
     const uint pv = w0 >> sh;                // byte a-4, only reached when j >= 4
     return uchar2{uchar((hi & 0xF) | ((pv & 0xc0) >> 2)), uchar(((hi & 0xFF) >> 4) | ((lo & 0xc0) >> 2))};
 }
+
+template <bool uniform, typename type4x4>
+void dequantize_q4_K_impl(device const block_q4_K * xb, short il, bool lo, thread type4x4 & reg) {
     // high nibble picked by a shifted mask and folded into the scale (as in dequantize_q4_0).
     // int offsets: AMD miscompiles short device address math.
     // 128-bit load: the block is 144 bytes (9*16) so the window lands 16-byte aligned
@@ -510,6 +516,7 @@ void dequantize_q4_K(device const block_q4_K * xb, short il, thread type4x4 & re
     short is = (il/4) * 2;
     q = q + (il/4) * 32 + 16 * (il&1);
     il = il & 3;
+    const uchar2 sc = get_scale_min_k4_just2_w<uniform>(is, il/2, hdr.y, hdr.z, hdr.w, lo);
     const float d   = il < 2 ? (float) dm[0] : (float) (dm[0] / 16.h);
     const float min = dm[1];
     const float dl = d * sc[0];
@@ -528,9 +535,12 @@ void dequantize_q4_K(device const block_q4_K * xb, short il, thread type4x4 & re
 }
 
 template <typename type4x4>
-void dequantize_q5_K(device const block_q5_K *xb, short il, thread type4x4 & reg) {
-    device const uint8_t * q  = xb->qs;
-    device const uint8_t * qh = xb->qh;
+void dequantize_q4_K(device const block_q4_K * xb, short il, thread type4x4 & reg) {
+    dequantize_q4_K_impl<false>(xb, il, false, reg);
+}
+
+template <bool uniform, typename type4x4>
+void dequantize_q5_K_impl(device const block_q5_K *xb, short il, bool lo, thread type4x4 & reg) {
     // 128-bit loads: the block is 176 bytes (11*16) and both windows land 16-byte aligned
     const int qoff = 32 * (int) (il/4) + 16 * ((int) il & 1);
     const int hoff = 16 * ((int) il & 1);
@@ -541,7 +551,7 @@ void dequantize_q5_K(device const block_q5_K *xb, short il, thread type4x4 & reg
     const ushort ul0 = 1 << (il/2);
     const ushort ul1 = ul0 << 8;
     il = il & 3;
-    const uchar2 sc = get_scale_min_k4_just2(is, il/2, xb->scales);
+    const uchar2 sc = get_scale_min_k4_just2<uniform>(is, il/2, xb->scales, lo);
     const float d = il < 2 ? xb->d : xb->d / 16.f;
     const float min = xb->dmin;
     const float dl = d * sc[0];
@@ -563,6 +573,24 @@ void dequantize_q5_K(device const block_q5_K *xb, short il, thread type4x4 & reg
 
     reg = (type4x4) reg_f;
 }
+
+template <typename type4x4>
+void dequantize_q5_K(device const block_q5_K *xb, short il, thread type4x4 & reg) {
+    dequantize_q5_K_impl<false>(xb, il, false, reg);
+}
+
+// for kernels that know j < 4 per wave; a no-op for every other block type
+template <typename block_q, typename type4x4>
+void dequantize_lo(device const block_q * xb, short il, bool lo, thread type4x4 & reg) {}
+
+template <typename type4x4>
+void dequantize_lo(device const block_q4_K * xb, short il, bool lo, thread type4x4 & reg) {
+    dequantize_q4_K_impl<true>(xb, il, lo, reg);
+}
+
+template <typename type4x4>
+void dequantize_lo(device const block_q5_K * xb, short il, bool lo, thread type4x4 & reg) {
+    dequantize_q5_K_impl<true>(xb, il, lo, reg);
 }
 
 template <typename type4x4>
@@ -829,3 +857,4 @@ void dequantize_tq2_0(device const block_tq2_0 * xb, short il, thread type4x4 & 
 
     reg = (type4x4) reg_f;
 }
+

@@ -1018,23 +1018,104 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     const int16_t r2   = (int16_t) (ne12 / op->src[0]->ne[2]);
     const int16_t r3   = (int16_t) (ne13 / op->src[0]->ne[3]);
 
-    snprintf(base, 256, "kernel_mul_mm_%s_%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
-    snprintf(name, 256, "%s_bci=%d_bco=%d_ne12=%d_ne13=%d_r2=%d_r3=%d",
-             base, bc_inp, bc_out, ne12, ne13, r2, r3);
     // The 8x4 tile halves the simdgroups per threadgroup, so it needs enough tokens to keep
     // the GPU in threadgroups; below ~192 it loses (measured 8.7% at 64 tokens on q8_0).
+    static const int wide_floor_env = []() {
         const char * s = TOSH_ENV("TOSH_MM_WIDE_FLOOR");
         return s ? atoi(s) : 0;
     }();
+
+    // the 64-token tile rounds the batch up, so a tail of 32 or fewer pays for a half-empty
+    // group that this one covers exactly. Past 128 the padding is a smaller share and the
+    // grid-lookup quants lose more re-dequantizing than they save.
+    // the tail keeps its own bound: it beats the 8x4 tile on a 32-token remainder at any size,
+    // so it must not follow the wide floor down
+    // The 192 bound was measured on 32 lanes. On 64 the tail path stops paying earlier: 128 gains
+    // 1.8 to 3.6% between 130 and 160 tokens and is neutral elsewhere, while raising it costs 8%.
+    // TOSH_MM_TAIL_MAX overrides it on either width.
+    static const int tail_max_env = []() {
         const char * s = TOSH_ENV("TOSH_MM_TAIL_MAX");
         return s ? atoi(s) : 0;
     }();
+
+    const int simd_width_tail = ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->simd_width;
+    const int tail_max = tail_max_env ? tail_max_env : (simd_width_tail == 64 ? 128 : 192);
+
+    bool tail_32 = op->ne[1] < tail_max && (op->ne[1] % 64) >= 1 && (op->ne[1] % 64) <= 32 &&
                    TOSH_ENV("TOSH_MM_NARROW_TAIL_DISABLE") == nullptr;
+    if (tail_32 && op->ne[1] > 128) {
+        switch (tsrc0) {
+            case GGML_TYPE_IQ1_S:
+            case GGML_TYPE_IQ1_M:
+            case GGML_TYPE_IQ2_XXS:
+            case GGML_TYPE_IQ2_XS:
+            case GGML_TYPE_IQ2_S:
+                tail_32 = false; break;
+            default: break;
+        }
+    }
+    const bool narrow = use_mm_manual && !has_tensor && tsrc1 == GGML_TYPE_F32 &&
+                        (op->ne[1] <= 32 || tail_32);
+
+    // wave64 wants a far higher floor: between 288 and 384 the tile loses on two models,
+    // and from 448 up it wins 4 to 6%
+    const int simd_width = ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->simd_width;
     const bool wide_width_ok = simd_width != 64 || TOSH_ENV("TOSH_MM_WIDE_W64_DISABLE") == nullptr;
+    // Both floors were derived against the 32-lane tile. The 64-lane rewrite moved the
+    // crossover, and it moved by a different amount per type, so each carries its own:
+    // a single number would have to pick whom to hurt (q8_0 gains 3.7% where q4_K loses 3.1%).
+    // Types with no measurement of their own keep the width default.
+    int wide_floor = wide_floor_env ? wide_floor_env : (simd_width == 64 ? 448 : 112);
+    // On 32 lanes q5_0 and q5_1 never earn the wide tile: it costs them 5 to 30% from 48 to
+    // 2048 tokens, while the same tile is worth 24% to them on 64 lanes.
+    if (!wide_floor_env && simd_width == 32 &&
+        (tsrc0 == GGML_TYPE_Q5_0 || tsrc0 == GGML_TYPE_Q5_1)) {
+        wide_floor = INT32_MAX;
+    }
+    if (!wide_floor_env && simd_width == 64) {
+        switch (tsrc0) {
+            // measured one type at a time over 128/192/256/384 tokens: 192 is where the tile
+            // starts paying for these, and below it every type loses (128 costs 4 to 19%)
+            case GGML_TYPE_Q8_0:
+            case GGML_TYPE_Q6_K:
+            case GGML_TYPE_Q5_K:
+            case GGML_TYPE_Q4_1:
+            case GGML_TYPE_Q3_K:
+            case GGML_TYPE_IQ3_S: wide_floor = 192; break;
+            // q4_0 turns one step later: at 192 it loses 10% on a 192-token prompt
+            case GGML_TYPE_Q4_0: wide_floor = 256; break;
+            // left at the width default because the shorter floor measured worse: f16 (-4.8%),
+            // q5_0 (-1.3%), q5_1 (-1.4%), and q4_K, which gains on a 4B and loses on an 8B
+            default: break;
+        }
+    }
+
+    // the tile also needs enough output rows, not just enough tokens. Halving the simdgroups per
+    // threadgroup costs more where the rows run out: on 64 lanes 2560 rows lose 7 to 10% at 512
+    // tokens while 4096 and up keep winning
+    static const int ne0_floor_env = []() {
         const char * s = TOSH_ENV("TOSH_MM_NE0_FLOOR");
         return s ? atoi(s) : 0;
     }();
+
+    int ne0_floor = ne0_floor_env ? ne0_floor_env : (simd_width == 64 ? 4096 : 2048);
+    if (!ne0_floor_env && simd_width == 64) {
+        switch (tsrc0) {
+            // these two win with the shorter weights the 64-lane tile now handles; q4_K and
+            // q6_K measured worse there and keep the higher floor
+            case GGML_TYPE_Q8_0:
+            case GGML_TYPE_Q4_0: ne0_floor = 2048; break;
+            default: break;
+        }
+    }
+
+    static const int wide_ext_floor_env = []() {
         const char * s = TOSH_ENV("TOSH_MM_WIDE_EXT_FLOOR");
+        return s ? atoi(s) : 0;
+    }();
+    const int wide_ext_floor = wide_ext_floor_env ? wide_ext_floor_env : 2048;
+
+    bool wide = use_mm_manual && !has_tensor && !narrow && tsrc1 == GGML_TYPE_F32 && wide_width_ok &&
                 op->ne[1] >= wide_floor && (op->ne[0] >= ne0_floor || TOSH_ENV("TOSH_MM_NE0_FLOOR_DISABLE") != nullptr) &&
                 TOSH_ENV("TOSH_MM_WIDE_DISABLE") == nullptr;
     if (wide) {
@@ -1047,11 +1128,27 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
             case GGML_TYPE_Q2_K:
             case GGML_TYPE_Q3_K:
             case GGML_TYPE_Q4_K:
+            // these leave the registers the 64 accumulators need; iq3_xxs, iq2_xs,
+            // iq2_xxs and iq1_m do not, so they keep the narrow tile
+
+            case GGML_TYPE_Q6_K:
+            case GGML_TYPE_Q4_0:
+            case GGML_TYPE_Q4_1:
+            case GGML_TYPE_MXFP4:
+            case GGML_TYPE_IQ4_NL:
+            case GGML_TYPE_IQ4_XS:
+            case GGML_TYPE_IQ3_S:
+            case GGML_TYPE_IQ2_S:
+            case GGML_TYPE_IQ1_S:
             case GGML_TYPE_IQ1_M:
             case GGML_TYPE_IQ2_XXS:
             case GGML_TYPE_IQ2_XS:
             case GGML_TYPE_IQ3_XXS:
+                // third floor, for the types whose dequant leaves less room: it was picked
+                // against the 32-lane tile too, so TOSH_MM_WIDE_EXT_FLOOR opens it for sweeping
                 wide = op->ne[0] >= wide_ext_floor && TOSH_ENV("TOSH_MM_WIDE_EXT_DISABLE") == nullptr; break;
+            // f32 and bf16 have never been through this gate; the override opens them so the
+            // exclusion can be measured instead of inherited
             default: wide = TOSH_ENV("TOSH_MM_WIDE_ALL") != nullptr && op->ne[0] >= wide_ext_floor; break;
         }
     }
@@ -1061,9 +1158,24 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     const bool acc_f32 = use_mm_manual && (!ggml_is_contiguous(op->src[0]) || tsrc0 == GGML_TYPE_BF16) &&
                          TOSH_ENV("TOSH_MM_ACC_F32_DISABLE") == nullptr;
 
+    // iq4_nl is the one type this kernel does not suit at every batch: it costs 3.9% at 256
+    // tokens and gains 1.0% at 512, so it takes a floor rather than lose the gain.
+    static const int w64_floor_env = []() {
         const char * s = TOSH_ENV("TOSH_MM_W64_FLOOR");
+        return s ? atoi(s) : 0;
+    }();
+    const int w64_floor = w64_floor_env ? w64_floor_env :
+                          (tsrc0 == GGML_TYPE_IQ4_NL ? 384 : 0);
+
+                     op->ne[1] >= w64_floor &&
                      TOSH_ENV("TOSH_MM_W64_DISABLE") == nullptr;
+    // measured on 32 lanes only; the 64-lane tile lives in its own kernel
+    const bool uniform_scale = (tsrc0 == GGML_TYPE_Q4_K || tsrc0 == GGML_TYPE_Q5_K) && wide && !w64 &&
+                               use_mm_manual && !has_tensor && simd_width == 32 &&
                                TOSH_ENV("TOSH_MM_UNIFORM_SCALE_DISABLE") == nullptr;
+
+    snprintf(name, 256, "%s_bci=%d_bco=%d_ne12=%d_ne13=%d_r2=%d_r3=%d_mm=%d_db=%d_af=%d_us=%d",
+             base, bc_inp, bc_out, ne12, ne13, r2, r3, use_mm_manual + 2*narrow, use_mm_double_buffer, acc_f32, uniform_scale);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
@@ -1079,6 +1191,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
         ggml_metal_cv_set_bool(cv, use_mm_manual, FC_MUL_MM + 6);
         ggml_metal_cv_set_bool(cv, use_mm_double_buffer, FC_MUL_MM + 8);
         ggml_metal_cv_set_bool(cv, acc_f32, FC_MUL_MM + 9);
+        ggml_metal_cv_set_bool(cv, uniform_scale, FC_MUL_MM + 10);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 
@@ -1738,19 +1851,55 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id(ggml_m
     // src1 prec [TAG_GGML_PREC]
     const bool amax = ggml_get_op_params_i32(op, 3) == GGML_PREC_F32;
 
-    snprintf(base, 256, "kernel_mul_mm_id_%s_%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
-    snprintf(name, 256, "%s_bci=%d_amax=%d", base, bc_inp, amax);
+    // a rescaled src1 still overflows the half partial sums, so those ops accumulate in float
+    const bool acc_f32 = use_mm_manual && (!ggml_is_contiguous(op->src[0]) || tsrc0 == GGML_TYPE_BF16 || amax) &&
                          TOSH_ENV("TOSH_MM_ACC_F32_DISABLE") == nullptr;
 
+    // one grid per expert already keeps the GPU in threadgroups, so the 8x4 tile does not need
+    // the dense token floor. What it needs is an average expert that fills the narrow tile:
+    // below that its 64 columns are mostly padding and it loses (measured -5% at 14 tokens
+    // per expert, +2.3% at 45)
+    static const int wide_floor = []() {
         const char * s = TOSH_ENV("TOSH_MMID_WIDE_FLOOR");
+        return s ? atoi(s) : 32;
+    }();
+
+    // wave64 is off by the dense tile's result, not by one measured here: the expert path splits
+    // its work per expert, so the opt-in exists for a GCN card to settle it
+    const int simd_width = ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->simd_width;
     const bool wide_width_ok = simd_width != 64 || TOSH_ENV("TOSH_MMID_WIDE_W64_ENABLE") != nullptr;
 
+    const int64_t tpe = op->src[0]->ne[2] > 0 ? op->src[2]->ne[0]*op->src[2]->ne[1] / op->src[0]->ne[2] : 0;
+
+    bool wide = use_mm_manual && tsrc1 == GGML_TYPE_F32 && wide_width_ok &&
                 tpe >= wide_floor && TOSH_ENV("TOSH_MMID_WIDE_DISABLE") == nullptr;
+    if (wide) {
+        // it needs 64 accumulators, so only where the dequant leaves the registers
+        switch (tsrc0) {
+            case GGML_TYPE_F16:
+            case GGML_TYPE_Q4_0:
+            case GGML_TYPE_Q4_1:
+            case GGML_TYPE_Q5_0:
+            case GGML_TYPE_Q5_1:
+            case GGML_TYPE_Q8_0:
+            case GGML_TYPE_MXFP4:
+            case GGML_TYPE_Q2_K:
+            case GGML_TYPE_Q3_K:
+            case GGML_TYPE_Q4_K:
+            case GGML_TYPE_Q5_K:
+            case GGML_TYPE_Q6_K:
+            case GGML_TYPE_IQ3_S:
+            case GGML_TYPE_IQ2_S:
+            case GGML_TYPE_IQ1_S:
+            case GGML_TYPE_IQ4_NL:
             case GGML_TYPE_IQ4_XS:
             case GGML_TYPE_IQ1_M:
             case GGML_TYPE_IQ2_XXS:
             case GGML_TYPE_IQ2_XS:
             case GGML_TYPE_IQ3_XXS: break;
+            default: wide = false; break;
+        }
+    }
                      TOSH_ENV("TOSH_MMID_W64_DISABLE") == nullptr;
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
@@ -1760,6 +1909,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id(ggml_m
         ggml_metal_cv_set_bool(cv, bc_inp,        FC_MUL_MM + 0);
         ggml_metal_cv_set_bool(cv, use_mm_manual, FC_MUL_MM + 6);
         ggml_metal_cv_set_bool(cv, acc_f32,       FC_MUL_MM + 9);
+        ggml_metal_cv_set_bool(cv, amax,          FC_MUL_MM + 11);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 
@@ -1767,6 +1917,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id(ggml_m
     }
 
     res.smem = 8192;
+    res.nr0  = 64;
+    res.nr1  = wide ? 64 : 32;
 
     return res;
 }
@@ -1787,6 +1939,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
     const ggml_type tsrc0 = op->src[0]->type;
     const ggml_type tsrc1 = op->src[1]->type;
 
+    const int simd_width = ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->simd_width;
     const char * suffix = "";
 
 

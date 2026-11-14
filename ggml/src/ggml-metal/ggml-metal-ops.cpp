@@ -3169,8 +3169,31 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
 
             ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
-            ggml_metal_encoder_dispatch_threadgroups(enc, (ne21 + 31)/32, (ne01 + 63)/64, ne02, 128, 1, 1);
+            const int nr1 = pipeline.nr1;
+
+            int ntg0 = (ne21 + nr1 - 1)/nr1;
+
+            // a 64-lane card hands consecutive threadgroups to its four shader engines in turn,
+            // and only the first token tile of an expert has work while the experts stay narrower
+            // than the tile, so the working threadgroups sit one every ntg0. An even ntg0 parks
+            // them on half the engines and a multiple of four on a single one (measured 1.8x and
+            // 3.4x). One inert tile restores the spread; it returns before reading anything.
+            if (props_dev->simd_width == 64 && ntg0 % 2 == 0 &&
                 TOSH_ENV("TOSH_MMID_ODD_GRID_DISABLE") == nullptr) {
+                ntg0 += 1;
+            }
+
+            // on 32 lanes these tile counts leave part of the card idle, and one or two more inert
+            // tiles avoid them; like the tile above they return before reading anything
+            if (props_dev->simd_width == 32 && TOSH_ENV("TOSH_MMID_RDNA2_GRID_DISABLE") == nullptr) {
+                if (ntg0 == 3 || ntg0 == 5) {
+                    ntg0 += 1;
+                } else if (ntg0 == 9 || ntg0 == 10) {
+                    ntg0 = 11;
+                }
+            }
+
+            ggml_metal_encoder_dispatch_threadgroups(enc, ntg0, (ne01 + 63)/64, ne02_run, 128, 1, 1);
         }
     } else {
         auto pipeline = ggml_metal_library_get_pipeline_mul_mv_id(lib, op);
