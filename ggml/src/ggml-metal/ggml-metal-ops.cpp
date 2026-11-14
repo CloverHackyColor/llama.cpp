@@ -788,6 +788,36 @@ int ggml_metal_op_concat(ggml_metal_op_t ctx, int idx) {
 
     const int32_t dim = ((const int32_t *) op->op_params)[0];
 
+    // a short state ahead of a transposed f32 view (the conv input of the recurrent models)
+    const ggml_metal_device_props * props_cat = ggml_metal_device_get_props(ctx->dev);
+    if (props_cat->simd_width == 32 && !props_cat->has_unified_memory && dim == 0 &&
+        op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+        nb0 == sizeof(float) && nb11 == sizeof(float) && nb10 > nb11 && ne00 <= 64 && ne10 >= 32 && ne1 >= 32 &&
+        TOSH_ENV("TOSH_CONCAT_TRANSPOSE_DISABLE") == nullptr) {
+        ggml_metal_kargs_concat args = {
+            /*.ne00 =*/ ne00, /*.ne01 =*/ ne01, /*.ne02 =*/ ne02, /*.ne03 =*/ ne03,
+            /*.nb00 =*/ nb00, /*.nb01 =*/ nb01, /*.nb02 =*/ nb02, /*.nb03 =*/ nb03,
+            /*.ne10 =*/ ne10, /*.ne11 =*/ ne11, /*.ne12 =*/ ne12, /*.ne13 =*/ ne13,
+            /*.nb10 =*/ nb10, /*.nb11 =*/ nb11, /*.nb12 =*/ nb12, /*.nb13 =*/ nb13,
+            /*.ne0  =*/ ne0,  /*.ne1  =*/ ne1,  /*.ne2  =*/ ne2,  /*.ne3  =*/ ne3,
+            /*.nb0  =*/ nb0,  /*.nb1  =*/ nb1,  /*.nb2  =*/ nb2,  /*.nb3  =*/ nb3,
+            /*.dim  =*/ dim,
+            /*.nc0  =*/ 1,
+        };
+        ggml_metal_pipeline_with_params pipeline = ggml_metal_library_get_pipeline(lib, "kernel_concat_t0_f32");
+        if (!pipeline.pipeline) {
+            pipeline = ggml_metal_library_compile_pipeline(lib, "kernel_concat_t0_f32", "kernel_concat_t0_f32", nullptr);
+        }
+        ggml_metal_encoder_set_pipeline(enc, pipeline);
+        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+        ggml_metal_encoder_set_threadgroup_memory_size(enc, 32*33*sizeof(float), 0);
+        ggml_metal_encoder_dispatch_threadgroups(enc, (ne10 + 31)/32, (ne1 + 31)/32, ne2*ne3, 32, 8, 1);
+        return 1;
+    }
+
     const bool is_q = ggml_is_quantized(op->type);
 
     // for quantized types, concat is done at the block level (nb0 == type_size == block size)
@@ -3027,7 +3057,13 @@ int ggml_metal_op_cpy(ggml_metal_op_t ctx, int idx) {
         return 1;
     }
 
-    auto pipeline = ggml_metal_library_get_pipeline_cpy(lib, op->src[0]->type, op->type, false);
+    const auto f32_f16 = [](ggml_type t) { return t == GGML_TYPE_F32 || t == GGML_TYPE_F16; };
+    const bool flat = props_cpy->simd_width == 32 && !props_cpy->has_unified_memory &&
+                      f32_f16(op->src[0]->type) && f32_f16(op->type) && ggml_is_contiguous(op) &&
+                      (ne00 != ne0 || ne01 != ne1 || ne02 != ne2) && TOSH_ENV("TOSH_CPY_FLAT_DISABLE") == nullptr;
+
+    auto pipeline = flat ? ggml_metal_library_get_pipeline_cpy_flat(lib, op->src[0]->type, op->type)
+                         : ggml_metal_library_get_pipeline_cpy(lib, op->src[0]->type, op->type, false);
 
     GGML_ASSERT(ne00 % ggml_blck_size(op->src[0]->type) == 0);
 

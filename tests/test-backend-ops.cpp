@@ -6753,6 +6753,54 @@ struct test_conv_3d : public test_case {
 };
 
 // GGML_OP_CONCAT
+// a short state ahead of a transposed view along dim 0, as the recurrent models build their conv input
+struct test_concat_transposed : public test_case {
+    const std::array<int64_t, 3> ne_a; // {state, rows, seqs}
+    const int64_t n_t;
+
+    std::string vars() override {
+        return VARS_TO_STR2(ne_a, n_t);
+    }
+
+    test_concat_transposed(std::array<int64_t, 3> ne_a = {3, 100, 2}, int64_t n_t = 70)
+        : ne_a(ne_a), n_t(n_t) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne_a[0], ne_a[1], ne_a[2]);
+        ggml_set_name(a, "a");
+
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne_a[1], n_t, ne_a[2]);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out = ggml_concat(ctx, a, ggml_transpose(ctx, b), 0);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
+// a strided view copied into a contiguous tensor of another shape, as a gate split from a joint projection
+struct test_cont_reshape : public test_case {
+    const std::array<int64_t, 3> ne; // {head, heads, tokens}
+
+    std::string vars() override {
+        return VARS_TO_STR1(ne);
+    }
+
+    test_cont_reshape(std::array<int64_t, 3> ne = {64, 4, 33}) : ne(ne) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * full = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2*ne[0], ne[1], ne[2]);
+        ggml_set_name(full, "full");
+
+        ggml_tensor * half = ggml_view_3d(ctx, full, ne[0], ne[1], ne[2], full->nb[1], full->nb[2], ne[0]*ggml_element_size(full));
+        ggml_tensor * out = ggml_cont_2d(ctx, half, ne[0]*ne[1], ne[2]);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 struct test_concat : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne_a;
@@ -11100,6 +11148,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+
+    test_cases.emplace_back(new test_concat_transposed({3, 100, 2}, 70));
+    test_cases.emplace_back(new test_concat_transposed({3, 8192, 1}, 512));
+    test_cases.emplace_back(new test_concat_transposed({2, 64, 1}, 32));
+    test_cases.emplace_back(new test_concat_transposed({7, 33, 3}, 95));
+    test_cases.emplace_back(new test_cont_reshape({64, 4, 33}));
+    test_cases.emplace_back(new test_cont_reshape({256, 16, 512}));
+    test_cases.emplace_back(new test_cont_reshape({100, 3, 7}));
 
     // few long rows, which backends may split across workgroups
     for (int dim : { 0, 1 }) {

@@ -97,6 +97,35 @@ template [[host_name("kernel_cpy_bf16_bf16")]] kernel kernel_cpy_t kernel_cpy_t_
 #endif
 template [[host_name("kernel_cpy_bf16e_f32")]]  kernel kernel_cpy_t kernel_cpy_t_t<bf16e,   float>;
 
+// into a contiguous destination of another shape a row lands at its linear index, without the divisions above
+template<typename T0, typename T1>
+kernel void kernel_cpy_flat_t_t(
+        constant ggml_metal_kargs_cpy & args,
+        device  const char * src0,
+        device        char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    const int32_t i03 = tgpig[2];
+    const int32_t i02 = tgpig[1];
+    const int32_t i01 = ntg[1] == 1 ? tgpig[0]%args.ne01 : tgpig[0]*ntg[1] + tpitg.y;
+    const int32_t iw0 = ntg[1] == 1 ? tgpig[0]/args.ne01 : 0;
+    const int32_t i00 = iw0*ntg[0] + tpitg.x;
+
+    if (i01 >= args.ne01 || i00 >= args.ne00) {
+        return;
+    }
+
+    const int64_t n = (((int64_t) i03*args.ne02 + i02)*args.ne01 + i01)*args.ne00 + i00;
+
+    ((device T1 *) dst)[n] = (T1) *(device const T0 *) (src0 + i03*args.nb03 + i02*args.nb02 + i01*args.nb01 + i00*args.nb00);
+}
+
+template [[host_name("kernel_cpy_flat_f32_f32")]] kernel kernel_cpy_t kernel_cpy_flat_t_t<float, float>;
+template [[host_name("kernel_cpy_flat_f32_f16")]] kernel kernel_cpy_t kernel_cpy_flat_t_t<float, half>;
+template [[host_name("kernel_cpy_flat_f16_f32")]] kernel kernel_cpy_t kernel_cpy_flat_t_t<half,  float>;
+template [[host_name("kernel_cpy_flat_f16_f16")]] kernel kernel_cpy_t kernel_cpy_flat_t_t<half,  half>;
+
 template<short QK,
          typename block_q,
          void (*quantize_func)(device const float *, device block_q &)>
@@ -617,6 +646,51 @@ kernel void kernel_cpy_transpose_f32(
         const int i1 = b1 + ty + k;
         if (i0 < args.ne00 && i1 < args.ne01) {
             *(device float *) (dst + i3*args.nb3 + i2*args.nb2 + (uint64_t) i1*args.nb1 + (uint64_t) i0*args.nb0) = tile[tx*33 + ty + k];
+        }
+    }
+}
+
+// concat along dim 0 of a few leading columns and a transposed f32 view: the view goes through the same 32x32 tiles
+kernel void kernel_concat_t0_f32(
+        constant ggml_metal_kargs_concat & args,
+        device  const char * src0,
+        device  const char * src1,
+        device        char * dst,
+        threadgroup  float * tile [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]]) {
+    const int b0 = tgpig.x*32;
+    const int b1 = tgpig.y*32;
+    const int i2 = tgpig.z % args.ne2;
+    const int i3 = tgpig.z / args.ne2;
+    const int tx = tpitg.x;
+    const int ty = tpitg.y;
+
+    device char * drow = dst + i3*args.nb3 + i2*args.nb2;
+
+    if (tgpig.x == 0) {
+        for (int e = ty*32 + tx; e < 32*args.ne00; e += 256) {
+            const int i1 = b1 + e/args.ne00;
+            const int j  = e%args.ne00;
+            if (i1 < args.ne1) {
+                *(device float *) (drow + (uint64_t) i1*args.nb1 + (uint64_t) j*args.nb0) =
+                    *(device const float *) (src0 + i3*args.nb03 + i2*args.nb02 + (uint64_t) i1*args.nb01 + (uint64_t) j*args.nb00);
+            }
+        }
+    }
+
+    FOR_UNROLL (short k = 0; k < 32; k += 8) {
+        const int j0 = b0 + ty + k;
+        const int i1 = b1 + tx;
+        tile[(ty + k)*33 + tx] = j0 < args.ne10 && i1 < args.ne1 ?
+            *(device const float *) (src1 + i3*args.nb13 + i2*args.nb12 + (uint64_t) i1*args.nb11 + (uint64_t) j0*args.nb10) : 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    FOR_UNROLL (short k = 0; k < 32; k += 8) {
+        const int j0 = b0 + tx;
+        const int i1 = b1 + ty + k;
+        if (j0 < args.ne10 && i1 < args.ne1) {
+            *(device float *) (drow + (uint64_t) i1*args.nb1 + (uint64_t) (args.ne00 + j0)*args.nb0) = tile[tx*33 + ty + k];
         }
     }
 }
