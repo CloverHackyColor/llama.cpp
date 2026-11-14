@@ -587,3 +587,36 @@ typedef decltype(kernel_set_rows_q<float, int64_t, QK_K, block_tq2_0, quantize_t
 template [[host_name("kernel_set_rows_f32_i64_tq2_0")]]  kernel set_rows_qK_t kernel_set_rows_q<float, int64_t, QK_K, block_tq2_0, quantize_tq2_0>;
 template [[host_name("kernel_set_rows_f32_i32_tq2_0")]]  kernel set_rows_qK_t kernel_set_rows_q<float, int32_t, QK_K, block_tq2_0, quantize_tq2_0>;
 
+
+// a transposed f32 view into a contiguous tensor, 32x32 tiles through threadgroup memory: the reads run along the
+// source rows and the writes along the destination rows, where the element-wise copy strides one of them
+kernel void kernel_cpy_transpose_f32(
+        constant ggml_metal_kargs_cpy & args,
+        device  const char * src0,
+        device        char * dst,
+        threadgroup  float * tile [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]]) {
+    const int b0 = tgpig.x*32;
+    const int b1 = tgpig.y*32;
+    const int i2 = tgpig.z % args.ne02;
+    const int i3 = tgpig.z / args.ne02;
+    const int tx = tpitg.x;
+    const int ty = tpitg.y;
+
+    // src(i0, i1) with i1 contiguous
+    FOR_UNROLL (short k = 0; k < 32; k += 8) {
+        const int i0 = b0 + ty + k;
+        const int i1 = b1 + tx;
+        tile[(ty + k)*33 + tx] = i0 < args.ne00 && i1 < args.ne01 ?
+            *(device const float *) (src0 + i3*args.nb03 + i2*args.nb02 + (uint64_t) i1*args.nb01 + (uint64_t) i0*args.nb00) : 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    FOR_UNROLL (short k = 0; k < 32; k += 8) {
+        const int i0 = b0 + tx;
+        const int i1 = b1 + ty + k;
+        if (i0 < args.ne00 && i1 < args.ne01) {
+            *(device float *) (dst + i3*args.nb3 + i2*args.nb2 + (uint64_t) i1*args.nb1 + (uint64_t) i0*args.nb0) = tile[tx*33 + ty + k];
+        }
+    }
+}

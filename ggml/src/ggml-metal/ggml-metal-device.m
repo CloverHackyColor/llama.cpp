@@ -2701,6 +2701,96 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             // wave64: norm/rms_norm kernels are width-agnostic (simd_sum + shmem sized by
             // the real width), so allow them on GPU behind the decode opt-in.
             return (has_simdgroup_reduction || wave64_decode) && (ggml_is_contiguous_rows(op->src[0]));
+        // the backward kernels reduce with 32-lane shared memory, so 64-lane GPUs keep them on the CPU
+        case GGML_OP_RMS_NORM_BACK:
+            return has_simdgroup_reduction && dev->props.simd_width == 32 &&
+                   op->type == GGML_TYPE_F32 &&
+                   op->src[0] != NULL && op->src[1] != NULL &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F32 &&
+                   op->ne[0] % 4 == 0 &&
+                   ggml_is_contiguous_1(op->src[0]) &&
+                   ggml_is_contiguous_1(op->src[1]) &&
+                   ggml_is_contiguous_1(op) &&
+                   ggml_are_same_shape(op, op->src[0]) &&
+                   ggml_are_same_shape(op, op->src[1]);
+        case GGML_OP_REPEAT_BACK:
+            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32;
+        // the training loss kernels reduce with 32-lane shared memory, so 64-lane GPUs keep them on the CPU
+        case GGML_OP_CROSS_ENTROPY_ROWS:
+            return has_simdgroup_reduction && dev->props.simd_width == 32 &&
+                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) && ggml_is_contiguous(op);
+        case GGML_OP_CROSS_ENTROPY_ROWS_BACK:
+            return has_simdgroup_reduction && dev->props.simd_width == 32 &&
+                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
+                   ggml_is_contiguous(op->src[2]) && ggml_is_contiguous(op);
+        case GGML_OP_FLASH_ATTN_EXT_BACK:
+            {
+                const struct ggml_tensor * q = op->src[0];
+                const struct ggml_tensor * k = op->src[1];
+                const struct ggml_tensor * v = op->src[2];
+                const struct ggml_tensor * m = op->src[3];
+                const int64_t d = k->ne[0];
+                return has_simdgroup_reduction && dev->props.simd_width == 32 &&
+                       (d == 64 || d == 128 || d == 256) && v->ne[0] == d && q->ne[0] == d &&
+                       q->type == GGML_TYPE_F32 && (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16) && v->type == k->type &&
+                       op->src[4]->type == GGML_TYPE_F32 && op->src[5]->type == GGML_TYPE_F32 &&
+                       (!m || m->type == GGML_TYPE_F16) &&
+                       q->nb[0] == sizeof(float) && k->nb[0] == ggml_type_size(k->type) && v->nb[0] == ggml_type_size(v->type) &&
+                       op->src[4]->nb[0] == sizeof(float) && op->src[5]->nb[0] == sizeof(float) &&
+                       ggml_is_contiguous(op);
+            }
+        case GGML_OP_OUT_PROD:
+            {
+                // the transposed loader is written for the manual 32-lane GEMM only
+                const struct ggml_tensor * a = op->src[0];
+                const struct ggml_tensor * b = op->src[1];
+                const bool flat = a->ne[2] == 1 && a->ne[3] == 1 && b->ne[2] == 1 && b->ne[3] == 1 &&
+                                  op->type == GGML_TYPE_F32 && ggml_is_contiguous(op);
+                if (flat && a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 && a->nb[0] == sizeof(float) &&
+                    b->nb[0] == sizeof(float) && (a->ne[0] <= 32 || b->ne[0] <= 32)) {
+                    return true;
+                }
+                return dev->props.use_mm_manual && dev->props.simd_width == 32 && dev->props.has_bfloat &&
+                       (a->type == GGML_TYPE_Q8_0 || a->type == GGML_TYPE_F16 || a->type == GGML_TYPE_F32) &&
+                       a->nb[0] == ggml_type_size(a->type) && a->ne[0] % 32 == 0 &&
+                       b->type == GGML_TYPE_F32 && b->nb[1] == sizeof(float) && b->nb[0] % 16 == 0 &&
+                       a->ne[2] == op->ne[2] && a->ne[3] == op->ne[3] && b->ne[2] == op->ne[2] && b->ne[3] == op->ne[3] &&
+                       op->type == GGML_TYPE_F32 && ggml_is_contiguous(op);
+            }
+        case GGML_OP_GATED_DELTA_NET_BACK:
+            {
+                bool ok = has_simdgroup_reduction && dev->props.simd_width == 32 &&
+                          dev->props.max_theadgroup_memory_size >= 52*1024 &&
+                          op->src[2]->ne[0] == 128 && op->src[0]->ne[0] == 128 && op->src[3]->ne[0] == 1 &&
+                          ggml_is_contiguous(op->src[5]) && ggml_is_contiguous(op->src[6]);
+                for (int i = 0; i < 7; ++i) {
+                    ok = ok && op->src[i]->type == GGML_TYPE_F32 && op->src[i]->nb[0] == sizeof(float);
+                }
+                return ok;
+            }
+        case GGML_OP_COUNT_EQUAL_MASKED:
+            return has_simdgroup_reduction && dev->props.simd_width == 32 &&
+                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) && ggml_is_contiguous(op->src[2]);
+        case GGML_OP_SOFT_MAX_BACK:
+            {
+                if (!has_simdgroup_reduction || dev->props.simd_width != 32 ||
+                    op->type != GGML_TYPE_F32 ||
+                    op->src[0] == NULL || op->src[1] == NULL ||
+                    op->src[0]->type != GGML_TYPE_F32 ||
+                    op->src[1]->type != GGML_TYPE_F32 ||
+                    !ggml_is_contiguous_1(op->src[0]) ||
+                    !ggml_is_contiguous_1(op->src[1]) ||
+                    !ggml_is_contiguous_1(op) ||
+                    !ggml_are_same_shape(op, op->src[0]) ||
+                    !ggml_are_same_shape(op, op->src[1])) {
+                    return false;
+                }
+
+                float max_bias = 0.0f;
+                memcpy(&max_bias, ((const float *) op->op_params) + 1, sizeof(float));
+                return max_bias == 0.0f;
+            }
         case GGML_OP_ROPE:
         case GGML_OP_ROPE_BACK:
             return true;
@@ -2771,8 +2861,11 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 const enum ggml_type vt = op->src[2]->type;
                 const bool k_turbo = (kt == GGML_TYPE_TURBO2_0 || kt == GGML_TYPE_TURBO3_0 || kt == GGML_TYPE_TURBO4_0);
                 const bool v_turbo = (vt == GGML_TYPE_TURBO2_0 || vt == GGML_TYPE_TURBO3_0 || vt == GGML_TYPE_TURBO4_0);
-                const bool k_std = (kt == GGML_TYPE_F16 || kt == GGML_TYPE_Q8_0 || kt == GGML_TYPE_Q4_0 || k_turbo);
-                const bool v_std = (vt == GGML_TYPE_F16 || vt == GGML_TYPE_Q8_0 || vt == GGML_TYPE_Q4_0 || v_turbo);
+                // f32 K/V only have prefill and tile kernels, which need enough queries to be picked
+                const bool kv_f32 = kt == GGML_TYPE_F32 && vt == GGML_TYPE_F32 && dev->props.simd_width == 32 &&
+                                    op->src[0]->ne[1] >= 32;
+                const bool k_std = (kt == GGML_TYPE_F16 || kt == GGML_TYPE_Q8_0 || kt == GGML_TYPE_Q4_0 || k_turbo || kv_f32);
+                const bool v_std = (vt == GGML_TYPE_F16 || vt == GGML_TYPE_Q8_0 || vt == GGML_TYPE_Q4_0 || v_turbo || kv_f32);
                 const int64_t dk = op->src[0]->ne[0];
                 // Turbo KV is instantiated for every supported 128-element padded head.
                 const bool turbo_dk_ok = (!k_turbo && !v_turbo) ||

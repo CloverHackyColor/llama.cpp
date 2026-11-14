@@ -4086,6 +4086,38 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
     }
 #endif
 
+    // TOSH_CB_MAX_NODES=N: command buffers of at most N nodes, so a long graph does not block the display
+    static int cb_max_nodes = -1;
+    if (cb_max_nodes < 0) {
+        const char * v = TOSH_ENV("TOSH_CB_MAX_NODES");
+        cb_max_nodes = v ? MAX(0, atoi(v)) : 0;
+    }
+    if (cb_max_nodes > 0 && gf->n_nodes > cb_max_nodes && ctx->capture_compute <= 0 && !ggml_metal_merge_graph()) {
+        @autoreleasepool {
+            ctx->gf = gf;
+            for (int i0 = 0; i0 < gf->n_nodes; i0 += cb_max_nodes) {
+                const int i1 = MIN(i0 + cb_max_nodes, gf->n_nodes);
+
+                id<MTLCommandBuffer> cmd_buf = [ctx->queue commandBufferWithUnretainedReferences];
+                ggml_metal_encode_pending_waits(ctx, cmd_buf);
+
+                ggml_metal_op_t ctx_op = ggml_metal_op_init(ctx->dev, cmd_buf, gf, ctx->finfo, i0, i1,
+                        ctx->use_concurrency, false, ctx->debug_graph);
+                for (int idx = 0; idx < ggml_metal_op_n_nodes(ctx_op); ++idx) {
+                    const int res = ggml_metal_op_encode(ctx_op, idx);
+                    if (res == 0) {
+                        break;
+                    }
+                    idx += res - 1;
+                }
+                ggml_metal_op_free(ctx_op);
+
+                ggml_metal_cmd_buf_submit(ctx, cmd_buf);
+            }
+        }
+        return GGML_STATUS_SUCCESS;
+    }
+
     // number of nodes encoded by the main thread (empirically determined)
     // the split was tuned on unified memory; TOSH_N_MAIN overrides it to A/B the share here
     static int n_main_env = -2;

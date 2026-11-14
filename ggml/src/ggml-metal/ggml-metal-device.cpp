@@ -866,6 +866,73 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net(
     return res;
 }
 
+// out_prod on the manual GEMM: src0 read transposed, the 64x64 tile of 8 simdgroups, f32 accumulation
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_ta(ggml_metal_library_t lib, const ggml_tensor * op, bool cs) {
+    char base[256];
+    char name[256];
+
+    const ggml_type tsrc0 = op->src[0]->type;
+    const int64_t   K     = op->src[0]->ne[1];
+
+    const bool bc_inp = K % 32 != 0;
+    const bool double_buffer = TOSH_ENV("GGML_METAL_MM_DOUBLE_BUFFER_DISABLE") == nullptr;
+
+    const int16_t ne12 = (int16_t) op->ne[2];
+    const int16_t ne13 = (int16_t) op->ne[3];
+
+    // with the column scales the gradient fits the half tile of the forward kernel and its packed accumulators
+    if (cs) {
+        snprintf(base, 256, "kernel_mul_mm_%s_f32", ggml_type_name(tsrc0));
+    } else if (tsrc0 == GGML_TYPE_F32) {
+        snprintf(base, 256, "kernel_mul_mm_f32_f32_gb");
+    } else {
+        snprintf(base, 256, "kernel_mul_mm_ta_%s_f32", ggml_type_name(tsrc0));
+    }
+    snprintf(name, 256, "%s_ta_cs=%d_bci=%d_ne12=%d_ne13=%d_db=%d", base, cs, bc_inp, ne12, ne13, double_buffer);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+
+        ggml_metal_cv_set_bool (cv, bc_inp, FC_MUL_MM + 0);
+        ggml_metal_cv_set_bool (cv, false,  FC_MUL_MM + 1);
+        ggml_metal_cv_set_int16(cv, ne12,   FC_MUL_MM + 2);
+        ggml_metal_cv_set_int16(cv, ne13,   FC_MUL_MM + 3);
+        ggml_metal_cv_set_int16(cv, 1,      FC_MUL_MM + 4);
+        ggml_metal_cv_set_int16(cv, 1,      FC_MUL_MM + 5);
+        ggml_metal_cv_set_bool (cv, true,   FC_MUL_MM + 6);
+        ggml_metal_cv_set_bool (cv, false,  FC_MUL_MM + 7);
+        ggml_metal_cv_set_bool (cv, double_buffer, FC_MUL_MM + 8);
+        ggml_metal_cv_set_bool (cv, !cs,    FC_MUL_MM + 9);
+        ggml_metal_cv_set_bool (cv, false,  FC_MUL_MM + 10);
+        ggml_metal_cv_set_bool (cv, true,   FC_MUL_MM + 12);
+        ggml_metal_cv_set_bool (cv, cs,     FC_MUL_MM + 13);
+
+        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+
+        ggml_metal_cv_free(cv);
+    }
+
+    res.nr0  = 64;
+    res.nr1  = 64;
+    res.nsg  = 8;
+    res.smem = double_buffer ? 16384 : 8192;
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net_back(ggml_metal_library_t lib, const char * stage) {
+    char name[256];
+    snprintf(name, 256, "kernel_gated_delta_net_back_%s", stage);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_turbo_wht(ggml_metal_library_t lib) {
     const char * name = "kernel_turbo_wht";
 
@@ -1264,6 +1331,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     // accumulator. bf16 weights already reach the tile as half, so they sum like f16.
     const bool acc_f32 = use_mm_manual &&
                          (!ggml_is_contiguous(op->src[0]) ||
+                          ggml_get_op_params_i32(op, 1) == GGML_HINT_GRADIENT ||
                           (tsrc0 == GGML_TYPE_BF16 && TOSH_ENV("TOSH_MM_BF16_ACC_F32") != nullptr)) &&
                          TOSH_ENV("TOSH_MM_ACC_F32_DISABLE") == nullptr;
 
@@ -1282,7 +1350,15 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
                      op->ne[1] >= w64_floor &&
                      TOSH_ENV("TOSH_MM_W64_DISABLE") == nullptr;
 
-    snprintf(base, 256, "kernel_mul_mm_%s_%s%s%s", ggml_metal_tname_pair(lib, tsrc0, tsrc1), ggml_type_name(tsrc1), wide ? "_w" : "", w64 ? "_w64" : "");
+    // a gradient can pass the half range: its f32 operand goes through the bfloat tile instead
+    const bool grad_bf16 = acc_f32 && !w64 && ggml_get_op_params_i32(op, 1) == GGML_HINT_GRADIENT &&
+                           ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->has_bfloat &&
+                           tsrc1 == GGML_TYPE_F32 && (tsrc0 == GGML_TYPE_F32 || tsrc0 == GGML_TYPE_F16) &&
+                           !(wide && tsrc0 == GGML_TYPE_F32) &&
+                           TOSH_ENV("TOSH_MM_GRAD_BF16_DISABLE") == nullptr;
+
+    snprintf(base, 256, "kernel_mul_mm_%s_%s%s%s%s", ggml_metal_tname_pair(lib, tsrc0, tsrc1), ggml_type_name(tsrc1),
+             grad_bf16 ? "_gb" : "", wide ? "_w" : "", w64 ? "_w64" : "");
     // measured on 32 lanes only; the 64-lane tile lives in its own kernel
     const bool uniform_scale = (tsrc0 == GGML_TYPE_Q4_K || tsrc0 == GGML_TYPE_Q5_K) && wide && !w64 &&
                                use_mm_manual && !has_tensor && simd_width == 32 &&
@@ -3854,6 +3930,67 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_count_equal(ggml
 
     res.smem = (size_t) nsg * sizeof(int32_t);
     res.nsg  = nsg;
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_soft_max_back(ggml_metal_library_t lib, const ggml_tensor * op) {
+    assert(op->op == GGML_OP_SOFT_MAX_BACK);
+
+    char base[256];
+    char name[256];
+
+    const char * suffix = (op->src[0]->ne[0] % 4 == 0) ? "_4" : "";
+
+    snprintf(base, 256, "kernel_soft_max_back%s", suffix);
+    snprintf(name, 256, "%s", base);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    res.smem = 32*sizeof(float);
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rms_norm_back(ggml_metal_library_t lib, const ggml_tensor * op) {
+    assert(op->op == GGML_OP_RMS_NORM_BACK);
+    GGML_UNUSED(op);
+
+    char base[256];
+    char name[256];
+
+    snprintf(base, 256, "kernel_rms_norm_back");
+    snprintf(name, 256, "%s", base);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    res.smem = 2*32*sizeof(float);
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_repeat_back(ggml_metal_library_t lib) {
+    const char * name = "kernel_repeat_back_f32";
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_by_name(ggml_metal_library_t lib, const char * name) {
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
 
     return res;
 }

@@ -659,6 +659,7 @@ template [[host_name("kernel_flash_attn_ext_tile_amd_dk" #dk "_" nm)]] kernel fl
     FA_AMD_TILE_INST(512, nm, kt, nkk, dkf, vt, nkv, dvf)
 
 FA_AMD_TILE_PAIR("kf16_vf16",   half4,      1, dequantize_f16_t4,  half4,      1, dequantize_f16_t4)
+FA_AMD_TILE_PAIR("kf32_vf32",   float4,     1, dequantize_f32_t4,  float4,     1, dequantize_f32_t4)
 FA_AMD_TILE_PAIR("kq8_0_vq8_0", block_q8_0, 8, dequantize_q8_0_t4_h2, block_q8_0, 8, dequantize_q8_0_t4_h2)
 FA_AMD_TILE_PAIR("kq4_0_vq4_0", block_q4_0, 8, dequantize_q4_0_t4, block_q4_0, 8, dequantize_q4_0_t4)
 FA_AMD_TILE_PAIR("kq8_0_vf16",  block_q8_0, 8, dequantize_q8_0_t4_h2, half4,      1, dequantize_f16_t4)
@@ -1075,6 +1076,8 @@ template [[host_name("kernel_flash_attn_ext_pf_amd_dk" #dk "_dv" #dv "_" nm)]] k
     FA_AMD_PF_INST(256, 32, 64, nm, kt, nkk, dkf, vt, nkv, dvf)
 
 FA_AMD_PF_PAIR("kf16_vf16",   half4,      1, dequantize_f16_t4,  half4,      1, dequantize_f16_t4)
+// f32 K and V come from training, which reads the K and V of the step instead of a cache
+FA_AMD_PF_PAIR("kf32_vf32",   float4,     1, dequantize_f32_t4,  float4,     1, dequantize_f32_t4)
 FA_AMD_PF_PAIR("kq8_0_vq8_0", block_q8_0, 8, dequantize_q8_0_t4_h2, block_q8_0, 8, dequantize_q8_0_t4_h2)
 FA_AMD_PF_PAIR("kq4_0_vq4_0", block_q4_0, 8, dequantize_q4_0_t4, block_q4_0, 8, dequantize_q4_0_t4)
 FA_AMD_PF_PAIR("kq8_0_vf16",  block_q8_0, 8, dequantize_q8_0_t4_h2, half4,      1, dequantize_f16_t4)

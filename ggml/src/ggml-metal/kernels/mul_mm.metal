@@ -13,6 +13,12 @@ constant bool  FC_mul_mm_double_buffer [[function_constant(FC_MUL_MM + 8)]];
 constant bool  FC_mul_mm_acc_f32 [[function_constant(FC_MUL_MM + 9)]];
 constant bool  FC_mul_mm_uniform_scale [[function_constant(FC_MUL_MM + 10)]];
 constant bool  FC_mul_mm_id_amax [[function_constant(FC_MUL_MM + 11)]];
+// A is read transposed (out_prod): output rows run along a row of src0 and K along its rows
+constant bool  FC_mul_mm_ta_def [[function_constant(FC_MUL_MM + 12)]];
+constant bool  FC_mul_mm_ta = is_function_constant_defined(FC_mul_mm_ta_def) && FC_mul_mm_ta_def;
+// src1 columns arrive scaled by a power of two each, kept after dst, so a gradient fits the half tile
+constant bool  FC_mul_mm_cs_def [[function_constant(FC_MUL_MM + 13)]];
+constant bool  FC_mul_mm_cs = is_function_constant_defined(FC_mul_mm_cs_def) && FC_mul_mm_cs_def;
 
 // each block_q contains 16*nl weights
 #ifdef GGML_METAL_HAS_TENSOR
@@ -211,6 +217,10 @@ kernel void kernel_mul_mm(
         + args.nb11*(r1 + lr1b)
         + args.nb10*iy);
 
+    device const float * cscale = (device const float *) dst + (uint64_t) args.ne0*args.ne1*FC_mul_mm_ne12*FC_mul_mm_ne13 + (uint64_t) im*args.ne1;
+    const float cs  = FC_mul_mm_cs ? cscale[r1 + lr1]  : 1.0f;
+    const float csb = FC_mul_mm_cs && NLR == 8 ? cscale[r1 + lr1b] : 1.0f;
+
     // Manual tiled path for GPUs without simdgroup matrix; simdgroup path otherwise.
     const short lane = tiitg % 32;
     const short lr = lane % 8; // row within an 8-row block of sa
@@ -246,7 +256,33 @@ kernel void kernel_mul_mm(
         threadgroup S1 * sb = (threadgroup S1 *)(shmem + db*8192 + 4096);
 
         // load data and store to threadgroup memory
-        if (is_same<T0_4x4, block_q>::value && FC_mul_mm_bc_inp) {
+        if (FC_mul_mm_ta) {
+            // a thread dequantizes 16 consecutive outputs of one src0 row (one K)
+            const short tk = tiitg >> 2;
+            const short tg = tiitg & 3;
+            const int   kr = loop_k + tk;
+            const int   n0 = r0 + 16*tg;
+
+            S0_4x4 temp_a;
+            temp_a[0] = 0; temp_a[1] = 0; temp_a[2] = 0; temp_a[3] = 0;
+            if (loadA && kr < args.ne00 && n0 < args.ne0) {
+                device const block_q * xb = (device const block_q *) (src0 + offset0 + (uint64_t) kr*args.nb01) + n0/(16*nl);
+                dequantize_func(xb, (n0/16) % nl, temp_a);
+            }
+
+            if (!FC_mul_mm_double_buffer) {
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+
+            if (loadA) {
+                const short sx = tk/8;
+                const short ly = tk%8;
+                FOR_UNROLL (short i = 0; i < 16; i++) {
+                    const short row = 16*tg + i;
+                    *(sa + 64*(8*sx + row/8) + 8*(row%8) + ly) = temp_a[i/4][i%4];
+                }
+            }
+        } else if (is_same<T0_4x4, block_q>::value && FC_mul_mm_bc_inp) {
             if (!FC_mul_mm_double_buffer) {
                 threadgroup_barrier(mem_flags::mem_threadgroup);
             }
@@ -324,12 +360,17 @@ kernel void kernel_mul_mm(
 
             if (FC_mul_mm_bc_inp) {
                 for (short i = 0; i < 8; ++i) {
-                    *(sb + 64*ib + 8*ly + i) = loop_k + iy + i < args.ne00 ? (S1) *((device T1 *) y + i) : 0;
+                    *(sb + 64*ib + 8*ly + i) = loop_k + iy + i < args.ne00 ? (S1) ((float) *((device T1 *) y + i)*cs) : 0;
                 }
                 if (NLR == 8) {
                     for (short i = 0; i < 8; ++i) {
-                        *(sb + 64*(ib + 4) + 8*ly + i) = loop_k + iy + i < args.ne00 ? (S1) *((device T1 *) yb + i) : 0;
+                        *(sb + 64*(ib + 4) + 8*ly + i) = loop_k + iy + i < args.ne00 ? (S1) ((float) *((device T1 *) yb + i)*csb) : 0;
                     }
+                }
+            } else if (FC_mul_mm_cs) {
+                *(threadgroup S1_2x4 *)(sb + 64*ib + 8*ly) = (S1_2x4)(float2x4(*((device T1_2x4 *) y))*cs);
+                if (NLR == 8) {
+                    *(threadgroup S1_2x4 *)(sb + 64*(ib + 4) + 8*ly) = (S1_2x4)(float2x4(*((device T1_2x4 *) yb))*csb);
                 }
             } else {
                 *(threadgroup S1_2x4 *)(sb + 64*ib + 8*ly) = (S1_2x4)(*((device T1_2x4 *) y));
@@ -498,7 +539,7 @@ kernel void kernel_mul_mm(
                 const int row = base_row + 8*rr + lr;
                 const int col = base_col + lc + 4*cc;
                 if (row < args.ne0 && col < args.ne1) {
-                    Dbase[row + (int64_t)col*args.ne0] = acc[rr][cc];
+                    Dbase[row + (int64_t)col*args.ne0] = FC_mul_mm_cs ? acc[rr][cc]/cscale[col] : acc[rr][cc];
                 }
             }
         }
@@ -1251,6 +1292,15 @@ template [[host_name("kernel_mul_mm_q4_K_f32_w")]]    kernel mul_mm_t kernel_mul
 template [[host_name("kernel_mul_mm_f32_f32")]]     kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   float4x4,      1,     dequantize_f32,     float,  float4x4,  float, float2x4>;
 template [[host_name("kernel_mul_mm_f16_f32")]]     kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   half4x4,       1,     dequantize_f16,     half,   half4x4,   float, float2x4>;
 #if defined(GGML_METAL_HAS_BF16)
+// gradients: the f32 operand is staged as bfloat, which keeps the f32 range (a gradient past 65504 is inf in half)
+template [[host_name("kernel_mul_mm_f32_f32_gb")]]   kernel mul_mm_t kernel_mul_mm<bfloat, bfloat4x4, simdgroup_bfloat8x8, bfloat, bfloat2x4, simdgroup_bfloat8x8, float4x4, 1,  dequantize_f32,     float,  float4x4,  float, float2x4>;
+template [[host_name("kernel_mul_mm_f16_f32_gb")]]   kernel mul_mm_t kernel_mul_mm<bfloat, bfloat4x4, simdgroup_bfloat8x8, bfloat, bfloat2x4, simdgroup_bfloat8x8, half4x4,  1,  dequantize_f16,     half,   half4x4,   float, float2x4>;
+template [[host_name("kernel_mul_mm_f16_f32_gb_w")]] kernel mul_mm_t kernel_mul_mm<bfloat, bfloat4x4, simdgroup_bfloat8x8, bfloat, bfloat2x4, simdgroup_bfloat8x8, half4x4,  1,  dequantize_f16,     half,   half4x4,   float, float2x4, 8>;
+// out_prod: the weight staged as half, the gradient as bfloat for its range (f32 takes kernel_mul_mm_f32_f32_gb)
+template [[host_name("kernel_mul_mm_ta_q8_0_f32")]] kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   bfloat, bfloat2x4, simdgroup_bfloat8x8, block_q8_0, 2, dequantize_q8_0, float, float4x4, float, float2x4>;
+template [[host_name("kernel_mul_mm_ta_f16_f32")]]  kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   bfloat, bfloat2x4, simdgroup_bfloat8x8, half4x4,    1, dequantize_f16,  half,  half4x4,  float, float2x4>;
+#endif
+#if defined(GGML_METAL_HAS_BF16)
 template [[host_name("kernel_mul_mm_bf16_f32")]]    kernel mul_mm_t kernel_mul_mm<bfloat, bfloat4x4, simdgroup_bfloat8x8, bfloat, bfloat2x4, simdgroup_bfloat8x8, bfloat4x4,     1,     dequantize_bf16,    bfloat, bfloat4x4, float, float2x4>;
 #endif
 template [[host_name("kernel_mul_mm_bf16e_f32")]]    kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   bf16e4x4,      1,     dequantize_bf16e,   float,  float4x4,  float, float2x4>;
@@ -1398,3 +1448,257 @@ template [[host_name("kernel_mul_mm_id_tq2_0_f16")]]   kernel mul_mm_id kernel_m
 #if defined(GGML_METAL_HAS_BF16)
 #endif
 
+
+// dst[o][t] = sum_k src0[o][k] src1[t][k] for a short k (the LoRA B times A x), below the GEMM's k >= 64: each thread
+// keeps its src0 row in registers and makes 8 outputs of it, with the rows along the threads so the stores coalesce
+template<short KMAX>
+kernel void kernel_mul_mm_lowk_f32(
+        constant ggml_metal_kargs_mul_mm & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  float * sx [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]]) {
+    const int K  = args.ne00;
+    const int o  = tgpig.x*64 + (tiitg & 63);
+    const int t0 = tgpig.y*32;
+    const int im = tgpig.z;
+
+    const int i12 = im % args.ne12;
+    const int i13 = im / args.ne12;
+
+    // the 32 columns of src1, k-major: sx[k*33 + j]
+    for (int e = tiitg; e < 32*KMAX; e += 256) {
+        const int j = e / KMAX;
+        const int k = e % KMAX;
+        const int t = t0 + j;
+        sx[k*33 + j] = t < args.ne1 && k < K ?
+            *((device const float *) (src1 + i13*args.nb13 + i12*args.nb12 + (uint64_t) t*args.nb11) + k) : 0.0f;
+    }
+
+    float w[KMAX];
+    if (o < args.ne0) {
+        device const float * wr = (device const float *) (src0 + (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03 + (uint64_t) o*args.nb01);
+        FOR_UNROLL (short k = 0; k < KMAX; ++k) {
+            w[k] = k < K ? wr[k] : 0.0f;
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (o >= args.ne0) {
+        return;
+    }
+
+    device float * d = (device float *) dst + (uint64_t) im*args.ne1*args.ne0 + o;
+    const short jb = (tiitg >> 6)*8;
+    FOR_UNROLL (short j = 0; j < 8; ++j) {
+        const int t = t0 + jb + j;
+        float acc = 0.0f;
+        FOR_UNROLL (short k = 0; k < KMAX; ++k) {
+            acc += w[k]*sx[k*33 + jb + j];
+        }
+        if (t < args.ne1) {
+            d[(uint64_t) t*args.ne0] = acc;
+        }
+    }
+}
+
+typedef decltype(kernel_mul_mm_lowk_f32<16>) kernel_mul_mm_lowk_t;
+
+template [[host_name("kernel_mul_mm_lowk_f32_16")]] kernel kernel_mul_mm_lowk_t kernel_mul_mm_lowk_f32<16>;
+template [[host_name("kernel_mul_mm_lowk_f32_32")]] kernel kernel_mul_mm_lowk_t kernel_mul_mm_lowk_f32<32>;
+
+// the scale of each src1 column for the half GEMM of out_prod: the power of two that brings its largest value into
+// (0.5, 1], stored after dst
+kernel void kernel_out_prod_colscale(
+        constant ggml_metal_kargs_mul_mm & args,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  float * sm [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]]) {
+    const int j   = tgpig.x;
+    const int im  = tgpig.y;
+    const int i12 = im % args.ne12;
+    const int i13 = im / args.ne12;
+
+    device const float * col = (device const float *) (src1 + i13*args.nb13 + i12*args.nb12 + (uint64_t) j*args.nb11);
+
+    float m = 0.0f;
+    for (int k = tiitg; k < args.ne00; k += 256) {
+        m = max(m, fabs(col[k]));
+    }
+    m = simd_max(m);
+    if (tiisg == 0) {
+        sm[sgitg] = m;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiitg == 0) {
+        float a = 0.0f;
+        for (short i = 0; i < 8; ++i) {
+            a = max(a, sm[i]);
+        }
+        const float e = a > 0.0f ? clamp(ceil(log2(a)), -120.0f, 120.0f) : 0.0f;
+        // ne02 carries the number of output matrices here
+        const uint64_t n_out = (uint64_t) args.ne0*args.ne1*args.ne02;
+        ((device float *) dst)[n_out + (uint64_t) im*args.ne1 + j] = exp2(-e);
+    }
+}
+
+// dst[m][t] = sum_k src0[m][k] src1[t][k] for few rows m and a long k (A x of a LoRA): a GEMM tile would stay mostly
+// empty, so a threadgroup takes a few columns and splits k over its threads, which reduce at the end
+template<short MMAX, short NC>
+kernel void kernel_mul_mm_skinny_f32(
+        constant ggml_metal_kargs_mul_mm & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  float * sred [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]]) {
+    const int K  = args.ne00;
+    const int M  = args.ne0;
+    const int t0 = tgpig.x*NC;
+    const int im = tgpig.z;
+
+    const int i12 = im % args.ne12;
+    const int i13 = im / args.ne12;
+
+    device const char * w0 = src0 + (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
+    device const char * x0 = src1 + i13*args.nb13 + i12*args.nb12;
+
+    float acc[MMAX][NC];
+    FOR_UNROLL (short m = 0; m < MMAX; ++m) {
+        FOR_UNROLL (short c = 0; c < NC; ++c) {
+            acc[m][c] = 0.0f;
+        }
+    }
+
+    for (int k = tiitg; k < K; k += 256) {
+        float xv[NC];
+        FOR_UNROLL (short c = 0; c < NC; ++c) {
+            xv[c] = t0 + c < args.ne1 ? ((device const float *) (x0 + (uint64_t) (t0 + c)*args.nb11))[k] : 0.0f;
+        }
+        FOR_UNROLL (short m = 0; m < MMAX; ++m) {
+            const float w = m < M ? ((device const float *) (w0 + (uint64_t) m*args.nb01))[k] : 0.0f;
+            FOR_UNROLL (short c = 0; c < NC; ++c) {
+                acc[m][c] += w*xv[c];
+            }
+        }
+    }
+
+    FOR_UNROLL (short m = 0; m < MMAX; ++m) {
+        FOR_UNROLL (short c = 0; c < NC; ++c) {
+            const float s = simd_sum(acc[m][c]);
+            if (tiisg == 0) {
+                sred[sgitg*(MMAX*NC) + m*NC + c] = s;
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tiitg < MMAX*NC) {
+        const short m = tiitg/NC;
+        const short c = tiitg%NC;
+        float s = 0.0f;
+        FOR_UNROLL (short g = 0; g < 8; ++g) {
+            s += sred[g*(MMAX*NC) + tiitg];
+        }
+        if (m < M && t0 + c < args.ne1) {
+            ((device float *) dst)[(uint64_t) im*args.ne1*args.ne0 + (uint64_t) (t0 + c)*args.ne0 + m] = s;
+        }
+    }
+}
+
+typedef decltype(kernel_mul_mm_skinny_f32<16, 4>) kernel_mul_mm_skinny_t;
+
+template [[host_name("kernel_mul_mm_skinny_f32_16_2")]] kernel kernel_mul_mm_skinny_t kernel_mul_mm_skinny_f32<16, 2>;
+template [[host_name("kernel_mul_mm_skinny_f32_16_4")]] kernel kernel_mul_mm_skinny_t kernel_mul_mm_skinny_f32<16, 4>;
+template [[host_name("kernel_mul_mm_skinny_f32_16_8")]] kernel kernel_mul_mm_skinny_t kernel_mul_mm_skinny_f32<16, 8>;
+
+// out_prod(a, b)[i][j] = sum_k a[i][k] b[j][k] when one side (a if SMALL_A) has at most SMAX rows, as the gradient of a
+// LoRA factor: a thread owns a row of the long side and keeps the short side's sums in registers, k split in four
+template<short SMAX, bool SMALL_A>
+kernel void kernel_out_prod_small_f32(
+        constant ggml_metal_kargs_mul_mm & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  float * ss [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]]) {
+    // args: ne00 = k, ne0/ne1 = rows of a/b, nb01/nb11 = k stride of a/b
+    const int K  = args.ne00;
+    const int ns = SMALL_A ? args.ne0 : args.ne1;
+    const int nl = SMALL_A ? args.ne1 : args.ne0;
+    const short r = tiitg & 63;
+    const short q = tiitg >> 6;
+    const int   l = tgpig.x*64 + r;
+
+    device const char * sp = SMALL_A ? src0 : src1;
+    device const char * lp = SMALL_A ? src1 : src0;
+    const uint64_t snb = SMALL_A ? args.nb01 : args.nb11;
+    const uint64_t lnb = SMALL_A ? args.nb11 : args.nb01;
+
+    threadgroup float * sq = ss + q*32*SMAX;
+
+    float acc[SMAX];
+    FOR_UNROLL (short s = 0; s < SMAX; ++s) {
+        acc[s] = 0.0f;
+    }
+
+    for (int k0 = 32*q; k0 < K + 96; k0 += 128) {
+        // the short side's values at the 32 k of this group
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int e = r; e < 32*SMAX; e += 64) {
+            const int kk = e / SMAX;
+            const int s  = e % SMAX;
+            sq[e] = s < ns && k0 + kk < K ? ((device const float *) (sp + (uint64_t) (k0 + kk)*snb))[s] : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (l < nl && k0 < K) {
+            const int kn = min(32, K - k0);
+            for (int kk = 0; kk < kn; ++kk) {
+                const float v = ((device const float *) (lp + (uint64_t) (k0 + kk)*lnb))[l];
+                FOR_UNROLL (short s = 0; s < SMAX; ++s) {
+                    acc[s] += v*sq[kk*SMAX + s];
+                }
+            }
+        }
+    }
+
+    // the four groups' sums
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    FOR_UNROLL (short s = 0; s < SMAX; ++s) {
+        ss[(q*SMAX + s)*64 + r] = acc[s];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (q == 0 && l < nl) {
+        device float * d = (device float *) dst;
+        FOR_UNROLL (short s = 0; s < SMAX; ++s) {
+            if (s < ns) {
+                const float v = ss[s*64 + r] + ss[(SMAX + s)*64 + r] + ss[(2*SMAX + s)*64 + r] + ss[(3*SMAX + s)*64 + r];
+                // dst is [ne0, ne1]: (i, j) at j*ne0 + i
+                if (SMALL_A) {
+                    d[(uint64_t) l*args.ne0 + s] = v;
+                } else {
+                    d[(uint64_t) s*args.ne0 + l] = v;
+                }
+            }
+        }
+    }
+}
+
+typedef decltype(kernel_out_prod_small_f32<16, true>) kernel_out_prod_small_t;
+
+template [[host_name("kernel_out_prod_small_f32_16_a")]] kernel kernel_out_prod_small_t kernel_out_prod_small_f32<16, true>;
+template [[host_name("kernel_out_prod_small_f32_16_b")]] kernel kernel_out_prod_small_t kernel_out_prod_small_f32<16, false>;
+template [[host_name("kernel_out_prod_small_f32_32_a")]] kernel kernel_out_prod_small_t kernel_out_prod_small_f32<32, true>;
+template [[host_name("kernel_out_prod_small_f32_32_b")]] kernel kernel_out_prod_small_t kernel_out_prod_small_f32<32, false>;

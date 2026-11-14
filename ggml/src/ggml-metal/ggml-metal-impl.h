@@ -720,6 +720,21 @@ typedef struct {
 
 typedef struct {
     int32_t  ne00;
+    int32_t  ne00_4;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    uint64_t nb11;
+    uint64_t nb12;
+    uint64_t nb13;
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb3;
+    float    eps;
+} ggml_metal_kargs_rms_norm_back;
+
+typedef struct {
+    int32_t  ne00;
     int32_t  ne01;
     int32_t  ne02;
     int32_t  ne03;
@@ -998,6 +1013,50 @@ typedef struct {
 } ggml_metal_kargs_soft_max;
 
 typedef struct {
+    int32_t  ne00;
+    int32_t  ne00_4;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    uint64_t nb11;
+    uint64_t nb12;
+    uint64_t nb13;
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb3;
+    float    scale;
+} ggml_metal_kargs_soft_max_back;
+
+typedef struct {
+    int32_t  ne00;   // classes per row
+    uint64_t nb01;   // logits row stride
+    uint64_t nb1;    // gradient row stride (backward only)
+} ggml_metal_kargs_cross_entropy_rows;
+
+typedef struct {
+    int32_t  n;
+} ggml_metal_kargs_count_equal_masked;
+
+typedef struct {
+    int32_t  ne01;      // queries
+    int32_t  ne02;      // query heads
+    int32_t  ne11;      // keys
+    int32_t  ne12;      // key/value heads
+    int32_t  ne13;      // sequences: dv sits after the dk of every one of them in the DKV result
+    uint64_t nb01, nb02, nb03;  // q
+    uint64_t nb11, nb12, nb13;  // k
+    uint64_t nb21, nb22, nb23;  // v
+    uint64_t nb31, nb32, nb33;  // mask (f16)
+    int32_t  ne32, ne33;        // mask heads and sequences, broadcast
+    int32_t  has_mask;
+    uint64_t nbo1, nbo2, nbo3;  // o: [dv, heads, queries]
+    uint64_t nbg1, nbg2, nbg3;  // gradient of o, same layout
+    uint64_t nbs1, nbs2, nbs3;  // stats: [2, queries, heads]
+    uint64_t nb1, nb2, nb3;     // result
+    float    scale;
+} ggml_metal_kargs_flash_attn_ext_back;
+
+typedef struct {
     int64_t  ne00;
     int64_t  ne01;
     int64_t  ne02;
@@ -1094,6 +1153,23 @@ typedef struct {
     float    eps_q;  // l2 norm of q and k done in the kernel: x / sqrt(sum(x^2) + eps)
     float    eps_k;
 } ggml_metal_kargs_gated_delta_net;
+
+typedef struct {
+    int32_t  H;   // value heads
+    int32_t  Hq;  // q/k heads, each shared by H/Hq value heads
+    int32_t  T;   // tokens per sequence
+    int32_t  B;   // sequences
+    int32_t  NT;  // chunks of 64 tokens per sequence
+    int32_t  has_dht;
+    uint64_t nb01, nb02, nb03; // q
+    uint64_t nb11, nb12, nb13; // k
+    uint64_t nb21, nb22, nb23; // v
+    uint64_t nb31, nb32, nb33; // g
+    uint64_t nb41, nb42, nb43; // beta
+    uint64_t nb52, nb53;       // initial state
+    uint64_t offs;             // the scratch, in bytes after the start of dst
+    float    scale;
+} ggml_metal_kargs_gated_delta_net_back;
 
 typedef struct {
     int64_t  n_elements;

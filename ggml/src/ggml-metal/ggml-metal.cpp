@@ -261,6 +261,14 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
                 res += ggml_metal_op_flash_attn_ext_extra_kv_f16(tensor);
                 res += ggml_metal_op_flash_attn_ext_extra_idx(tensor);
             } break;
+        case GGML_OP_GATED_DELTA_NET_BACK:
+            {
+                res += ggml_metal_op_gated_delta_net_back_extra(tensor);
+            } break;
+        case GGML_OP_OUT_PROD:
+            {
+                res += ggml_metal_op_out_prod_extra(tensor);
+            } break;
         case GGML_OP_CUMSUM:
         case GGML_OP_ARGSORT:
             {
