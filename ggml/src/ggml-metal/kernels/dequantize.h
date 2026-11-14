@@ -38,6 +38,7 @@ template <typename type4>
 void dequantize_bf16e_t4(device const bf16e4 * src, short il, thread type4 & reg) {
     reg = (type4) as_type<float4>(uint4(src->b) << 16);
 }
+
 template <typename type4x4>
 void dequantize_f16(device const half4x4 * src, short il, thread type4x4 & reg) {
     reg = (type4x4)(*src);
@@ -141,6 +142,95 @@ void dequantize_q2_0_t4(device const block_q2_0 * xb, short il, thread type4 & r
     reg_f[3] = ((float)((b >> 6) & 3) - 1.0f) * d;
 
     reg = (type4) reg_f;
+}
+
+// PQ2_0: each 2-bit field is OR-ed into the mantissa of 1024.0h, so the half minus 1025 is the
+// signed weight; a 16-bit lane pair covers elements s and s + 8 of the 16 in one operation
+template <typename type4x4>
+void dequantize_pq2_0(device const block_pq2_0 * xb, short il, thread type4x4 & reg) {
+    device const ushort * qs = (device const ushort *) xb->qs + 2*il;
+    const uint w = uint(qs[0]) | (uint(qs[1]) << 16);
+    const half d = xb->d;
+
+    half4x4 r;
+    FOR_UNROLL (short s = 0; s < 8; ++s) {
+        const half2 h = (as_type<half2>(((w >> (2*s)) & 0x00030003u) | 0x64006400u) - half2(1025.0h))*d;
+        r[s/4][s%4]     = h[0];
+        r[s/4 + 2][s%4] = h[1];
+    }
+    reg = (type4x4) r;
+}
+
+template <typename type4>
+void dequantize_pq2_0_t4(device const block_pq2_0 * xb, short il, thread type4 & reg) {
+    const uint b = xb->qs[il];
+    const float d = xb->d;
+
+    reg = (type4) ((float4(b & 3u, (b >> 2) & 3u, (b >> 4) & 3u, b >> 6) - 1.0f)*d);
+}
+
+// element e of a PTQ1_0 block: 16 bytes carry trits 0..4 of elements 0..79, the next 8 bytes
+// trits 0..4 of elements 80..119, and qh four trits each of elements 120..127
+inline float ptq1_0_q(device const block_ptq1_0 * xb, int e) {
+    const float pow3f[5] = {1.0f, 3.0f, 9.0f, 27.0f, 81.0f};
+    float b;
+    int n;
+    if (e < 80) {
+        b = xb->qs[e & 15];                n = e >> 4;
+    } else if (e < 120) {
+        b = xb->qs[16 + ((e - 80) & 7)];   n = (e - 80) >> 3;
+    } else {
+        b = xb->qh[(e - 120) & 1];         n = (e - 120) >> 1;
+    }
+    const float c0 = pow3f[n]*(1.0f/256.0f);
+    return floor(3.0f*c0*b) - 3.0f*floor(c0*b);
+}
+
+// trit n of the two bytes held in the low halves of a pair of 16-bit lanes, as TQ1_0 packs them,
+// ((b * 3^n) mod 256) * 3 >> 8, returned as the half pair of trit - 1
+inline half2 ptq1_0_trit2(ushort2 b, ushort p) {
+    const ushort2 t = (((b*p) & ushort2(0xFF))*ushort2(3)) >> 8;
+    return as_type<half2>(t | ushort2(0x6400)) - half2(1025.0h);
+}
+
+// the sixteen elements of a call are regular in il: il 0..4 are trit il of qs[0..15]; il 5 and 6
+// trits 2(il-5) and 2(il-5)+1 of qs[16..23]; il 7 trit 4 of those, then the four trits of each qh
+// byte. Written as eight byte pairs with a power of three each, so lanes on different il run the
+// same code instead of diverging.
+template <typename type4x4>
+void dequantize_ptq1_0(device const block_ptq1_0 * xb, short il, thread type4x4 & reg) {
+    const half d = xb->d;
+    device const ushort * q16 = (device const ushort *) xb->qs; // qs then qh, 13 byte pairs
+
+    const bool lo = il < 5;
+    const bool md = il < 7;
+    const ushort p0 = il == 0 ? 1 : il == 1 ? 3 : il == 2 ? 9 : il == 3 ? 27 : 81; // 3^il below 5
+    const ushort pm = il == 5 ? 1 : 9;                                              // 3^(2(il-5))
+
+    half4x4 r;
+    FOR_UNROLL (short j = 0; j < 8; j++) {
+        const short  src = lo ? j : md ? 8 + (j & 3) : (j < 4 ? 8 + j : 12);
+        const ushort hp  = j < 4 ? 81 : (j == 4 ? 1 : j == 5 ? 3 : j == 6 ? 9 : 27);
+        const ushort p   = lo ? p0 : md ? (j < 4 ? pm : 3*pm) : hp;
+
+        const ushort w = q16[src];
+        const half2  t = ptq1_0_trit2(ushort2(w & 0xFF, w >> 8), p)*d;
+        r[(2*j)/4][(2*j)%4]         = t[0];
+        r[(2*j + 1)/4][(2*j + 1)%4] = t[1];
+    }
+
+    reg = (type4x4) r;
+}
+
+template <typename type4>
+void dequantize_ptq1_0_t4(device const block_ptq1_0 * xb, short il, thread type4 & reg) {
+    const float d = xb->d;
+
+    float4 r;
+    FOR_UNROLL (short k = 0; k < 4; ++k) {
+        r[k] = (ptq1_0_q(xb, 4*il + k) - 1.0f)*d;
+    }
+    reg = (type4) r;
 }
 
 template <typename type4x4>

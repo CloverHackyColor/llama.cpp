@@ -796,7 +796,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rwkv(ggml_metal_
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net(ggml_metal_library_t lib, const ggml_tensor * op) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net(ggml_metal_library_t lib, const ggml_tensor * op, bool rows, bool fold, bool raw, bool l2q, bool l2k) {
     char base[256];
     char name[256];
 
@@ -813,9 +813,17 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net(
     GGML_ASSERT(op->ne[0] == ne20 * ne21);
     GGML_ASSERT(ne20 % 32 == 0);
 
-    snprintf(base, 256, "kernel_gated_delta_net_%s_%d", ggml_type_name(op->src[0]->type), nsg);
-    snprintf(name, 256, "%s_ne20=%d_ne30=%d_K=%d", base, ne20, ne30, K);
+    // rows of 128 split over 16 lanes instead of 32: the per-token reductions get shorter and each
+    // lane reads q and k as whole vectors. TOSH_GDN_LPR picks another split, 0 the 32-lane kernel
     static const int lpr_env = []() { const char * e = TOSH_ENV("TOSH_GDN_LPR"); return e ? atoi(e) : 16; }();
+    const int lpr = (ne20 == 128 && ggml_is_contiguous_rows(op->src[0]) && ggml_is_contiguous_rows(op->src[1])) ? lpr_env : 0;
+
+    if (lpr) {
+        snprintf(base, 256, "kernel_gated_delta_net_%s_lpr%d", ggml_type_name(op->src[0]->type), lpr);
+    } else {
+        snprintf(base, 256, "kernel_gated_delta_net_%s_%d", ggml_type_name(op->src[0]->type), nsg);
+    }
+    snprintf(name, 256, "%s_ne20=%d_ne30=%d_K=%d_rows=%d_fold=%d_raw=%d_l2=%d%d", base, ne20, ne30, K, rows, fold, raw, l2q, l2k);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
@@ -824,13 +832,20 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net(
         ggml_metal_cv_set_int16(cv, ne20, FC_GATED_DELTA_NET + 0);
         ggml_metal_cv_set_int16(cv, ne30, FC_GATED_DELTA_NET + 1);
         ggml_metal_cv_set_int16(cv, K,    FC_GATED_DELTA_NET + 2);
+        ggml_metal_cv_set_bool (cv, rows, FC_GATED_DELTA_NET + 3);
+        ggml_metal_cv_set_bool (cv, fold, FC_GATED_DELTA_NET + 4);
+        ggml_metal_cv_set_bool (cv, raw,  FC_GATED_DELTA_NET + 5);
+        ggml_metal_cv_set_bool (cv, l2q,  FC_GATED_DELTA_NET + 6);
+        ggml_metal_cv_set_bool (cv, l2k,  FC_GATED_DELTA_NET + 7);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 
         ggml_metal_cv_free(cv);
     }
 
-    res.nsg = nsg;
+    res.nsg = lpr ? -lpr : nsg;
+
+    return res;
 }
 
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_turbo_wht(ggml_metal_library_t lib) {
@@ -1204,6 +1219,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
             case GGML_TYPE_Q2_K:
             case GGML_TYPE_Q3_K:
             case GGML_TYPE_Q4_K:
+            case GGML_TYPE_Q5_K:
+            case GGML_TYPE_PQ2_0:
+            case GGML_TYPE_PTQ1_0: break;
             // these leave the registers the 64 accumulators need; iq3_xxs, iq2_xs,
             // iq2_xxs and iq1_m do not, so they keep the narrow tile
 
@@ -1299,6 +1317,45 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
         res.sgw = 64;
         res.nsg = (wide || narrow) ? 2 : 4;
     }
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_pq2_swiglu(ggml_metal_library_t lib) {
+    const auto * props = ggml_metal_device_get_props(ggml_metal_library_get_device(lib));
+
+    const bool    h     = props->simd_width == 64;
+    const int16_t nsg   = N_SG_PQ2_0;
+    const int16_t nw    = props->wave64_decode ? (int16_t) props->simd_width : 32;
+    const bool    align = props->needs_aligned_loads;
+
+    char base[256];
+    char name[256];
+
+    snprintf(base, 256, "kernel_mul_mv_pq2_0_swiglu_f32%s", h ? "_h" : "");
+    snprintf(name, 256, "%s_nsg=%d_nw=%d_al=%d", base, nsg, nw, align);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+
+        ggml_metal_cv_set_int16(cv, nsg,         FC_MUL_MV + 0);
+        ggml_metal_cv_set_int16(cv, 1,           FC_MUL_MV + 2);
+        ggml_metal_cv_set_int16(cv, 1,           FC_MUL_MV + 3);
+        ggml_metal_cv_set_int16(cv, 1,           FC_MUL_MV + 4);
+        ggml_metal_cv_set_int16(cv, nw,          FC_MUL_MV + 5);
+        ggml_metal_cv_set_bool (cv, false,       FC_MUL_MV + 6);
+        ggml_metal_cv_set_bool (cv, false,       FC_MUL_MV + 7);
+        ggml_metal_cv_set_bool (cv, align,       FC_MUL_MV + 8);
+
+        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+
+        ggml_metal_cv_free(cv);
+    }
+
+    res.nsg = nsg;
+    res.nr0 = h ? N_R0_PQ2_0_H : N_R0_PQ2_0;
+    res.nr1 = nw; // threads per simdgroup for the dispatch
 
     return res;
 }
@@ -1407,6 +1464,42 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             {
                 nsg = N_SG_Q2_0;
                 nr0 = N_R0_Q2_0;
+            } break;
+        case GGML_TYPE_PQ2_0:
+            {
+                nsg = N_SG_PQ2_0;
+                nr0 = N_R0_PQ2_0;
+                // 64 lanes are bound by instructions here: products in half with float accumulation
+                // take the byte conversions off the loop
+                if (simd_width == 64) {
+                    suffix = "_h";
+                    nr0 = N_R0_PQ2_0_H;
+                }
+                // a few columns share one pass over the weights; five to eight take two
+                if (ne11 >= 2) {
+                    nr0 = N_R0_PQ2_0_NC;
+                    nr1 = ne11 <= 4 ? ne11 : (ne11 + 1)/2;
+                    snprintf(sweep_sfx, sizeof(sweep_sfx), "_c%d", nr1);
+                    suffix = sweep_sfx;
+                }
+            } break;
+        case GGML_TYPE_PTQ1_0:
+            {
+                nsg = N_SG_PTQ1_0;
+                nr0 = N_R0_PTQ1_0;
+                smem = 256*2*sizeof(uint32_t); // the trit table
+                // 64 lanes want more rows per lane to amortize the staged activations
+                if (simd_width == 64 && ne11 == 1) {
+                    nsg    = N_SG_PTQ1_0_W64;
+                    nr0    = N_R0_PTQ1_0_W64;
+                    suffix = "_r8";
+                }
+                if (ne11 >= 2) {
+                    nr0 = N_R0_PTQ1_0_NC;
+                    nr1 = ne11 <= 4 ? ne11 : (ne11 + 1)/2;
+                    snprintf(sweep_sfx, sizeof(sweep_sfx), "_c%d", nr1);
+                    suffix = sweep_sfx;
+                }
             } break;
         case GGML_TYPE_Q4_0:
             {
@@ -1761,6 +1854,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                                     tsrc0 == GGML_TYPE_Q4_0 || tsrc0 == GGML_TYPE_Q4_1 ||
                                     tsrc0 == GGML_TYPE_Q5_0 || tsrc0 == GGML_TYPE_Q5_1 ||
                                     tsrc0 == GGML_TYPE_Q1_0 || tsrc0 == GGML_TYPE_Q2_0 ||
+                                    tsrc0 == GGML_TYPE_PQ2_0 || tsrc0 == GGML_TYPE_PTQ1_0 ||
                                     tsrc0 == GGML_TYPE_IQ2_XXS || tsrc0 == GGML_TYPE_IQ2_XS ||
                                     tsrc0 == GGML_TYPE_IQ3_XXS || tsrc0 == GGML_TYPE_IQ3_S ||
                                     tsrc0 == GGML_TYPE_IQ2_S || tsrc0 == GGML_TYPE_IQ1_S ||
@@ -2040,6 +2134,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
     const ggml_type tsrc1 = op->src[1]->type;
 
     const int simd_width = ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->simd_width;
+
     const char * suffix = "";
 
 
@@ -2064,6 +2159,17 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
             {
                 nsg = N_SG_Q2_0;
                 nr0 = N_R0_Q2_0;
+            } break;
+        case GGML_TYPE_PQ2_0:
+            {
+                nsg = N_SG_PQ2_0;
+                nr0 = N_R0_PQ2_0;
+            } break;
+        case GGML_TYPE_PTQ1_0:
+            {
+                nsg = N_SG_PTQ1_0;
+                nr0 = N_R0_PTQ1_0;
+                smem = 256*2*sizeof(uint32_t); // the trit table
             } break;
         case GGML_TYPE_Q4_0:
             {
@@ -2248,6 +2354,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
                              tsrc0 == GGML_TYPE_Q4_0 || tsrc0 == GGML_TYPE_Q4_1 ||
                              tsrc0 == GGML_TYPE_Q5_0 || tsrc0 == GGML_TYPE_Q5_1 ||
                              tsrc0 == GGML_TYPE_Q1_0 || tsrc0 == GGML_TYPE_Q2_0 ||
+                             tsrc0 == GGML_TYPE_PQ2_0 || tsrc0 == GGML_TYPE_PTQ1_0 ||
                              tsrc0 == GGML_TYPE_IQ2_XXS || tsrc0 == GGML_TYPE_IQ2_XS ||
                              tsrc0 == GGML_TYPE_IQ3_XXS || tsrc0 == GGML_TYPE_IQ3_S ||
                              tsrc0 == GGML_TYPE_IQ2_S || tsrc0 == GGML_TYPE_IQ1_S ||
@@ -2389,12 +2496,37 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_fwht(ggml_metal_
     char base[256];
     char name[256];
 
-    snprintf(base, 256, "kernel_fwht_%s_%d", ggml_type_name(tsrc), n);
+    snprintf(base, 256, "kernel_fwht_%s_%d%s", ggml_type_name(tsrc), n, w64 ? "_w64" : "");
     snprintf(name, 256, "%s", base);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
         res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_fwht_fused(ggml_metal_library_t lib, int n, int hd, int rep, int nk, bool w64) {
+    char base[256];
+    char name[256];
+
+    const bool perm = hd > 0;
+
+    snprintf(base, 256, "kernel_fwht_fused_f32_%d%s%s", n, perm ? "_p" : "", w64 ? "_w64" : "");
+    snprintf(name, 256, "%s_hd=%d_rep=%d_nk=%d", base, hd, rep, nk);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+
+        ggml_metal_cv_set_int16(cv, (int16_t) hd,  FC_FWHT + 0);
+        ggml_metal_cv_set_int16(cv, (int16_t) rep, FC_FWHT + 1);
+        ggml_metal_cv_set_int16(cv, (int16_t) nk,  FC_FWHT + 2);
+
+        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+
+        ggml_metal_cv_free(cv);
     }
 
     return res;

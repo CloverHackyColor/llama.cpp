@@ -435,6 +435,10 @@ extern "C" {
         GGML_TYPE_TURBO4_0 = 45, // TurboQuant 4-bit KV cache: WHT + 4-bit PolarQuant
         GGML_TYPE_TQ3_1S  = 46, // TurboQuant 3-bit weight: WHT-rotated 8-level Lloyd-Max, block_size=32
         GGML_TYPE_TQ4_1S  = 47, // TurboQuant 4-bit weight: WHT-rotated 16-level Lloyd-Max, block_size=32
+        // Prism ML types; the ids match the published GGUFs, and 48..141 are unused
+        GGML_TYPE_PQ2_0   = 142, // Q2_0 codec at group 128
+        GGML_TYPE_PTQ1_0  = 143, // ternary at group 128
+        GGML_TYPE_COUNT   = 144,
     };
 
     // [TAG_GGML_PREC]
@@ -490,6 +494,8 @@ extern "C" {
         GGML_FTYPE_MOSTLY_NVFP4   = 26, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q2_0    = 28, // except 1d tensors
+        GGML_FTYPE_MOSTLY_PQ2_0   = 128, // except 1d tensors
+        GGML_FTYPE_MOSTLY_PTQ1_0  = 129, // except 1d tensors
     };
 
     // available tensor operations:
@@ -2663,6 +2669,14 @@ extern "C" {
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state,
             int64_t               K);
+
+    // g and beta arrive before their activations (scalar gate only):
+    //   beta -> sigmoid(beta), g -> a[h] * softplus(g + dt_bias[h])
+    // dt_bias and a are F32 with one value per head
+    GGML_API void ggml_gated_delta_net_set_raw_gates(
+            struct ggml_tensor  * gdn,
+            struct ggml_tensor  * dt_bias,
+            struct ggml_tensor  * a);
 
     // TurboQuant Walsh-Hadamard Transform (O(d log d) rotation for KV cache compression)
     // Applies WHT rotation to 128-element groups along ne[0]: sign1 -> butterfly -> sign2 -> normalize

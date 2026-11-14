@@ -29,6 +29,17 @@
 #define N_R0_Q2_0 8
 #define N_SG_Q2_0 2
 
+#define N_R0_PQ2_0 8
+#define N_R0_PQ2_0_H 8
+#define N_R0_PQ2_0_NC 8
+#define N_SG_PQ2_0 2
+
+#define N_R0_PTQ1_0 4
+#define N_R0_PTQ1_0_NC 8
+#define N_R0_PTQ1_0_W64 8
+#define N_SG_PTQ1_0_W64 1
+#define N_SG_PTQ1_0 2
+
 #define N_R0_Q4_0 4
 #define N_SG_Q4_0 1
 
@@ -126,6 +137,7 @@
 #define FC_LIGHTNING_INDEXER           2200
 #define FC_MUL_MV_MMA                  2300
 #define FC_TURBO_WHT                   2400
+#define FC_FWHT                        2500
 
 // op-specific constants
 #define OP_FLASH_ATTN_EXT_NQPSG 8
@@ -967,6 +979,7 @@ typedef struct {
     uint64_t nb00;
     uint64_t nb01;
     uint64_t nb02;
+    int64_t  ne10;
     int64_t  ne11;
     uint64_t nb10;
     uint64_t nb11;
@@ -1051,7 +1064,10 @@ typedef struct {
     uint64_t nb1;
     uint64_t nb2;
     uint64_t nb3;
-    uint64_t nb_out; // 0 => snapshots are appended after the attn scores (unfused)
+    uint64_t s_nb1;  // cache row stride when the state is read straight from the cache
+    uint64_t sd_nb1; // cache row stride when the new state is written straight into it
+    float    eps_q;  // l2 norm of q and k done in the kernel: x / sqrt(sum(x^2) + eps)
+    float    eps_k;
 } ggml_metal_kargs_gated_delta_net;
 
 typedef struct {
@@ -1325,9 +1341,27 @@ typedef struct {
     float   clamp;
     float   scale;
 } ggml_metal_kargs_tosh_topk_moe;
+
 typedef struct {
     int32_t nrows;
 } ggml_metal_kargs_fwht;
+
+typedef struct {
+    int32_t nrows;  // rows of the output, one transform block each
+    int32_t nsign;  // width of the sign vector, 0 for none
+} ggml_metal_kargs_fwht_fused;
+
+typedef struct {
+    int32_t  ne00;   // row width, a whole number of 1024 blocks
+    float    eps;
+    uint64_t nb01;   // row strides of the input, the norm output and the transform output
+    uint64_t nb1n;
+    uint64_t nb1h;
+    int32_t  write_norm;
+    int32_t  add;    // the row is the sum of two inputs, written out as well
+    uint64_t nb11;
+    uint64_t nb1a;
+} ggml_metal_kargs_rms_norm_fwht;
 
 typedef struct {
     int64_t  ne0;

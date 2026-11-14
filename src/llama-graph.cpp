@@ -1524,6 +1524,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     mctx             (params.mctx),
     cross            (params.cross),
     prec_policy      (params.prec_policy),
+    hadamard_rotations(params.hadamard_rotations),
+    hadamard_inverses (params.hadamard_inverses),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -1546,11 +1548,72 @@ ggml_tensor * llm_graph_context::build_cvec(
     return cvec->apply_to(ctx0, cur, il);
 }
 
+ggml_tensor * llm_graph_context::build_hadamard_input(
+          ggml_tensor * w,
+          ggml_tensor * cur,
+          const llama_hadamard_rotations * rotations) const {
+    if (!rotations) {
+        rotations = hadamard_rotations;
+    }
+    if (!rotations) {
+        return cur;
+    }
+    const auto it = rotations->find(w);
+    if (it == rotations->end()) {
+        return cur;
+    }
+    const auto & t = it->second;
+
+    const auto key = std::make_pair((const ggml_tensor *) cur, (const ggml_tensor *) t.rot);
+    const auto memo = hadamard_memo.find(key);
+    if (memo != hadamard_memo.end()) {
+        return memo->second;
+    }
+
+    ggml_tensor * x = cur;
+    if (t.perm_rep > 1) {
+        x = ggml_is_contiguous(x) ? x : ggml_cont(ctx0, x);
+        const int64_t ne1 = x->ne[1], ne2 = x->ne[2], ne3 = x->ne[3];
+        x = ggml_reshape_4d(ctx0, x, t.perm_hd, t.perm_nk, t.perm_rep, ne1*ne2*ne3);
+        x = ggml_cont(ctx0, ggml_permute(ctx0, x, 0, 2, 1, 3));
+        x = ggml_reshape_4d(ctx0, x, t.perm_hd*t.perm_nk*t.perm_rep, ne1, ne2, ne3);
+    }
+    if (t.signs) {
+        x = ggml_mul(ctx0, x, t.signs);
+    }
+    x = llama_mul_mat_hadamard(ctx0, x, t.rot);
+
+    hadamard_memo[key] = x;
+    return x;
+}
+
+ggml_tensor * llm_graph_context::build_hadamard_lookup(
+          ggml_tensor * table,
+          ggml_tensor * rows,
+          const llama_hadamard_rotations * inverses) const {
+    if (!inverses) {
+        inverses = hadamard_inverses;
+    }
+    if (!inverses) {
+        return rows;
+    }
+    const auto it = inverses->find(table);
+    if (it == inverses->end()) {
+        return rows;
+    }
+    // latent rows back to the primal basis: h = s * (H z)
+    rows = llama_mul_mat_hadamard(ctx0, rows, it->second.rot);
+    if (it->second.signs) {
+        rows = ggml_mul(ctx0, rows, it->second.signs);
+    }
+    return rows;
+}
+
 ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
           ggml_tensor * w_s) const {
-    ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
+    ggml_tensor * res = ggml_mul_mat(ctx0, w, build_hadamard_input(w, cur));
 
     if (prec_policy) {
         prec_policy->apply(res);
@@ -1590,7 +1653,7 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * cur, // ggml_tensor * b
           ggml_tensor * ids,
           ggml_tensor * w_s) const {
-    ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
+    ggml_tensor * res = ggml_mul_mat_id(ctx0, w, build_hadamard_input(w, cur), ids);
 
     if (prec_policy) {
         prec_policy->apply(res);
@@ -2430,6 +2493,7 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
     // token embeddings with lora and padding
     auto build_tok = [&](ggml_tensor * ids) {
         ggml_tensor * cur = ggml_get_rows(ctx0, tok_embd, ids);
+        cur = build_hadamard_lookup(tok_embd, cur);
 
         // apply lora for embedding tokens if needed
         for (const auto & lora : *loras) {

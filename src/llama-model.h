@@ -737,6 +737,15 @@ struct llama_model {
     // for quantize-stats only
     std::vector<std::pair<std::string, struct ggml_tensor *>> tensors_by_name;
 
+    // Prism ML Hadamard-folded weights (prism.hadamard.*): the forward transform is applied to the
+    // activation of every folded matmul, the inverse to rows looked up from latent tables
+    std::unordered_map<std::string, uint32_t> hadamard_weight_blocks;
+    std::unordered_map<std::string, uint32_t> hadamard_inverse_blocks;
+    std::map<uint32_t, std::vector<int32_t>> hadamard_sign_data;
+    bool hadamard_gdn_v_grouped = false;
+    llama_hadamard_rotations hadamard_rotations;
+    llama_hadamard_rotations hadamard_inverses;
+
     // for keeping track of associated LoRA adapters
     std::unordered_set<llama_adapter_lora *> loras;
 
@@ -853,6 +862,9 @@ struct llama_model_base : public llama_model {
     void load_hparams(llama_model_loader & ml) override;
     void load_vocab  (llama_model_loader & ml) override;
     bool load_tensors(llama_model_loader & ml) override;
+
+    void load_hadamard_hparams(llama_model_loader & ml);
+    void create_hadamard_tensors(bool no_alloc);
 
     // model must define these
     void load_arch_hparams(llama_model_loader & ml) override = 0;

@@ -2380,6 +2380,9 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                  op->src[0]->type == GGML_TYPE_Q5_0 ||
                  op->src[0]->type == GGML_TYPE_Q5_1 ||
                  op->src[0]->type == GGML_TYPE_Q1_0 ||
+                 op->src[0]->type == GGML_TYPE_Q2_0 ||
+                 op->src[0]->type == GGML_TYPE_PQ2_0 ||
+                 op->src[0]->type == GGML_TYPE_PTQ1_0);
             return prefill || decode;
         }
         case GGML_OP_MUL_MAT_ID: {
@@ -2418,6 +2421,10 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                  op->src[0]->type == GGML_TYPE_Q5_0 ||
                  op->src[0]->type == GGML_TYPE_Q5_1 ||
                  op->src[0]->type == GGML_TYPE_Q1_0 ||
+                 op->src[0]->type == GGML_TYPE_Q2_0 ||
+                 op->src[0]->type == GGML_TYPE_PQ2_0 ||
+                 op->src[0]->type == GGML_TYPE_PTQ1_0);
+        }
         case GGML_OP_SET:
         case GGML_OP_CPY:
         case GGML_OP_DUP:
@@ -2432,6 +2439,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                            case GGML_TYPE_Q8_0:
                            case GGML_TYPE_Q1_0:
                            case GGML_TYPE_Q2_0:
+                           case GGML_TYPE_PQ2_0:
                            case GGML_TYPE_Q4_0:
                            case GGML_TYPE_Q4_1:
                            case GGML_TYPE_Q5_0:
@@ -2464,6 +2472,8 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                         }
                     case GGML_TYPE_Q1_0:
                     case GGML_TYPE_Q2_0:
+                    case GGML_TYPE_PQ2_0:
+                    case GGML_TYPE_PTQ1_0:
                     case GGML_TYPE_Q4_0:
                     case GGML_TYPE_Q4_1:
                     case GGML_TYPE_Q5_0:
