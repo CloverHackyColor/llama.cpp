@@ -1666,13 +1666,11 @@ void kernel_mul_mv_q2_K_f32_L16_w64_impl(
         for (short row = 0; row < nr0; row++) {
             float4 acc1 = {0.f, 0.f, 0.f, 0.f};
             float4 acc2 = {0.f, 0.f, 0.f, 0.f};
-            // the four shorts this lane reads are contiguous, so an aligned stride turns
-            // them into two words
+            // the two shorts this lane reads are contiguous, so an aligned stride reads them as one word
             ushort qw[4];
             if (FC_mul_mv_row8) {
-                const uint2 t = *(device const uint2 *)qs;
-                qw[0] = (ushort)(t.x); qw[1] = (ushort)(t.x >> 16);
-                qw[2] = (ushort)(t.y); qw[3] = (ushort)(t.y >> 16);
+                const uint t = *(device const uint *)qs;
+                qw[0] = (ushort)(t); qw[1] = (ushort)(t >> 16);
             } else {
                 for (short k = 0; k < 2; ++k) qw[k] = qs[k];
             }
