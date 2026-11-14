@@ -926,13 +926,7 @@ static bool rs_save_small(const ggml_tensor * t, bool compact) {
 }
 
 static void rs_write_small(llama_io_write_i & io, ggml_tensor * t, size_t offset, size_t size, int64_t n_per_row) {
-    const ggml_type type = rs_save_type();
-    std::vector<float> f(size/sizeof(float));
-    ggml_backend_tensor_get(t, f.data(), offset, size);
-    const int64_t nrows = (int64_t) f.size()/n_per_row;
-    std::vector<uint8_t> q(ggml_row_size(type, n_per_row)*nrows);
-    ggml_quantize_chunk(type, f.data(), q.data(), 0, nrows, n_per_row, nullptr);
-    io.write(q.data(), q.size());
+    io.write_tensor_quantized(t, offset, size, rs_save_type(), n_per_row);
 }
 
 static void rs_read_small(llama_io_read_i & io, ggml_type type, ggml_tensor * t, size_t offset, size_t size, int64_t n_per_row) {

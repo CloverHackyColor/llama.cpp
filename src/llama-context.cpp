@@ -19,12 +19,14 @@ static inline size_t tosh_dmoe_private_bytes(void) { return 0; }
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <atomic>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 
 //
@@ -2899,6 +2901,10 @@ public:
         size_written += size;
     }
 
+    void write_tensor_quantized(ggml_tensor * /* tensor */, size_t /* offset */, size_t size, ggml_type type, int64_t n_per_row) override {
+        size_written += ggml_row_size(type, n_per_row)*(size/sizeof(float)/n_per_row);
+    }
+
     size_t n_bytes() override {
         return size_written;
     }
@@ -2925,11 +2931,20 @@ public:
         for (const auto & winfo : winfos) {
             ggml_backend_tensor_get(winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
         }
+        // kept between checkpoints: a fresh buffer the size of a recurrent state pays its page faults every time
+        static thread_local std::vector<float> f32;
+        if (f32.size() < n_quant_floats) {
+            f32.resize(n_quant_floats);
+        }
+        for (const auto & q : qinfos) {
+            ggml_backend_tensor_get(q.tensor, f32.data() + q.src, q.offset, q.size);
+        }
         if (backends) {
             for (const auto & b : *backends) {
                 ggml_backend_read_batch_end(b.get());
             }
         }
+        quantize(f32);
     }
 
     void write(const void * src, size_t size) override {
@@ -2955,14 +2970,64 @@ public:
         buf_size -= size;
     }
 
+    void write_tensor_quantized(ggml_tensor * tensor, size_t offset, size_t size, ggml_type type, int64_t n_per_row) override {
+        const int64_t nrows = (int64_t) (size/sizeof(float))/n_per_row;
+        const size_t  qsize = ggml_row_size(type, n_per_row)*nrows;
+        if (qsize > buf_size) {
+            throw std::runtime_error("unexpectedly reached end of buffer");
+        }
+
+        // read with the other tensors, quantize once all reads are in
+        qinfos.push_back({tensor, ptr, size, offset, n_quant_floats, type, nrows, n_per_row});
+        n_quant_floats += size/sizeof(float);
+
+        ptr += qsize;
+        size_written += qsize;
+        buf_size -= qsize;
+    }
+
     size_t n_bytes() override {
         return size_written;
     }
 
 private:
+    struct quant_info {
+        ggml_tensor * tensor;
+        uint8_t * ptr;
+        size_t size;
+        size_t offset;
+        size_t src;
+        ggml_type type;
+        int64_t nrows;
+        int64_t n_per_row;
+    };
+
+    void quantize(const std::vector<float> & f32) const {
+        if (qinfos.empty()) {
+            return;
+        }
+        std::atomic<size_t> next{0};
+        auto work = [&]() {
+            for (size_t i; (i = next.fetch_add(1)) < qinfos.size(); ) {
+                const auto & q = qinfos[i];
+                ggml_quantize_chunk(q.type, f32.data() + q.src, q.ptr, 0, q.nrows, q.n_per_row, nullptr);
+            }
+        };
+        const size_t n_threads = std::min<size_t>(qinfos.size(), std::max(1u, std::min(8u, std::thread::hardware_concurrency()/2)));
+        std::vector<std::thread> threads;
+        for (size_t t = 1; t < n_threads; t++) {
+            threads.emplace_back(work);
+        }
+        work();
+        for (auto & t : threads) {
+            t.join();
+        }
+    }
+
     uint8_t * ptr;
     size_t buf_size = 0;
     size_t size_written = 0;
+    size_t n_quant_floats = 0;
 
     struct write_info {
         ggml_tensor * tensor;
@@ -2971,6 +3036,7 @@ private:
         size_t offset;
     };
     std::vector<write_info> winfos;
+    std::vector<quant_info> qinfos;
     const std::vector<ggml_backend_ptr> * backends;
 };
 
