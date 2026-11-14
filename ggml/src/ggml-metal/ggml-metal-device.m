@@ -1112,6 +1112,8 @@ static const struct {
 #undef DEV
 };
 
+// tensor split blocks the main thread on the queue's in-flight command buffer limit (64 by
+// default), so allow raising it: TOSH_MTL_QUEUE_DEPTH
 // macOS can hand out an integrated iGPU (isLowPower, ~1 GB) as the system
 // default. Auto-selection skips it; explicit DEVICE_INDEX/LIST can still pin it.
 static id<MTLDevice> ggml_metal_device_default_discrete(void) {
@@ -1139,7 +1141,18 @@ static id<MTLDevice> ggml_metal_device_default_discrete(void) {
     return def;
 }
 
+
+static id<MTLCommandQueue> ggml_metal_new_queue(id<MTLDevice> device) {
     const char * s = TOSH_ENV("TOSH_MTL_QUEUE_DEPTH");
+    const int depth = s ? atoi(s) : 0;
+
+    if (depth > 0) {
+        return [device newCommandQueueWithMaxCommandBufferCount:depth];
+    }
+
+    return [device newCommandQueue];
+}
+
 
 static enum ggml_metal_device_id ggml_metal_device_id_parse(const char * name) {
     if (!name) {
@@ -1223,7 +1236,7 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
             }
 
             if (dev->mtl_device) {
-                dev->mtl_queue = [dev->mtl_device newCommandQueue];
+                dev->mtl_queue = ggml_metal_new_queue(dev->mtl_device);
                 if (dev->mtl_queue == nil) {
                     GGML_LOG_ERROR("%s: error: failed to create command queue\n", __func__);
                 }
@@ -1363,11 +1376,15 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
                     }
                 }
 
+                // Auto-on for wave64: run the quantized/f16 mat-vec decode on the GPU
                 // (large tg win, validated on GCN); escape hatch forces it off.
                 // GGML_METAL_WAVE64_SAFEMODE is the user-facing alias the app documents.
                 dev->props.wave64_decode = is_wave64 && TOSH_ENV("GGML_METAL_WAVE64_DECODE_DISABLE") == NULL
                                                      && TOSH_ENV("GGML_METAL_WAVE64_SAFEMODE") == NULL;
                 if (dev->props.wave64_decode) {
+                    fprintf(stderr, "ggml_metal: wave64 decode ON: quantized/f16/bf16 mat-vec on GPU "
+                                    "(see the allowlist in ggml_metal_library_get_pipeline_mul_mv)\n");
+                }
 
                 dev->props.has_simdgroup_mm = [dev->mtl_device supportsFamily:MTLGPUFamilyApple7];
 
@@ -1693,6 +1710,7 @@ void * ggml_metal_device_get_queue(ggml_metal_device_t dev) {
 void * ggml_metal_device_acquire_queue(ggml_metal_device_t dev, bool * owned) {
     *owned = false;
 
+    id<MTLCommandQueue> queue = ggml_metal_new_queue(dev->mtl_device);
     if (queue == nil) {
         return dev->mtl_queue;
     }
@@ -3152,6 +3170,84 @@ bool ggml_metal_device_stage_set(ggml_metal_device_t dev, struct ggml_metal_buff
     return true;
 }
 
+// A tensor-split weight upload arrives one row-slice at a time. Routing each through
+// ggml_metal_device_stage_set costs a command buffer per row; pack as many rows as the
+// staging buffer holds into a single one instead.
+bool ggml_metal_device_stage_set_2d(ggml_metal_device_t dev, struct ggml_metal_buffer_id bid_dst,
+        const void * data, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
+    if (size == 0 || n_copies == 0) {
+        return true;
+    }
+    if (size > GGML_METAL_STAGE_BUF_MAX || bid_dst.metal == nil) {
+        return false;
+    }
+
+    const uint64_t t0 = tosh_prof_on() ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
+
+    const size_t per_batch = MAX((size_t) 1, GGML_METAL_STAGE_BUF_MAX / size);
+
+    [dev->stage_lock lock];
+
+    for (size_t i = 0; i < n_copies;) {
+        const size_t k    = MIN(per_batch, n_copies - i);
+        const size_t need = k*size;
+
+        const int slot = dev->stage_set_cur;
+        dev->stage_set_cur = (slot + 1) % 4;
+
+        if (dev->stage_set_cmds[slot]) {
+            [dev->stage_set_cmds[slot] waitUntilCompleted];
+            [dev->stage_set_cmds[slot] release];
+            dev->stage_set_cmds[slot] = nil;
+        }
+
+        id<MTLBuffer> stage = dev->stage_set_bufs[slot];
+        if (stage == nil || stage.length < need) {
+            [stage release];
+            stage = [dev->mtl_device newBufferWithLength:MAX(need, (size_t) 256*1024)
+                                                 options:MTLResourceStorageModeShared | MTLResourceCPUCacheModeWriteCombined];
+            dev->stage_set_bufs[slot] = stage;
+        }
+        if (stage == nil) {
+            [dev->stage_lock unlock];
+            return false;
+        }
+
+        for (size_t r = 0; r < k; r++) {
+            memcpy((char *) stage.contents + r*size, (const char *) data + (i + r)*stride_data, size);
+        }
+
+        id<MTLCommandBuffer> cmd_buf = [dev->mtl_queue commandBuffer];
+
+        {
+            id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
+
+            for (size_t r = 0; r < k; r++) {
+                [encoder copyFromBuffer:stage
+                           sourceOffset:r*size
+                               toBuffer:bid_dst.metal
+                      destinationOffset:bid_dst.offs + (i + r)*stride_tensor
+                                   size:size];
+            }
+
+            [encoder endEncoding];
+        }
+
+        [cmd_buf commit];
+        dev->stage_set_cmds[slot] = [cmd_buf retain];
+
+        i += k;
+    }
+
+    [dev->stage_lock unlock];
+
+    if (t0) {
+        tosh_prof_add(TOSH_PROF_H2D_STAGE, size*n_copies, t0);
+    }
+
+    return true;
+}
+
 // one commit + wait covers every queued blit; caller must hold stage_lock
 static void ggml_metal_device_stage_batch_flush(ggml_metal_device_t dev) {
     if (dev->stage_batch_n == 0) {
@@ -3263,6 +3359,29 @@ static bool tosh_xfer_on(void);
 static void ggml_metal_buffer_set_tensor_impl(ggml_metal_buffer_t buf, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size);
 static void ggml_metal_buffer_get_tensor_impl(ggml_metal_buffer_t buf, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size);
 
+void ggml_metal_buffer_set_tensor_2d(ggml_metal_buffer_t buf, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size,
+        size_t n_copies, size_t stride_tensor, size_t stride_data) {
+    if (size == 0 || n_copies == 0) {
+        return;
+    }
+
+    if (!buf->is_shared) {
+        @autoreleasepool {
+            ggml_metal_prof_note(tensor->name, size*n_copies, false);
+
+            struct ggml_metal_buffer_id bid_dst = ggml_metal_buffer_get_id(buf, tensor);
+            bid_dst.offs += offset;
+
+            if (ggml_metal_device_stage_set_2d(buf->dev, bid_dst, data, size, n_copies, stride_tensor, stride_data)) {
+                return;
+            }
+        }
+    }
+
+    for (size_t i = 0; i < n_copies; i++) {
+        ggml_metal_buffer_set_tensor(buf, tensor, (const char *) data + i*stride_data, offset + i*stride_tensor, size);
+    }
+}
 
 void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     const bool xf = tosh_xfer_on();

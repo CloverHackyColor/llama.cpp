@@ -233,6 +233,37 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             } break;
     }
 
+    // A tensor split hands a device an empty slice when the weight has fewer whole
+    // quantization blocks than there are devices. The op then contributes nothing, but
+    // its result still enters the sum across devices, so write zeros rather than abort.
+    if (!ggml_is_empty(node)) {
+        bool empty_src = false;
+        for (int i = 0; i < GGML_MAX_SRC; i++) {
+            if (node->src[i] && ggml_is_empty(node->src[i])) {
+                empty_src = true;
+                break;
+            }
+        }
+        if (empty_src && (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID)) {
+            if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                return 1;
+            }
+            ggml_metal_pipeline_with_params pz = ggml_metal_library_get_pipeline(ctx->lib, "kernel_zero_bytes");
+            if (!pz.pipeline) {
+                ggml_metal_cv_t cv = ggml_metal_cv_init();
+                pz = ggml_metal_library_compile_pipeline(ctx->lib, "kernel_zero_bytes", "kernel_zero_bytes", cv);
+                ggml_metal_cv_free(cv);
+            }
+            if (pz.pipeline) {
+                const uint64_t n = ggml_nbytes(node);
+                const int nth = std::min<int>(256, ggml_metal_pipeline_max_theads_per_threadgroup(pz));
+                ggml_metal_encoder_set_pipeline(ctx->enc, pz);
+                ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(node), 0);
+                ggml_metal_encoder_set_bytes   (ctx->enc, (void *) &n, sizeof(n), 1);
+                ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (int) ((n + nth - 1)/nth), 1, 1, nth, 1, 1);
+                return 1;
+            }
+        }
     }
 
     if (!ggml_metal_device_supports_op(ctx->dev, node)) {

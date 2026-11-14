@@ -838,7 +838,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         std::vector<float> tensor_split_scan;
         tensor_split_scan.reserve(ud->n_devices);
         for (size_t j = 0; j < ud->n_devices; j++) {
-            tensor_split_scan.push_back(tensor_split == nullptr ? 0.0f : tensor_split[(j + tc.rotation) % ud->n_devices]);
+            tensor_split_scan.push_back(tensor_split == nullptr ? 0.0f :
+                    tensor_split[ud->dev_offset + (j + tc.rotation) % ud->n_devices]);
             if (j > 0) {
                 tensor_split_scan[j] += tensor_split_scan[j - 1];
             }
@@ -1577,7 +1578,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             splits[i] = free;
         }
     } else {
-        std::copy(tensor_split, tensor_split + n_devices(), splits.begin());
+        // a group's share is the sum of its devices'
+        for (size_t i = 0; i < n_devices(); ++i) {
+            splits[i] = 0.0f;
+            for (size_t k = 0; k < tensor_group_size; ++k) {
+                splits[i] += tensor_split[i*tensor_group_size + k];
+            }
+        }
     }
 
     // sum and normalize the splits to get the split points

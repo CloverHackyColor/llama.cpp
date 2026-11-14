@@ -496,9 +496,8 @@ llama_context::llama_context(
         if (pipeline_parallel) {
             for (auto & backend : backends) {
                 auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backend.get()));
-                if (dev_type == GGML_BACKEND_DEVICE_TYPE_CPU) {
-                    // ignore CPU backend
-                    // TODO: should we ignore ACCEL types too?
+                if (dev_type == GGML_BACKEND_DEVICE_TYPE_CPU || dev_type == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
+                    // ignore CPU and ACCEL backends: BLAS is always present on macOS and reports
                     continue;
                 }
                 auto * dev = ggml_backend_get_device(backend.get());

@@ -994,6 +994,16 @@ kernel void kernel_dsv4_hc_post_f32(
         *(device float *) (dst + i0*args.nb_d0 + idst*args.nb_d1 + it*args.nb_d2) = result[idst];
     }
 }
+kernel void kernel_zero_bytes(
+        device char             * dst,
+        constant uint64_t       & n,
+        uint tpig[[thread_position_in_grid]]) {
+    if (tpig < n) {
+        dst[tpig] = 0;
+    }
+}
+template [[host_name("kernel_fwht_f32_64_w64")]]  kernel kernel_fwht_f32_t kernel_fwht<64,  float, 64>;
+template [[host_name("kernel_fwht_f32_128_w64")]] kernel kernel_fwht_f32_t kernel_fwht<128, float, 64>;
 template [[host_name("kernel_fwht_f32_256_w64")]] kernel kernel_fwht_f32_t kernel_fwht<256, float, 64>;
 template [[host_name("kernel_fwht_f16_64_w64")]]  kernel kernel_fwht_f16_t kernel_fwht<64,  half, 64>;
 template [[host_name("kernel_fwht_f16_128_w64")]] kernel kernel_fwht_f16_t kernel_fwht<128, half, 64>;

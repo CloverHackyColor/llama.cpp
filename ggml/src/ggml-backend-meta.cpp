@@ -254,12 +254,14 @@ struct ggml_backend_meta_buffer_type_context {
     std::string name;
 
     ggml_backend_meta_buffer_type_context(std::vector<ggml_backend_buffer_type_t> simple_bufts) : simple_bufts(std::move(simple_bufts)) {
+        // the member, not the parameter, which was just moved from. llama.cpp keys its
+        // per-buffer-type context map on this name, so an empty one puts every group in one buffer.
         name = "Meta(";
-        for (size_t i = 0; i < simple_bufts.size(); i++) {
+        for (size_t i = 0; i < this->simple_bufts.size(); i++) {
             if (i > 0) {
                 name += ",";
             }
-            name += ggml_backend_buft_name(simple_bufts[i]);
+            name += ggml_backend_buft_name(this->simple_bufts[i]);
         }
         name += ")";
     }
@@ -499,6 +501,29 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
 
+    // b holds `ratio` times as much of the split axis as a on every device. Attention with
+    // grouped queries splits K/V and Q this way: same devices, n_head per n_head_kv each.
+    auto split_states_proportional = [&](const ggml_backend_meta_split_state & a,
+                                         const ggml_backend_meta_split_state & b, int64_t ratio) -> bool {
+        if (a.axis != b.axis) {
+            return false;
+        }
+        for (size_t j = 0; j < n_bufs; j++) {
+            int64_t sum_a = 0;
+            for (size_t s = 0; s < a.n_segments; s++) {
+                sum_a += a.ne[s*n_bufs + j] * a.nr[s];
+            }
+            int64_t sum_b = 0;
+            for (size_t s = 0; s < b.n_segments; s++) {
+                sum_b += b.ne[s*n_bufs + j] * b.nr[s];
+            }
+            if (sum_a*ratio != sum_b) {
+                return false;
+            }
+        }
+        return true;
+    };
+
     auto split_states_equal = [&](const ggml_backend_meta_split_state & a, const ggml_backend_meta_split_state & b) -> bool {
         if (a.axis != b.axis) {
             return false;
@@ -562,6 +587,17 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         return handle_generic(src_ss, /*scalar_only =*/ false);
     };
 
+    // the attention mask is mirrored and broadcast over the heads, so a soft max keeps
+    // whatever split its scores arrived with.
+    auto handle_soft_max = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        if (tensor->src[1] != nullptr && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
+                src_ss[0].axis >= GGML_BACKEND_SPLIT_AXIS_2 && src_ss[0].axis < GGML_MAX_DIMS &&
+                tensor->src[1]->ne[src_ss[0].axis] == 1) {
+            return src_ss[0];
+        }
+        return handle_generic(src_ss, /*scalar_only =*/ false);
+    };
+
     auto handle_concat = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         const ggml_backend_meta_split_axis concat_axis = ggml_backend_meta_split_axis(ggml_get_op_params_i32(tensor, 0));
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[1].axis >= 0 && src_ss[1].axis < GGML_MAX_DIMS) {
@@ -598,6 +634,15 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         }
         if (src_ss[0].axis == src_ss[1].axis && src_ss[0].axis >= GGML_BACKEND_SPLIT_AXIS_2 &&
                 src_ss[0].axis < GGML_MAX_DIMS) {
+            // src0 broadcasts over src1 along the batch axis (grouped-query attention, where
+            // the unfused K*Q appears once the batch is too big to fuse into flash attention):
+            // the two are split in proportion, not identically, and the result follows src1.
+            const int64_t ne_src0 = tensor->src[0]->ne[src_ss[0].axis];
+            const int64_t ne_src1 = tensor->src[1]->ne[src_ss[1].axis];
+            if (ne_src0 > 0 && ne_src1 > ne_src0 && ne_src1 % ne_src0 == 0 &&
+                    split_states_proportional(src_ss[0], src_ss[1], ne_src1/ne_src0)) {
+                return src_ss[1];
+            }
             GGML_ASSERT(split_states_equal(src_ss[0], src_ss[1]));
             return src_ss[0];
         }
@@ -964,7 +1009,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_DIAG_MASK_ZERO: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
-            case GGML_OP_SOFT_MAX:
+            case GGML_OP_SOFT_MAX: {
+                split_state = handle_soft_max(src_ss);
+            } break;
             case GGML_OP_SOFT_MAX_BACK: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
             } break;

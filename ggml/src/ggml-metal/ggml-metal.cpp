@@ -144,6 +144,15 @@ static void ggml_backend_metal_buffer_private_get_tensor(ggml_backend_buffer_t b
     ggml_metal_buffer_get_tensor(ctx, tensor, data, offset, size);
 }
 
+static void ggml_backend_metal_buffer_private_set_tensor_2d(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size,
+        size_t n_copies, size_t stride_tensor, size_t stride_data) {
+    ggml_metal_buffer_t ctx = (ggml_metal_buffer_t)buffer->context;
+
+    GGML_ASSERT(!ggml_metal_buffer_is_shared(ctx));
+
+    ggml_metal_buffer_set_tensor_2d(ctx, tensor, data, offset, size, n_copies, stride_tensor, stride_data);
+}
+
 static bool ggml_backend_metal_buffer_private_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
     ggml_metal_buffer_t ctx = (ggml_metal_buffer_t)buffer->context;
 
@@ -171,7 +180,7 @@ static ggml_backend_buffer_i ggml_backend_metal_buffer_private_i = {
     /* .memset_tensor = */ ggml_backend_metal_buffer_private_memset_tensor,
     /* .set_tensor    = */ ggml_backend_metal_buffer_private_set_tensor,
     /* .get_tensor    = */ ggml_backend_metal_buffer_private_get_tensor,
-    /* .set_tensor_2d = */ NULL,
+    /* .set_tensor_2d = */ ggml_backend_metal_buffer_private_set_tensor_2d,
     /* .get_tensor_2d = */ NULL,
     /* .cpy_tensor    = */ ggml_backend_metal_buffer_private_cpy_tensor,
     /* .clear         = */ ggml_backend_metal_buffer_private_clear,
@@ -543,6 +552,7 @@ static void ggml_backend_metal_read_batch_end(ggml_backend_t backend) {
     ggml_metal_read_batch_end((ggml_metal_t) backend->context);
 }
 #endif
+static bool ggml_backend_metal_cpy_tensor_async_ex(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst, bool prefer_events, bool hold_dst) {
     if (!ggml_backend_is_metal(backend_src) || !ggml_backend_is_metal(backend_dst)) {
         return false;
     }
@@ -560,7 +570,25 @@ static void ggml_backend_metal_read_batch_end(ggml_backend_t backend) {
     //ggml_metal_buffer_t buf_ctx_src = (ggml_metal_buffer_t)buf_src->context;
     //ggml_metal_buffer_t buf_ctx_dst = (ggml_metal_buffer_t)buf_dst->context;
 
-    return ggml_metal_cpy_tensor_async(ctx_src, ctx_dst, src, dst);
+    return ggml_metal_cpy_tensor_async_ex(ctx_src, ctx_dst, src, dst, prefer_events, hold_dst);
+}
+
+// Peer costs a third of the decode, so it only pays from a batch up. Both the layer
+// hand-off below and the allreduce read the same threshold.
+static int64_t ggml_metal_peer_min_batch(void) {
+    static int64_t v = -1;
+    if (v < 0) {
+        const char * s = getenv("TOSH_MGPU_PEER_MIN_BATCH");
+        v = s ? atoll(s) : 32;
+    }
+    return v;
+}
+
+static bool ggml_backend_metal_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
+    // A layer hand-off crosses one token at a time, which is the shape peer is worst at.
+    const int64_t batch = src->ne[0] > 0 ? ggml_nelements(src)/src->ne[0] : 1;
+    const bool prefer_events = batch < ggml_metal_peer_min_batch();
+    return ggml_backend_metal_cpy_tensor_async_ex(backend_src, backend_dst, src, dst, prefer_events, /*hold_dst =*/ false);
 }
 
 static enum ggml_status ggml_backend_metal_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
@@ -966,7 +994,179 @@ static void ggml_backend_metal_fusion_set_enabled(ggml_backend_fusion_t finfo, b
     ggml_metal_fusion_info_set_enabled((struct ggml_metal_fusion_info *) finfo, enabled);
 }
 
+// Tensor split reduces after every subgraph. The meta backend's generic path spends a full
+// graph submission per device on each of those adds; here the copy and the add are issued
+// directly, which is what the CUDA and SYCL backends already do for themselves.
+struct ggml_backend_metal_comm_context {
+    std::vector<ggml_backend_t>         backends;
+    // scratch per device and reduction step: reusing one per device would let a step
+    // overwrite what the previous one is still reducing
+    std::vector<ggml_backend_buffer_t>  tmp;
+    std::vector<size_t>                 tmp_size;
+    size_t                              n_steps = 0;
+// Butterfly reduction over the largest power of two that fits, same schedule as the generic
+// path: fold the devices past it, exchange, then copy the result back to them.
+static size_t ggml_backend_metal_comm_offset_max(size_t n_backends) {
+    size_t offset = n_backends/2;
+    while ((offset & (offset - 1)) != 0) {
+        offset--;
+    }
+    return offset;
+}
+
+static size_t ggml_backend_metal_comm_n_steps(size_t n_backends) {
+    const size_t offset_max = ggml_backend_metal_comm_offset_max(n_backends);
+
+    size_t n_steps = n_backends > 2*offset_max ? 1 : 0;
+    for (size_t offset = offset_max; offset >= 1; offset /= 2) {
+        n_steps++;
+    }
+
+    return n_steps;
+}
+
+static void * ggml_backend_metal_comm_init(ggml_backend_t * backends, size_t n_backends) {
+    if (n_backends < 2 || getenv("TOSH_MGPU_COMM_DISABLE") != NULL) {
+        return nullptr;
+    }
+
+    for (size_t i = 0; i < n_backends; i++) {
+        if (!ggml_backend_is_metal(backends[i])) {
+            return nullptr;
+        }
+    }
+
+    auto * comm_ctx = new ggml_backend_metal_comm_context;
+    comm_ctx->backends.assign(backends, backends + n_backends);
+    comm_ctx->n_steps = ggml_backend_metal_comm_n_steps(n_backends);
+    comm_ctx->tmp.assign(n_backends*comm_ctx->n_steps, nullptr);
+    comm_ctx->tmp_size.assign(n_backends*comm_ctx->n_steps, 0);
+
+    if (n_backends > 2) {
+        GGML_LOG_WARN("%s: reducing across %zu devices in %zu steps\n", __func__, n_backends, comm_ctx->n_steps);
+    }
+
+    return comm_ctx;
+}
+
+static void ggml_backend_metal_comm_free(void * comm_ctx_v) {
+    auto * comm_ctx = (ggml_backend_metal_comm_context *) comm_ctx_v;
+    for (auto & buf : comm_ctx->tmp) {
+        if (buf != nullptr) {
+            ggml_backend_buffer_free(buf);
+        }
+    delete comm_ctx;
+}
+static bool ggml_backend_metal_comm_allreduce_tensor(void * comm_ctx_v, ggml_tensor ** tensors) {
+    auto * comm_ctx = (ggml_backend_metal_comm_context *) comm_ctx_v;
+
+    const size_t n_backends = comm_ctx->backends.size();
+
+    if (tensors[0] == nullptr || tensors[0]->type != GGML_TYPE_F32) {
+
+    const int64_t ne = ggml_nelements(tensors[0]);
+    if (ne == 0) {
+        return true;
+    }
+    for (size_t i = 0; i < n_backends; i++) {
+        ggml_tensor * t = tensors[i];
+        if (t == nullptr || t->type != GGML_TYPE_F32 || ggml_nelements(t) != ne) {
+        }
+        if (!ggml_are_same_shape(t, tensors[0]) || !ggml_is_contiguous(t)) {
+        }
+        if (!ggml_backend_buffer_is_metal(t->buffer)) {
+        }
+        if (!(t->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+
+    const size_t size = ggml_nbytes(tensors[0]);
+    const size_t n_steps = comm_ctx->n_steps;
+
+    for (size_t k = 0; k < n_backends*n_steps; k++) {
+        if (comm_ctx->tmp_size[k] < size) {
+            ggml_backend_buffer_t buf = ggml_backend_alloc_buffer(comm_ctx->backends[k/n_steps], size);
+            if (buf == nullptr) {
+                return false;
+            }
+            if (comm_ctx->tmp[k] != nullptr) {
+                ggml_backend_buffer_free(comm_ctx->tmp[k]);
+            }
+            comm_ctx->tmp[k] = buf;
+            comm_ctx->tmp_size[k] = size;
+        }
+    }
+
+    // stack views onto the scratch buffers, so the existing cross-device copy is reused as is
+    std::vector<ggml_tensor> tmp(n_backends);
+    auto view_tmp = [&](size_t i, size_t step) {
+        tmp[i] = *tensors[i];
+        tmp[i].buffer    = comm_ctx->tmp[i*n_steps + step];
+        tmp[i].data      = ggml_backend_buffer_get_base(tmp[i].buffer);
+        tmp[i].view_src  = nullptr;
+        tmp[i].view_offs = 0;
+        tmp[i].src[0]    = nullptr;
+        tmp[i].src[1]    = nullptr;
+    };
+
+    for (size_t i = 0; i < n_backends; i++) {
+        view_tmp(i, 0);
+        ggml_metal_t ctx = (ggml_metal_t) comm_ctx->backends[i]->context;
+        if (!ggml_metal_add_inplace_supported(ctx, tensors[i], &tmp[i])) {
+    }
+
+    // The peer copy has the higher bandwidth and the event hand-off the lower fixed cost, so
+    // the batch decides: peer wins the prefill, events the decode.
+    const bool prefer_events = ne / tensors[0]->ne[0] < ggml_metal_peer_min_batch();
+
+    // the add goes into the command buffer the copy already opened; kill switch because that
+    // buffer stays open between the two calls
+    static int fuse = -1;
+    if (fuse < 0) {
+        fuse = getenv("TOSH_MGPU_FUSE_ADD_DISABLE") == NULL ? 1 : 0;
+    }
+    const bool hold_dst = fuse == 1;
+
+    // Bailing out is only safe while no device has reduced anything: past that the generic
+    // path would add the partial sums a second time.
+    bool reduced = false;
+        view_tmp(j_dst, step);
+        return ok;
+    };
+    auto reduce = [&](size_t j_dst) {
+        ggml_metal_t ctx = (ggml_metal_t) comm_ctx->backends[j_dst]->context;
+        reduced = true;
+    const size_t offset_max = ggml_backend_metal_comm_offset_max(n_backends);
+
+    size_t step = 0;
+    if (n_backends > 2*offset_max) {
+        for (size_t j_src = 2*offset_max; j_src < n_backends; j_src++) {
+        }
+        for (size_t j_src = 2*offset_max; j_src < n_backends; j_src++) {
+        step++;
+    }
+
+    // Every exchange of a step must read the partner's tensor before its own add rewrites it,
+    // so the copies all go out before any of the adds.
+    for (size_t offset = offset_max; offset >= 1; offset /= 2) {
+        for (size_t j = 0; j < 2*offset_max; j++) {
+        }
+        for (size_t j = 0; j < 2*offset_max; j++) {
+        step++;
+    }
+
+    for (size_t j = 2*offset_max; j < n_backends; j++) {
+        const size_t j_src = j - 2*offset_max;
+}
+
 static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (strcmp(name, "ggml_backend_comm_init") == 0) {
+        return (void *)ggml_backend_metal_comm_init;
+    }
+    if (strcmp(name, "ggml_backend_comm_free") == 0) {
+        return (void *)ggml_backend_metal_comm_free;
+    }
+    if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
+        return (void *)ggml_backend_metal_comm_allreduce_tensor;
+    }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_metal_get_features;
     }

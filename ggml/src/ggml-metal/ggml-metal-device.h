@@ -395,10 +395,15 @@ bool   ggml_metal_buffer_is_shared(ggml_metal_buffer_t buf);
 
 void   ggml_metal_buffer_memset_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * tensor, uint8_t value, size_t offset, size_t size);
 void   ggml_metal_buffer_set_tensor   (ggml_metal_buffer_t buf, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size);
+void   ggml_metal_buffer_set_tensor_2d(ggml_metal_buffer_t buf, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size,
+                                       size_t n_copies, size_t stride_tensor, size_t stride_data);
 void   ggml_metal_buffer_get_tensor   (ggml_metal_buffer_t buf, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size);
+
 // small host<->device transfers through the device's persistent staging buffer
 // (synchronous); false when the size exceeds the stage, so callers fall back
 bool   ggml_metal_device_stage_set(ggml_metal_device_t dev, struct ggml_metal_buffer_id bid_dst, const void * data, size_t size);
+bool   ggml_metal_device_stage_set_2d(ggml_metal_device_t dev, struct ggml_metal_buffer_id bid_dst, const void * data, size_t size,
+                                      size_t n_copies, size_t stride_tensor, size_t stride_data);
 bool   ggml_metal_device_stage_get(ggml_metal_device_t dev, struct ggml_metal_buffer_id bid_src, void * data, size_t size);
 
 // TOSH_MOE_PROFILE: per-tensor-name transfer accounting; no-op when disabled
