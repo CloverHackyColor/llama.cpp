@@ -11638,3 +11638,38 @@ void kernel_mul_mv_iq1_m_f32_v2_impl(
 MV_V2_GRID_KERNEL(iq1_m, N_R0_IQ1_M, "kernel_mul_mv_iq1_m_f32_v2")
 MV_V2_GRID_KERNEL(iq1_m, 2, "kernel_mul_mv_iq1_m_f32_v2_r2")
 MV_V2_GRID_KERNEL(iq1_m, 8, "kernel_mul_mv_iq1_m_f32_v2_r8")
+
+// the expert mat-vec runs one row block per threadgroup, so the grid kernels' walk takes one step
+#define MV_V2_ID_ADAPTER(T) \
+template<int nr0, typename args_t> \
+void kernel_mul_mv_##T##_f32_v2_id_impl( \
+        args_t args, \
+        device const char * src0, \
+        device const char * src1, \
+        device       char * dst, \
+        threadgroup  char * shmem, \
+        uint3  tgpig, \
+        ushort tiisg, \
+        ushort sgitg) { \
+    kernel_mul_mv_##T##_f32_v2_impl<nr0, args_t>(args, src0, src1, dst, shmem, tgpig, 1u << 30, tiisg, sgitg); \
+}
+
+MV_V2_ID_ADAPTER(iq3_xxs)
+MV_V2_ID_ADAPTER(iq3_s)
+MV_V2_ID_ADAPTER(iq2_s)
+MV_V2_ID_ADAPTER(iq2_xxs)
+MV_V2_ID_ADAPTER(iq2_xs)
+MV_V2_ID_ADAPTER(iq1_s)
+MV_V2_ID_ADAPTER(iq1_m)
+
+template [[host_name("kernel_mul_mv_id_q5_1_f32_L2r2")]]  kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<mul_vec_q_n_f32_l_impl<block_q5_1, 2, 2>>>;
+template [[host_name("kernel_mul_mv_id_q5_K_f32_v2")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q5_K_f32_v2_impl<N_R0_Q5_K>>>;
+template [[host_name("kernel_mul_mv_id_q3_K_f32_v2")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q3_K_f32_v2_impl<N_R0_Q3_K>>>;
+template [[host_name("kernel_mul_mv_id_q2_K_f32_v2")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q2_K_f32_v2_impl<N_R0_Q2_K>>>;
+template [[host_name("kernel_mul_mv_id_iq3_xxs_f32_v2")]] kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq3_xxs_f32_v2_id_impl<N_R0_IQ3_XXS>>>;
+template [[host_name("kernel_mul_mv_id_iq3_s_f32_v2")]]   kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq3_s_f32_v2_id_impl<N_R0_IQ3_S>>>;
+template [[host_name("kernel_mul_mv_id_iq2_s_f32_v2")]]   kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq2_s_f32_v2_id_impl<N_R0_IQ2_S>>>;
+template [[host_name("kernel_mul_mv_id_iq2_xxs_f32_v2")]] kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq2_xxs_f32_v2_id_impl<N_R0_IQ2_XXS>>>;
+template [[host_name("kernel_mul_mv_id_iq2_xs_f32_v2")]]  kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq2_xs_f32_v2_id_impl<N_R0_IQ2_XS>>>;
+template [[host_name("kernel_mul_mv_id_iq1_s_f32_v2")]]   kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq1_s_f32_v2_id_impl<N_R0_IQ1_S>>>;
+template [[host_name("kernel_mul_mv_id_iq1_m_f32_v2")]]   kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq1_m_f32_v2_id_impl<N_R0_IQ1_M>>>;

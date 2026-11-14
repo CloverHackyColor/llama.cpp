@@ -2467,6 +2467,21 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
         else if (lut) { nw = (int16_t) props_id->simd_width; smem = (size_t) nw*sizeof(float); }
     }
 
+    // the 32-lane expert mat-vec takes the same kernels as the dense one
+    if (!id_w64 && nw == 32 && suffix[0] == '\0') {
+        static const bool v2 = TOSH_ENV("TOSH_MV_V2_DISABLE") == nullptr;
+        if (v2 && (tsrc0 == GGML_TYPE_IQ3_XXS || tsrc0 == GGML_TYPE_IQ3_S  || tsrc0 == GGML_TYPE_IQ2_S  ||
+                   tsrc0 == GGML_TYPE_IQ2_XXS || tsrc0 == GGML_TYPE_IQ2_XS || tsrc0 == GGML_TYPE_IQ1_S  ||
+                   tsrc0 == GGML_TYPE_IQ1_M   || tsrc0 == GGML_TYPE_Q3_K   || tsrc0 == GGML_TYPE_Q2_K   ||
+                   tsrc0 == GGML_TYPE_Q5_K)) {
+            suffix = "_v2";
+        }
+        if (tsrc0 == GGML_TYPE_Q5_1 && !props_id->has_unified_memory && TOSH_ENV("TOSH_MV_Q5_1_L2_DISABLE") == nullptr) {
+            nr0    = 2;
+            suffix = "_L2r2";
+        }
+    }
+
     const bool row4 = (op->src[0]->nb[1] % 2 == 0) && (op->src[0]->nb[2] % 2 == 0) &&
                       TOSH_ENV("TOSH_MV_ROW4_DISABLE") == nullptr;
 
