@@ -643,6 +643,7 @@ struct common_params {
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
 
     std::string public_path   = "";                                                                         // NOLINT
+    std::string tiles_path    = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT
     std::string chat_template = "";                                                                         // NOLINT
     std::vector<std::string> hostnames = {"127.0.0.1"};
@@ -690,6 +691,10 @@ struct common_params {
     // MCP server configs (Cursor-compatible JSON)
     std::string mcp_servers_config;   // path to JSON file with MCP server definitions
     std::string mcp_servers_json;     // inline JSON with MCP server definitions
+    std::string mcp_agent;            // MCP server whose "run" tool answers chat completions that bring no tools
+    bool        mcp_agent_explicit = false; // the agent answers only requests with X-Tosh-Agent: on
+    std::string mcp_agent_only;       // comma-separated MCP servers whose tools only the agent may list and call
+    bool        mcp_agent_client_tools = false; // requests with tools of their own go to the agent too
 
     // router server configs
     std::string models_dir    = "";     // directory containing models for the router server

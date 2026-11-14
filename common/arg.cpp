@@ -3394,6 +3394,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_STATIC_PATH"));
     add_opt(common_arg(
+        {"--tiles-path"}, "PATH",
+        "folder of map files (PMTiles, fonts, sprites) served at /tiles/, with byte ranges",
+        [](common_params & params, const std::string & value) {
+            params.tiles_path = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_TILES_PATH"));
+    add_opt(common_arg(
         {"--cors-origins"}, "ORIGINS",
         string_format(
             "comma-separated list of allowed origins for CORS (default: %s)\n"
@@ -3495,6 +3502,35 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.mcp_servers_json = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MCP_SERVERS_JSON"));
+    add_opt(common_arg(
+        {"--mcp-agent"}, "NAME",
+        "experimental: answer /v1/chat/completions requests that bring no tools with the \"run\" tool of the MCP server NAME;\n"
+        "requests with tools, a grammar or a response format, or the header X-Tosh-Agent: off, stay raw inference (default: none)",
+        [](common_params & params, const std::string & value) {
+            params.mcp_agent = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MCP_AGENT"));
+    add_opt(common_arg(
+        {"--mcp-agent-explicit"},
+        "experimental: with --mcp-agent, answer only requests that carry X-Tosh-Agent: on or come from a page in a browser; the rest stay raw inference (default: disabled)",
+        [](common_params & params) {
+            params.mcp_agent_explicit = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MCP_AGENT_EXPLICIT"));
+    add_opt(common_arg(
+        {"--mcp-agent-only"}, "NAMES",
+        "experimental: with --mcp-agent, comma-separated MCP servers whose tools /tools lists and runs only for the agent (default: none)",
+        [](common_params & params, const std::string & value) {
+            params.mcp_agent_only = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MCP_AGENT_ONLY"));
+    add_opt(common_arg(
+        {"--mcp-agent-client-tools"},
+        "experimental: with --mcp-agent, requests that bring tools of their own go to the agent too, which hands the client the calls to its tools (default: disabled)",
+        [](common_params & params) {
+            params.mcp_agent_client_tools = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MCP_AGENT_CLIENT_TOOLS"));
     add_opt(common_arg(
         {"-ag", "--agent"},
         {"-no-ag", "--no-agent"},

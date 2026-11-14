@@ -212,80 +212,198 @@ static json mcp_result_to_response(const json & result) {
     return {{"plain_text_response", text}};
 }
 
-json server_mcp_transport::send_rpc(const json & request, const std::function<bool()> & should_stop) {
+json server_mcp_transport::send_rpc(const json & request, const std::function<bool()> & should_stop,
+                                    const std::function<void(const json &)> & on_progress) {
+    const bool has_id = request.contains("id");
+    const std::string key = has_id ? request.at("id").dump() : "";
+    // nothing is sent for a caller that already went away
+    if (has_id && should_stop && should_stop()) {
+        return {{"error", {{"code", -32603}, {"message", "cancelled"}}}};
+    }
+    {
+        std::lock_guard<std::mutex> lk(demux_mutex);
+        if (demux_closed) {
+            return {{"error", {{"code", -32603}, {"message", "transport closed"}}}};
+        }
+        if (has_id) {
+            demux_waiting.insert(key);
+        }
+    }
     if (!to_server.write(request.dump())) {
+        std::lock_guard<std::mutex> lk(demux_mutex);
+        demux_waiting.erase(key);
         return {{"error", {{"code", -32603}, {"message", "transport closed"}}}};
     }
 
-    const bool has_id = request.contains("id");
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
     auto stop = [&]() {
         return (should_stop && should_stop()) || std::chrono::steady_clock::now() >= deadline;
     };
 
-    std::string frame;
-    while (from_server.read(frame, stop, false)) {
-        json reply;
-        try {
-            reply = json::parse(frame);
-        } catch (...) {
-            if (std::chrono::steady_clock::now() >= deadline) {
-                break;
+    json reply;
+    bool got = false;
+    std::unique_lock<std::mutex> lk(demux_mutex);
+    while (true) {
+        auto it = demux_replies.find(key);
+        if (it != demux_replies.end()) {
+            reply = std::move(it->second);
+            demux_replies.erase(it);
+            got = true;
+            break;
+        }
+        auto pending = demux_progress.find(key);
+        if (pending != demux_progress.end() && !pending->second.empty()) {
+            json params = std::move(pending->second.front());
+            pending->second.pop_front();
+            lk.unlock();
+            if (on_progress) {
+                on_progress(params);
             }
+            lk.lock();
+            continue;
+        }
+        if (demux_closed || stop()) {
+            break;
+        }
+        if (demux_reading) {
+            demux_cv.wait_for(lk, std::chrono::milliseconds(200));
+            continue;
+        }
+        demux_reading = true;
+        lk.unlock();
+        std::string frame;
+        const bool read = from_server.read(frame, stop, false);
+        lk.lock();
+        demux_reading = false;
+        demux_cv.notify_all();
+        if (!read) {
+            demux_closed = demux_closed || from_server.writer_closed.load();
+            continue;
+        }
+        json message;
+        try {
+            message = json::parse(frame);
+        } catch (...) {
             continue; // skip malformed frame
         }
-        // no id: a notification. mismatched id: a stale reply from a timed-out request (ids are monotonic, never a future one)
-        if (!has_id || (reply.contains("id") && reply.at("id") == request.at("id"))) {
-            return reply;
+        if (!has_id) {
+            reply = std::move(message);
+            got = true;
+            break;
         }
-        if (std::chrono::steady_clock::now() >= deadline) {
-            break; // a flood of notifications must not outrun the deadline
+        if (message.contains("id")) {
+            const std::string id = message.at("id").dump();
+            if (id == key) {
+                reply = std::move(message);
+                got = true;
+                break;
+            }
+            // a reply nobody waits for is from a call that timed out or was cancelled: dropped
+            if (demux_waiting.count(id)) {
+                demux_replies[id] = std::move(message);
+            }
+        } else if (message.value("method", "") == "notifications/progress" && message.contains("params")) {
+            const json & params = message.at("params");
+            const std::string token = params.contains("progressToken") ? params.at("progressToken").dump() : "";
+            if (token == key) {
+                lk.unlock();
+                if (on_progress) {
+                    on_progress(params);
+                }
+                lk.lock();
+            } else if (demux_waiting.count(token)) {
+                demux_progress[token].push_back(params);
+            }
         }
     }
+    demux_waiting.erase(key);
+    demux_replies.erase(key);
+    demux_progress.erase(key);
+    const bool closed = demux_closed;
+    lk.unlock();
+    if (got) {
+        return reply;
+    }
 
+    // the server keeps working on a request nobody waits for unless it is told
+    auto cancel = [&](const char * reason) {
+        if (has_id && !closed) {
+            to_server.write(json{{"jsonrpc", "2.0"}, {"method", "notifications/cancelled"},
+                                 {"params", {{"requestId", request.at("id")}, {"reason", reason}}}}.dump());
+        }
+    };
     if (should_stop && should_stop()) {
+        cancel("the caller went away");
         return {{"error", {{"code", -32603}, {"message", "cancelled"}}}};
     }
     if (std::chrono::steady_clock::now() >= deadline) {
+        cancel("request timed out");
         return {{"error", {{"code", -32603}, {"message", "request timed out"}}}};
     }
     return {{"error", {{"code", -32603}, {"message", "transport closed"}}}};
 }
 
+static constexpr int MCP_INIT_RETRY_SECONDS = 5;
+
 bool server_mcp_transport::ensure_init(const std::function<bool()> & should_stop) {
-    if (initialized) {
-        return true;
+    {
+        std::unique_lock<std::mutex> lk(init_mutex);
+        while (!initialized && init_running) {
+            if (should_stop && should_stop()) {
+                return false;
+            }
+            init_cv.wait_for(lk, std::chrono::milliseconds(100));
+        }
+        if (initialized) {
+            return true;
+        }
+        if (std::chrono::steady_clock::now() < init_retry) {
+            return false;
+        }
+        init_running = true;
     }
 
-    json init_req = {
-        {"jsonrpc", "2.0"},
-        {"id", next_id++},
-        {"method", "initialize"},
-        {"params", {
-            {"protocolVersion", MCP_PROTOCOL_VERSION},
-            {"capabilities", json::object()},
-            {"clientInfo", {{"name", "llama.cpp"}, {"version", "1.0"}}},
-        }},
-    };
+    json init_req;
+    {
+        std::lock_guard<std::mutex> lock(rpc_mutex);
+        init_req = {
+            {"jsonrpc", "2.0"},
+            {"id", next_id++},
+            {"method", "initialize"},
+            {"params", {
+                {"protocolVersion", MCP_PROTOCOL_VERSION},
+                {"capabilities", json::object()},
+                {"clientInfo", {{"name", "llama.cpp"}, {"version", "1.0"}}},
+            }},
+        };
+    }
     json resp = send_rpc(init_req, should_stop);
-    if (!resp.contains("result")) {
+    const bool ok = resp.contains("result");
+    if (ok) {
+        // notifications/initialized: no id, no reply expected
+        json notif = {{"jsonrpc", "2.0"}, {"method", "notifications/initialized"}};
+        to_server.write(notif.dump());
+    } else {
+        std::lock_guard<std::mutex> lock(rpc_mutex);
         last_error = "initialize failed: " + rpc_error_message(resp);
-        return false;
     }
 
-    // notifications/initialized: no id, no reply expected
-    json notif = {{"jsonrpc", "2.0"}, {"method", "notifications/initialized"}};
-    to_server.write(notif.dump());
-
-    initialized = true;
-    return true;
+    std::lock_guard<std::mutex> lk(init_mutex);
+    init_running = false;
+    initialized  = ok;
+    // a caller that went away says nothing about the server, so the next one tries at once
+    if (!ok && !(should_stop && should_stop())) {
+        init_retry = std::chrono::steady_clock::now() + std::chrono::seconds(MCP_INIT_RETRY_SECONDS);
+    }
+    init_cv.notify_all();
+    return ok;
 }
 
 std::vector<server_mcp_tool_def> server_mcp_transport::list_tools(const std::function<bool()> & should_stop) {
-    std::lock_guard<std::mutex> lock(rpc_mutex);
     if (!ensure_init(should_stop)) {
         return {};
     }
+    std::lock_guard<std::mutex> lock(rpc_mutex);
     if (!tools.empty()) {
         return tools;
     }
@@ -315,19 +433,35 @@ std::vector<server_mcp_tool_def> server_mcp_transport::list_tools(const std::fun
 
 json server_mcp_transport::call_tool(const std::string & tool_name,
                                      const json & arguments,
-                                     const std::function<bool()> & should_stop) {
-    std::lock_guard<std::mutex> lock(rpc_mutex);
-    if (!ensure_init(should_stop)) {
-        return {{"error", last_error}};
+                                     const std::function<bool()> & should_stop,
+                                     const std::function<void(const json &)> & on_progress) {
+    // a call queued behind another only starts its timeout once it is sent, and gives up its place if its caller goes
+    std::unique_lock<std::timed_mutex> serial(call_mutex, std::defer_lock);
+    if (!concurrent) {
+        while (!serial.try_lock_for(std::chrono::milliseconds(100))) {
+            if (should_stop && should_stop()) {
+                return {{"error", "cancelled"}};
+            }
+        }
     }
-
-    json req = {
-        {"jsonrpc", "2.0"},
-        {"id", next_id++},
-        {"method", "tools/call"},
-        {"params", {{"name", tool_name}, {"arguments", arguments}}},
-    };
-    json resp = send_rpc(req, should_stop);
+    const bool ready = ensure_init(should_stop);
+    json req;
+    {
+        std::lock_guard<std::mutex> lock(rpc_mutex);
+        if (!ready) {
+            return {{"error", last_error}};
+        }
+        req = {
+            {"jsonrpc", "2.0"},
+            {"id", next_id++},
+            {"method", "tools/call"},
+            {"params", {{"name", tool_name}, {"arguments", arguments}}},
+        };
+    }
+    if (on_progress) {
+        req["params"]["_meta"] = {{"progressToken", req.at("id")}};
+    }
+    json resp = send_rpc(req, should_stop, on_progress);
     if (resp.contains("error")) {
         return {{"error", rpc_error_message(resp)}};
     }
@@ -670,6 +804,7 @@ const server_mcp_server_config * server_mcp::find_config(const std::string & nam
 }
 
 void server_mcp::start(const common_params & params) {
+    agent_name = params.mcp_agent;
     auto append = [this](const std::string & json_str) {
         try {
             auto parsed = server_mcp_server_config::parse_from_json(json_str);
@@ -727,6 +862,14 @@ void server_mcp::start(const common_params & params) {
     registry.swap(discovered);
 }
 
+std::vector<std::string> server_mcp::server_names() const {
+    std::vector<std::string> names;
+    for (const auto & c : configs) {
+        names.push_back(c.name);
+    }
+    return names;
+}
+
 std::vector<server_mcp_tool_def> server_mcp::list_tools() const {
     std::lock_guard<std::mutex> lock(mutex);
     return registry;
@@ -735,7 +878,8 @@ std::vector<server_mcp_tool_def> server_mcp::list_tools() const {
 json server_mcp::call_tool(const std::string & server_name,
                            const std::string & tool_name,
                            const json & arguments,
-                           const std::function<bool()> & should_stop) {
+                           const std::function<bool()> & should_stop,
+                           const std::function<void(const json &)> & on_progress) {
     auto transport = get_or_create(server_name);
     if (!transport) {
         return {{"error", "MCP server unavailable: " + server_name}};
@@ -744,7 +888,7 @@ json server_mcp::call_tool(const std::string & server_name,
     auto stop = [this, &should_stop]() {
         return stopping.load() || (should_stop && should_stop());
     };
-    return transport->call_tool(tool_name, arguments, stop);
+    return transport->call_tool(tool_name, arguments, stop, on_progress);
 }
 
 std::shared_ptr<server_mcp_transport> server_mcp::get_or_create(const std::string & name) {
@@ -779,6 +923,7 @@ std::shared_ptr<server_mcp_transport> server_mcp::get_or_create(const std::strin
         const server_mcp_server_config * cfg = find_config(name);
         if (cfg) {
             auto fresh = create_transport(*cfg);
+            fresh->concurrent = name == agent_name;
             if (fresh->start() && fresh->is_alive()) {
                 transports[name] = fresh;
                 result = fresh;

@@ -368,6 +368,16 @@ bool server_http_context::init_listener(const common_params & params) {
     // Web UI setup
     //
 
+    // a map reads its tiles in byte ranges; the CORS middleware above answers for the origin
+    if (!params.tiles_path.empty()) {
+        httplib::Headers tile_headers = {{"Access-Control-Expose-Headers", "Content-Length, Content-Range, ETag"}};
+        if (const auto is_found = srv->set_mount_point(params.api_prefix + "/tiles", params.tiles_path, tile_headers);
+            !is_found) {
+            SRV_ERR("tiles path not found: %s\n", params.tiles_path.c_str());
+            return false;
+        }
+    }
+
     // Use new `params.ui` field (backed by old `params.webui` for compat)
     if (!params.ui) {
         SRV_INF("%s", "The UI is disabled\n");
@@ -682,7 +692,8 @@ void server_http_context::get(const std::string & path, const server_http_contex
             build_query_string(req),
             req.body,
             {},
-            req.is_connection_closed
+            req.is_connection_closed,
+            req.remote_addr
         });
         server_http_res_ptr response = handler(*request);
         process_handler_response(std::move(request), response, res);
@@ -733,7 +744,8 @@ void server_http_context::post(const std::string & path, const server_http_conte
             build_query_string(req),
             body,
             std::move(files),
-            req.is_connection_closed
+            req.is_connection_closed,
+            req.remote_addr
         });
         server_http_res_ptr response = handler(*request);
         process_handler_response(std::move(request), response, res);
@@ -754,7 +766,8 @@ void server_http_context::del(const std::string & path, const server_http_contex
             build_query_string(req),
             req.body,
             {},
-            req.is_connection_closed
+            req.is_connection_closed,
+            req.remote_addr
         });
         server_http_res_ptr response = handler(*request);
         process_handler_response(std::move(request), response, res);
