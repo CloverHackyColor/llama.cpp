@@ -59,6 +59,9 @@ struct ggml_metal_pipeline_with_params {
 
     // lanes per simdgroup the dispatch asks for; 0 keeps the 32-lane default
     int sgw;
+
+    // most threadgroups a dispatch launches, for kernels that walk row blocks; 0 is one per block
+    int ntg;
 };
 
 int ggml_metal_pipeline_max_theads_per_threadgroup(struct ggml_metal_pipeline_with_params pipeline);

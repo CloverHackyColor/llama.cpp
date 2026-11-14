@@ -1966,6 +1966,18 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
     // 22-, 34-, 98-, 110- and 210-byte types, so the wide read splits in two there.
     const bool align = props->needs_aligned_loads;
 
+    // the low-bit rewrites keep the standalone geometry, so every 32-lane device takes them
+    {
+        static const bool v2 = TOSH_ENV("TOSH_MV_V2_DISABLE") == nullptr;
+        if (v2 && suffix[0] == '\0' && nw == 32 &&
+            (tsrc0 == GGML_TYPE_IQ3_XXS || tsrc0 == GGML_TYPE_IQ3_S || tsrc0 == GGML_TYPE_IQ2_S ||
+             tsrc0 == GGML_TYPE_IQ2_XXS || tsrc0 == GGML_TYPE_IQ2_XS || tsrc0 == GGML_TYPE_IQ1_S ||
+             tsrc0 == GGML_TYPE_IQ1_M   || tsrc0 == GGML_TYPE_Q3_K  || tsrc0 == GGML_TYPE_Q2_K  ||
+             tsrc0 == GGML_TYPE_Q5_K)) {
+            suffix = "_v2";
+        }
+    }
+
     // Sweep hook: TOSH_SWEEP_TYPE names one ggml type and TOSH_SWEEP_NR0 / TOSH_SWEEP_NSG
     // force its rows per lane and simdgroups, so the register front can be measured without
     // rebuilding. The pipeline name carries both, so a run can be checked against what it asked.
@@ -1978,7 +1990,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
 
             const char * sln = TOSH_ENV("TOSH_SWEEP_LANES");
 
-            if (snr != nullptr && sln != nullptr) {
+            if (snr != nullptr && strcmp(suffix, "_v2") == 0) {
+                nr0 = atoi(snr);
+                snprintf(sweep_sfx, sizeof(sweep_sfx), "_v2_r%d", nr0);
+                suffix = sweep_sfx;
+            } else if (snr != nullptr && sln != nullptr) {
                 // cross sweep: the 32-block family carries one entry point per (lanes, rows)
                 nr0 = atoi(snr);
                 snprintf(sweep_sfx, sizeof(sweep_sfx), "_L%dr%d", atoi(sln), nr0);
@@ -2046,6 +2062,14 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
     res.nr1  = nr1;
     res.nsg  = nsg;
     res.smem = smem;
+
+    // a grid kernel stages its table once per threadgroup, which measured worth amortizing from
+    // 2 KB up except on iq2_xxs; 640 threadgroups still fill the largest cards it runs on.
+    // TOSH_MV_NTG overrides, 0 is no cap
+    if (strncmp(suffix, "_v2", 3) == 0 && smem > 0) {
+        static const int ntg_env = TOSH_ENV("TOSH_MV_NTG") ? atoi(TOSH_ENV("TOSH_MV_NTG")) : -1;
+        res.ntg = ntg_env >= 0 ? ntg_env : (smem >= 2048 && tsrc0 != GGML_TYPE_IQ2_XXS ? 640 : 0);
+    }
 
     return res;
 }

@@ -849,6 +849,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline(ggml_meta
         /*.c4       =*/ false,
         /*.cnt      =*/ false,
         /*.sgw      =*/ 0,
+        /*.ntg      =*/ 0,
     };
 
     res.pipeline = ggml_metal_pipelines_get(lib->pipelines, name);
@@ -868,6 +869,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
         /*.c4       =*/ false,
         /*.cnt      =*/ false,
         /*.sgw      =*/ 0,
+        /*.ntg      =*/ 0,
     };
 
     [lib->lock lock];
