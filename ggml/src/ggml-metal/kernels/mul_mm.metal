@@ -276,6 +276,8 @@ kernel void kernel_mul_mm(
                 if (FC_mul_mm_uniform_scale && NLR == 8 &&
                     (is_same<block_q, block_q4_K>::value || is_same<block_q, block_q5_K>::value)) {
                     dequantize_lo(x, il, (loop_k & 128) == 0, temp_a);
+                } else if (FC_mul_mm_manual && has_dequantize_words<block_q>()) {
+                    dequantize_words(x, il, temp_a);
                 } else {
                     dequantize_func(x, il, temp_a);
                 }
@@ -847,7 +849,11 @@ kernel void kernel_mul_mm_id(
             }
         } else {
             S0_4x4 temp_a;
-            dequantize_func(x, il, temp_a);
+            if (FC_mul_mm_manual && has_dequantize_words<block_q>()) {
+                dequantize_words(x, il, temp_a);
+            } else {
+                dequantize_func(x, il, temp_a);
+            }
 
             threadgroup_barrier(mem_flags::mem_threadgroup);
 

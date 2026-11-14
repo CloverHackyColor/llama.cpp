@@ -1175,12 +1175,6 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     // a single number would have to pick whom to hurt (q8_0 gains 3.7% where q4_K loses 3.1%).
     // Types with no measurement of their own keep the width default.
     int wide_floor = wide_floor_env ? wide_floor_env : (simd_width == 64 ? 448 : 112);
-    // On 32 lanes q5_0 and q5_1 never earn the wide tile: it costs them 5 to 30% from 48 to
-    // 2048 tokens, while the same tile is worth 24% to them on 64 lanes.
-    if (!wide_floor_env && simd_width == 32 &&
-        (tsrc0 == GGML_TYPE_Q5_0 || tsrc0 == GGML_TYPE_Q5_1)) {
-        wide_floor = INT32_MAX;
-    }
     if (!wide_floor_env && simd_width == 64) {
         switch (tsrc0) {
             // measured one type at a time over 128/192/256/384 tokens: 192 is where the tile

@@ -697,6 +697,218 @@ void dequantize_lo(device const block_q5_K * xb, short il, bool lo, thread type4
     dequantize_q5_K_impl<true>(xb, il, lo, reg);
 }
 
+// Word-sized reads for the manual GEMM path, where narrow device loads are what the dequant
+// pays for. q8_0 and q4_0 blocks sit on 2 bytes (q4_0 on 4 every other block), q4_1 and q2_K
+// on 4. q3_K and q6_K lose with the alignment branch, so they keep their own dequant.
+template <typename block_q>
+constexpr bool has_dequantize_words() {
+    return is_same<block_q, block_q8_0>::value || is_same<block_q, block_q4_0>::value ||
+           is_same<block_q, block_q4_1>::value || is_same<block_q, block_q2_K>::value ||
+           is_same<block_q, block_q5_0>::value || is_same<block_q, block_q5_1>::value ||
+           is_same<block_q, block_mxfp4>::value;
+}
+
+// 16 bytes on a 4-byte boundary
+static inline uint4 load_words16(device const uint16_t * p) {
+    device const uint * q = (device const uint *) p;
+    return uint4(q[0], q[1], q[2], q[3]);
+}
+
+static inline ushort word_half(uint4 w, int i) {
+    return (i & 1) ? ushort(w[i/2] >> 16) : ushort(w[i/2] & 0xFFFF);
+}
+
+template <typename block_q, typename type4x4>
+void dequantize_words(device const block_q * xb, short il, thread type4x4 & reg) {}
+
+template <typename type4x4>
+void dequantize_words(device const block_q8_0 * xb, short il, thread type4x4 & reg) {
+    // a packed char4 still becomes four byte loads off a 4-byte boundary
+    device const ushort * qs = (device const ushort *) xb->qs + 8*(int)il;
+    const float d = xb->d;
+
+    float4x4 reg_f;
+
+    for (int i = 0; i < 4; i++) {
+        const char2 lo = as_type<char2>(qs[2*i + 0]);
+        const char2 hi = as_type<char2>(qs[2*i + 1]);
+        reg_f[i] = float4(lo.x, lo.y, hi.x, hi.y) * d;
+    }
+
+    reg = (type4x4) reg_f;
+}
+
+template <typename type4x4>
+void dequantize_words(device const block_q4_0 * xb, short il, thread type4x4 & reg) {
+    device const uint16_t * q16 = (device const uint16_t *) xb;
+    half dh;
+    uint4 w;
+    if ((ulong) xb & 2) {
+        device const uint * q = (device const uint *)(q16 + 1);
+        dh = as_type<half>(q16[0]);
+        w  = uint4(q[0], q[1], q[2], q[3]);
+    } else {
+        // d and the first two quants share a word; the last two quants are read on their own
+        device const uint * q = (device const uint *) q16;
+        const uint a0 = q[0], a1 = q[1], a2 = q[2], a3 = q[3];
+        const uint h  = q16[8];
+        dh = as_type<half>(ushort(a0 & 0xFFFF));
+        w  = uint4((a0 >> 16) | (a1 << 16), (a1 >> 16) | (a2 << 16), (a2 >> 16) | (a3 << 16), (a3 >> 16) | (h << 16));
+    }
+
+    const float d1 = il ? (dh / 16.h) : dh;
+    const float d2 = d1 / 256.f;
+    const float md = -8.h * dh;
+    const ushort mask0 = il ? 0x00F0 : 0x000F;
+    const ushort mask1 = mask0 << 8;
+
+    float4x4 reg_f;
+
+    for (int i = 0; i < 8; i++) {
+        const ushort qsi = word_half(w, i);
+        reg_f[i/2][2*(i%2) + 0] = d1 * (qsi & mask0) + md;
+        reg_f[i/2][2*(i%2) + 1] = d2 * (qsi & mask1) + md;
+    }
+
+    reg = (type4x4) reg_f;
+}
+
+template <typename type4x4>
+void dequantize_words(device const block_q4_1 * xb, short il, thread type4x4 & reg) {
+    device const uint32_t * q32 = (device const uint32_t *) xb;
+    const half2 dm = as_type<half2>(q32[0]);
+    const uint4 w  = uint4(q32[1], q32[2], q32[3], q32[4]);
+
+    const float d1 = il ? (dm.x / 16.h) : dm.x;
+    const float d2 = d1 / 256.f;
+    const float  m = dm.y;
+    const ushort mask0 = il ? 0x00F0 : 0x000F;
+    const ushort mask1 = mask0 << 8;
+
+    float4x4 reg_f;
+
+    for (int i = 0; i < 8; i++) {
+        const ushort qsi = word_half(w, i);
+        reg_f[i/2][2*(i%2) + 0] = ((qsi & mask0) * d1) + m;
+        reg_f[i/2][2*(i%2) + 1] = ((qsi & mask1) * d2) + m;
+    }
+
+    reg = (type4x4) reg_f;
+}
+
+// The fifth bit goes into the integer next to its nibble, so each weight is still one exact
+// product and one add, as in dequantize_q5_0, with no per-weight shifts of the nibble.
+template <typename type4x4>
+static inline void dequantize_q5_words(uint4 w, uint qh, float d, float m, short il, thread type4x4 & reg) {
+    const float d1 = il ? d/16.f : d;
+    const float d2 = d1/256.f;
+    const ushort mask0 = il ? 0x00F0 : 0x000F;
+    const ushort mask1 = mask0 << 8;
+    const uint hq = qh >> (16*il);
+    const short s0 = 4 + 4*il;
+
+    float4x4 reg_f;
+
+    for (int i = 0; i < 8; i++) {
+        const uint u  = word_half(w, i);
+        const uint x0 = (u & mask0) | (((hq >> (2*i    )) & 1) << s0);
+        const uint x1 = (u & mask1) | (((hq >> (2*i + 1)) & 1) << (s0 + 8));
+        reg_f[i/2][2*(i%2) + 0] = d1 * x0 + m;
+        reg_f[i/2][2*(i%2) + 1] = d2 * x1 + m;
+    }
+
+    reg = (type4x4) reg_f;
+}
+
+// 22-byte blocks: every other one starts 2 past a 4-byte boundary, which puts qh and qs on 4
+template <typename type4x4>
+void dequantize_words(device const block_q5_0 * xb, short il, thread type4x4 & reg) {
+    device const uint16_t * q16 = (device const uint16_t *) xb;
+    float d;
+    uint qh;
+    uint4 w;
+    if ((ulong) xb & 2) {
+        device const uint * q = (device const uint *)(q16 + 1);
+        d  = as_type<half>(q16[0]);
+        qh = q[0];
+        w  = uint4(q[1], q[2], q[3], q[4]);
+    } else {
+        // d shares a word with half of qh, and qh with the first two quants
+        device const uint * q = (device const uint *) q16;
+        d  = as_type<half>(ushort(q[0] & 0xFFFF));
+        qh = (q[0] >> 16) | (q[1] << 16);
+        w  = uint4((q[1] >> 16) | (q[2] << 16), (q[2] >> 16) | (q[3] << 16), (q[3] >> 16) | (q[4] << 16), (q[4] >> 16) | (uint(q16[10]) << 16));
+    }
+    dequantize_q5_words(w, qh, d, -16.f*d, il, reg);
+}
+
+// 24-byte blocks: always on 4 bytes
+template <typename type4x4>
+void dequantize_words(device const block_q5_1 * xb, short il, thread type4x4 & reg) {
+    device const uint * q = (device const uint *) xb;
+    const half2 dm = as_type<half2>(q[0]);
+    dequantize_q5_words(uint4(q[2], q[3], q[4], q[5]), q[1], dm.x, dm.y, il, reg);
+}
+
+// 84-byte blocks: always on 4 bytes
+template <typename type4x4>
+void dequantize_words(device const block_q2_K * xb, short il, thread type4x4 & reg) {
+    const half2 dm = as_type<half2>(*((device const uint *) &xb->d));
+    const float d = dm.x;
+    const float min = dm.y;
+    const uint8_t sc = xb->scales[il];
+
+    const int qoff = 32*((int) il/8) + 16*((int) il & 1);
+    const uint4 qw = load_words16((device const uint16_t *)(xb->qs + qoff));
+    il = (il/2)%4;
+
+    half  coef = il>1 ? (il>2 ? 1/64.h : 1/16.h) : (il>0 ? 1/4.h : 1.h);
+    uchar mask = il>1 ? (il>2 ? 192    : 48)     : (il>0 ? 12    : 3);
+    const float dl = d * (sc & 0xF) * coef, ml = min * (sc >> 4);
+
+    const ushort mask1 = (ushort) mask << 8;
+    const float  dl2   = dl / 256.f;
+
+    float4x4 reg_f;
+
+    for (int i = 0; i < 8; ++i) {
+        const ushort qv = word_half(qw, i);
+        reg_f[i/2][2*(i%2) + 0] = dl  * (qv & mask)  - ml;
+        reg_f[i/2][2*(i%2) + 1] = dl2 * (qv & mask1) - ml;
+    }
+
+    reg = (type4x4) reg_f;
+}
+
+// 17-byte blocks start on any byte, so five words from the boundary below cover one. The fifth
+// can reach 3 bytes past the block, which stays inside the tensor's padded allocation.
+template <typename type4x4>
+void dequantize_words(device const block_mxfp4 * xb, short il, thread type4x4 & reg) {
+    const uint s = (uint) ((ulong) xb & 3);
+    device const uint * q = (device const uint *) ((device const uint8_t *) xb - s);
+    const uint q0 = q[0], q1 = q[1], q2 = q[2], q3 = q[3], q4 = q[4];
+
+    // 64-bit shifts, since s == 3 moves a whole word
+    const uint sh = 8*s + 8;
+    const uint4 w = uint4(uint(as_type<ulong>(uint2(q0, q1)) >> sh), uint(as_type<ulong>(uint2(q1, q2)) >> sh),
+                          uint(as_type<ulong>(uint2(q2, q3)) >> sh), uint(as_type<ulong>(uint2(q3, q4)) >> sh));
+
+    const float d = e8m0_to_fp32(uint8_t(q0 >> 8*s));
+    const uint shr = 4*il;
+
+    float4x4 reg_f;
+
+    for (int i = 0; i < 4; ++i) {
+        const uint x = w[i] >> shr;
+        reg_f[i][0] = d * kvalues_mxfp4_f[(x      ) & 0x0F];
+        reg_f[i][1] = d * kvalues_mxfp4_f[(x >>  8) & 0x0F];
+        reg_f[i][2] = d * kvalues_mxfp4_f[(x >> 16) & 0x0F];
+        reg_f[i][3] = d * kvalues_mxfp4_f[(x >> 24) & 0x0F];
+    }
+
+    reg = (type4x4) reg_f;
+}
+
 template <typename type4x4>
 void dequantize_q6_K(device const block_q6_K *xb, short il, thread type4x4 & reg) {
     const half d_all = xb->d;
