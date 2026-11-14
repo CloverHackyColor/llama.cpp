@@ -1,4 +1,6 @@
 #include "llama-graph.h"
+#include "llama-vocab.h"
+
 #ifdef TOSH_ENABLE_DYNAMIC_MOE
 #include "tosh-dmoe.h"
 #endif
@@ -1613,6 +1615,36 @@ ggml_tensor * llm_graph_context::build_hadamard_lookup(
     return rows;
 }
 
+ggml_tensor * llm_graph_context::build_mtp_head(
+        const llama_vocab & vocab,
+              ggml_tensor * head_w,
+              ggml_tensor * head_s,
+              ggml_tensor * cur) const {
+    const int64_t n_vocab = head_w->ne[1];
+    // Qwen 3.x keeps the byte-level BPE ranks of its 151643-token predecessor first; the rows after
+    // them are rarer scripts, which a draft seldom needs and every draft token pays to score
+    static const int64_t rows = getenv("TOSH_MTP_HEAD_ROWS") ? atoll(getenv("TOSH_MTP_HEAD_ROWS")) : 151643;
+    static const int64_t tail = [&] {
+        for (int64_t id = std::max<int64_t>(rows, 0); id < n_vocab; ++id) {
+            if (vocab.token_get_attr((llama_token) id) & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED)) {
+                return id;
+            }
+        }
+        return n_vocab;
+    }();
+    if (rows <= 0 || n_vocab <= 200000 || rows >= n_vocab || head_s != nullptr || n_vocab - tail > 4096) {
+        return build_lora_mm(head_w, cur, head_s);
+    }
+    ggml_tensor * head = ggml_mul_mat(ctx0, ggml_view_2d(ctx0, head_w, head_w->ne[0], rows, head_w->nb[1], 0), cur);
+    head = ggml_pad(ctx0, head, (int) (tail - rows), 0, 0, 0);
+    if (tail < n_vocab) {
+        ggml_tensor * special = ggml_mul_mat(ctx0,
+                ggml_view_2d(ctx0, head_w, head_w->ne[0], n_vocab - tail, head_w->nb[1], tail*head_w->nb[1]), cur);
+        head = ggml_concat(ctx0, head, special, 0);
+    }
+    return head;
+}
+
 ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
@@ -3047,6 +3079,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             kqv = ggml_view_4d(ctx0, kqv, orig_head_v, kqv->ne[1], kqv->ne[2], kqv->ne[3], kqv->nb[1], kqv->nb[2], kqv->nb[3], 0);
             kqv = ggml_cont(ctx0, kqv);
         }
+
         // for MLA with the absorption optimization, we need to "decompress" from MQA back to MHA
         if (v_mla) {
             kqv = ggml_mul_mat(ctx0, v_mla, kqv);
@@ -3264,6 +3297,73 @@ ggml_tensor * llm_graph_context::build_attn(
     return cur;
 }
 
+bool llm_graph_context::mtp_kv_only() const {
+    static const bool disabled = getenv("TOSH_MTP_KV_ONLY_DISABLE") != nullptr;
+
+    return !disabled && n_outputs == 0;
+}
+
+void llm_graph_context::build_attn_kv_store(
+        llm_graph_input_attn_kv * inp,
+        ggml_tensor * k_cur,
+        ggml_tensor * v_cur,
+                int   il) const {
+    if (inp->self_k_rot) {
+        k_cur = llama_mul_mat_hadamard(ctx0, k_cur, inp->self_k_rot);
+    }
+
+    if (inp->self_v_rot) {
+        v_cur = llama_mul_mat_hadamard(ctx0, v_cur, inp->self_v_rot);
+    }
+
+    ggml_build_forward_expand(gf, v_cur);
+    ggml_build_forward_expand(gf, k_cur);
+
+    const auto * mctx_cur = inp->mctx;
+
+    const auto & k_idxs = inp->get_k_idxs();
+    const auto & v_idxs = inp->get_v_idxs();
+
+    ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+    ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+}
+
+void llm_graph_context::build_attn_kv_store(
+        llm_graph_input_attn_kv_iswa * inp,
+        ggml_tensor * k_cur,
+        ggml_tensor * v_cur,
+                int   il) const {
+    const bool is_swa = hparams.is_swa(il);
+
+    auto * k_rot = is_swa ? inp->self_k_rot_swa : inp->self_k_rot;
+    auto * v_rot = is_swa ? inp->self_v_rot_swa : inp->self_v_rot;
+
+    if (k_rot && k_cur) {
+        k_cur = llama_mul_mat_hadamard(ctx0, k_cur, k_rot);
+    }
+
+    if (v_rot && v_cur) {
+        v_cur = llama_mul_mat_hadamard(ctx0, v_cur, v_rot);
+    }
+
+    const auto * mctx_cur = is_swa ? inp->mctx->get_swa() : inp->mctx->get_base();
+
+    if (k_cur) {
+        ggml_build_forward_expand(gf, k_cur);
+
+        const auto & k_idxs = is_swa ? inp->get_k_idxs_swa() : inp->get_k_idxs();
+
+        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+    }
+
+    if (v_cur) {
+        ggml_build_forward_expand(gf, v_cur);
+
+        const auto & v_idxs = is_swa ? inp->get_v_idxs_swa() : inp->get_v_idxs();
+
+        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+    }
+}
 
 static std::unique_ptr<llm_graph_input_attn_k> build_attn_inp_k_impl(
            ggml_context * ctx0,

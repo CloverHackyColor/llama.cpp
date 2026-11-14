@@ -31,6 +31,7 @@ struct llama_hadamard_transform {
 using llama_hadamard_rotations = std::unordered_map<const ggml_tensor *, llama_hadamard_transform>;
 
 struct llama_cparams;
+struct llama_vocab;
 struct llama_layer;
 struct llama_prec_policy;
 
@@ -1100,6 +1101,14 @@ struct llm_graph_context {
               ggml_tensor * cur,
               ggml_tensor * w_s = nullptr) const;
 
+    // logits of a draft head over the frequent prefix of a large vocabulary plus the control
+    // tokens at its end; the rest stay 0, which a top candidate always beats
+    ggml_tensor * build_mtp_head(
+        const llama_vocab & vocab,
+              ggml_tensor * head_w,
+              ggml_tensor * head_s,
+              ggml_tensor * cur) const;
+
     // do mat_mul_id, while optionally apply lora and per-expert scale
     ggml_tensor * build_lora_mm_id(
               ggml_tensor * w,   // ggml_tensor * as
@@ -1265,6 +1274,22 @@ struct llm_graph_context {
             ggml_tensor * sinks, // [n_head_q]
             ggml_tensor * v_mla, // [n_embd_head_v_mla, n_embd_head_v, n_head_v] // TODO: remove
                   float   kq_scale,
+                    int   il) const;
+
+    // true on the MTP catch-up decode, whose output nobody reads: the graph can end at the K/V store
+    bool mtp_kv_only() const;
+
+    // write K/V into the cache without attending, for passes whose output nobody reads
+    void build_attn_kv_store(
+            llm_graph_input_attn_kv * inp,
+            ggml_tensor * k_cur,
+            ggml_tensor * v_cur,
+                    int   il) const;
+
+    void build_attn_kv_store(
+            llm_graph_input_attn_kv_iswa * inp,
+            ggml_tensor * k_cur,
+            ggml_tensor * v_cur,
                     int   il) const;
 
     llm_graph_input_attn_k  * build_attn_inp_k() const;

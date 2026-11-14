@@ -401,7 +401,11 @@ struct common_params_speculative {
             return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
 
-        return needs_rs_seq ? draft.n_max : 0u;
+        // a prompt-lookup window next to the MTP runs two tokens longer and must roll back cheaply too
+        const bool mtp = std::any_of(types.begin(), types.end(), [](auto t) { return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP; });
+        const char * lookup = std::getenv("TOSH_MTP_LOOKUP");
+        const uint32_t extra = mtp && draft.n_max >= 1 && (lookup == nullptr || std::atoi(lookup) != 0) ? 2u : 0u;
+        return needs_rs_seq ? draft.n_max + extra : 0u;
     }
 };
 
