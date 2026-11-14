@@ -3613,7 +3613,7 @@ static int ggml_metal_op_mul_mat_swiglu(ggml_metal_op_t ctx, int idx) {
     const ggml_type wt = gate->src[0]->type;
     const ggml_metal_device_props * props = ggml_metal_device_get_props(ctx->dev);
     const bool dense = !dense_disabled && props->simd_width == 32 && !props->has_unified_memory &&
-        (wt == GGML_TYPE_Q4_0 || wt == GGML_TYPE_Q5_K || wt == GGML_TYPE_Q8_0 ||
+        (wt == GGML_TYPE_Q4_0 || wt == GGML_TYPE_Q5_K || wt == GGML_TYPE_Q8_0 || wt == GGML_TYPE_MXFP4 ||
          (wt == GGML_TYPE_Q4_K && gate->src[0]->ne[0] > 2048 && gate->src[0]->ne[1] > 2048));
 
     const bool ok =
@@ -3673,6 +3673,9 @@ static int ggml_metal_op_mul_mat_swiglu(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_threadgroup_memory_size(enc, pipeline.smem, 0);
         ggml_metal_encoder_dispatch_threadgroups(enc, (w->ne[1] + nr0 - 1)/nr0, 1, 1, pipeline.nr1, nsg, 1);
     } else {
+        if (pipeline.smem) {
+            ggml_metal_encoder_set_threadgroup_memory_size(enc, pipeline.smem, 0);
+        }
         ggml_metal_encoder_dispatch_threadgroups(enc, (w->ne[1] + nr0*nsg - 1)/(nr0*nsg), 1, 1, pipeline.nr1, nsg, 1);
     }
 
@@ -3980,8 +3983,126 @@ size_t ggml_metal_op_mul_mat_id_extra_amax(const ggml_tensor * op) {
     return 8 + N_MM_NPART_AMAX*sizeof(float);
 }
 
+// gpt-oss decode: the gate and up expert mat-vecs, their per-expert bias adds and the clamped
+// swiglu that follow them go as one kernel that writes the swiglu output
+static int ggml_metal_op_mul_mat_id_swiglu_oai(ggml_metal_op_t ctx, int idx) {
+    static const bool disabled = TOSH_ENV("TOSH_MOE_SWIGLU_OAI_FUSION_DISABLE") != nullptr;
+    if (disabled || !ctx->use_fusion() || idx + 4 >= ctx->n_nodes()) {
+        return 0;
+    }
+
+    const ggml_metal_device_props * props = ggml_metal_device_get_props(ctx->dev);
+    if (props->simd_width != 32 || props->has_unified_memory) {
+        return 0;
+    }
+
+    const ggml_tensor * m0  = ctx->node(idx);
+    const ggml_tensor * a0  = ctx->node(idx + 1);
+    const ggml_tensor * m1  = ctx->node(idx + 2);
+    const ggml_tensor * a1  = ctx->node(idx + 3);
+    const ggml_tensor * glu = ctx->node(idx + 4);
+
+    if (m0->op != GGML_OP_MUL_MAT_ID || a0->op != GGML_OP_ADD_ID || m1->op != GGML_OP_MUL_MAT_ID ||
+        a1->op != GGML_OP_ADD_ID || glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU_OAI ||
+        ggml_get_op_params_i32(glu, 1) != 0 || !glu->src[1] || a0->src[0] != m0 || a1->src[0] != m1) {
+        return 0;
+    }
+
+    const ggml_tensor * gate_b = glu->src[0];
+    const ggml_tensor * up_b   = glu->src[1];
+    if (!((gate_b == a0 && up_b == a1) || (gate_b == a1 && up_b == a0))) {
+        return 0;
+    }
+
+    const ggml_tensor * gate = gate_b->src[0];
+    const ggml_tensor * up   = up_b->src[0];
+    const ggml_tensor * x    = gate->src[1];
+    const ggml_tensor * ids  = gate->src[2];
+    const ggml_tensor * bg   = gate_b->src[1];
+    const ggml_tensor * bu   = up_b->src[1];
+
+    const ggml_cgraph * gf = ctx->graph();
+
+    const bool ok =
+        gate->src[0]->type == GGML_TYPE_MXFP4 && up->src[0]->type == GGML_TYPE_MXFP4 &&
+        ggml_are_same_shape(gate->src[0], up->src[0]) && ggml_is_contiguous(gate->src[0]) && ggml_is_contiguous(up->src[0]) &&
+        up->src[1] == x && up->src[2] == ids && gate_b->src[2] == ids && up_b->src[2] == ids &&
+#ifdef TOSH_ENABLE_DYNAMIC_MOE
+        ids->op != GGML_OP_TOSH_DMOE_PUBLISH &&
+#endif
+        !ggml_metal_op_mul_mat_id_use_mm(gate, props->has_simdgroup_mm || props->use_mm_manual) &&
+        x->type == GGML_TYPE_F32 && x->nb[0] == sizeof(float) &&
+        bg->type == GGML_TYPE_F32 && bu->type == GGML_TYPE_F32 && bg->nb[0] == sizeof(float) && bu->nb[0] == sizeof(float) &&
+        bg->ne[0] == gate->ne[0] && bu->ne[0] == gate->ne[0] &&
+        gate->type == GGML_TYPE_F32 && ggml_is_contiguous(gate) && ggml_are_same_shape(gate, up) &&
+        glu->type == GGML_TYPE_F32 && ggml_is_contiguous(glu) && ggml_are_same_shape(glu, gate) &&
+        gate->src[0]->ne[0] % ggml_blck_size(GGML_TYPE_MXFP4) == 0 &&
+        ggml_metal_use_count(gf, m0) == 1 && ggml_metal_use_count(gf, m1) == 1 &&
+        ggml_metal_use_count(gf, a0) == 1 && ggml_metal_use_count(gf, a1) == 1 &&
+        !(m0->flags & GGML_TENSOR_FLAG_OUTPUT) && !(m1->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+        !(a0->flags & GGML_TENSOR_FLAG_OUTPUT) && !(a1->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+        !ggml_metal_ranges_overlap(glu, x);
+    if (!ok) {
+        return 0;
+    }
+
+    auto pipeline = ggml_metal_library_get_pipeline_mul_mv_id_mxfp4_swiglu_oai(ctx->lib);
+
+    const ggml_tensor * w = gate->src[0];
+
+    ggml_metal_kargs_mul_mv_id_swiglu_oai args = {
+        /*.mv =*/ {
+            /*.nei0 =*/ (int32_t) ids->ne[0],
+            /*.nei1 =*/ (int32_t) ids->ne[1],
+            /*.nbi1 =*/ ids->nb[1],
+            /*.ne00 =*/ (int32_t) w->ne[0],
+            /*.ne01 =*/ (int32_t) w->ne[1],
+            /*.ne02 =*/ (int32_t) w->ne[2],
+            /*.nb00 =*/ w->nb[0],
+            /*.nb01 =*/ w->nb[1],
+            /*.nb02 =*/ w->nb[2],
+            /*.ne10 =*/ (int32_t) x->ne[0],
+            /*.ne11 =*/ (int32_t) x->ne[1],
+            /*.ne12 =*/ (int32_t) x->ne[2],
+            /*.ne13 =*/ (int32_t) x->ne[3],
+            /*.nb10 =*/ x->nb[0],
+            /*.nb11 =*/ x->nb[1],
+            /*.nb12 =*/ x->nb[2],
+            /*.ne0  =*/ (int32_t) gate->ne[0],
+            /*.ne1  =*/ (int32_t) gate->ne[1],
+            /*.nb1  =*/ gate->nb[1],
+            /*.nr0  =*/ pipeline.nr0,
+        },
+        /*.nbg1  =*/ bg->nb[1],
+        /*.nbu1  =*/ bu->nb[1],
+        /*.alpha =*/ ggml_get_op_params_f32(glu, 2),
+        /*.limit =*/ ggml_get_op_params_f32(glu, 3),
+    };
+
+    ggml_metal_encoder_t enc = ctx->enc;
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(gate->src[0]), 1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(up->src[0]),   2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(x),            3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(glu),          4);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(ids),          5);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(bg),           6);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(bu),           7);
+
+    ggml_metal_encoder_set_threadgroup_memory_size(enc, pipeline.smem, 0);
+    ggml_metal_encoder_dispatch_threadgroups(enc, (w->ne[1] + pipeline.nr0 - 1)/pipeline.nr0, 1, ids->ne[0]*ids->ne[1],
+                                             pipeline.nr1, pipeline.nsg, 1);
+
+    return 5;
+}
+
 int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
+
+    if (const int n_fuse = ggml_metal_op_mul_mat_id_swiglu_oai(ctx, idx)) {
+        return n_fuse;
+    }
 
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;

@@ -692,6 +692,14 @@ typedef struct {
     int32_t  nr0;
 } ggml_metal_kargs_mul_mv_id;
 
+typedef struct {
+    ggml_metal_kargs_mul_mv_id mv;
+    uint64_t nbg1; // per-expert stride of the gate bias
+    uint64_t nbu1; // and of the up bias
+    float    alpha;
+    float    limit;
+} ggml_metal_kargs_mul_mv_id_swiglu_oai;
+
 // NORM
 // RMS_NORM
 typedef struct {

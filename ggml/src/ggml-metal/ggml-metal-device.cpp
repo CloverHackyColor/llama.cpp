@@ -1388,6 +1388,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_dense_swi
         case GGML_TYPE_Q4_K: nsg = N_SG_Q4_K; nr0 = N_R0_Q4_K; break;
         case GGML_TYPE_Q5_K: nsg = N_SG_Q5_K; nr0 = N_R0_Q5_K; break;
         case GGML_TYPE_Q8_0: nsg = N_SG_Q8_0; nr0 = N_R0_Q8_0; break;
+        case GGML_TYPE_MXFP4: nsg = N_SG_MXFP4; nr0 = N_R0_MXFP4; break;
         default: GGML_ABORT("unsupported dense swiglu type");
     }
 
@@ -1423,8 +1424,31 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_dense_swi
     res.nsg  = nsg;
     res.nr0  = nr0/2; // rows of each matrix, so a group reads what it did alone
     res.nr1  = 32;    // threads per simdgroup for the dispatch
-    // q8_0 splits each row across its simdgroups and reduces gate and up rows in threadgroup memory
-    res.smem = type == GGML_TYPE_Q8_0 ? 32*sizeof(float)*nr0 : 0;
+    // q8_0 splits each row across its simdgroups and reduces gate and up rows in threadgroup memory;
+    // mxfp4 keeps its value table there
+    res.smem = type == GGML_TYPE_Q8_0 ? 32*sizeof(float)*nr0 : type == GGML_TYPE_MXFP4 ? 32*sizeof(float) : 0;
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id_mxfp4_swiglu_oai(ggml_metal_library_t lib) {
+    const char * name = "kernel_mul_mv_id_mxfp4_swiglu_oai_f32";
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+
+        ggml_metal_cv_set_int16(cv, 32, FC_MUL_MV + 5);
+
+        res = ggml_metal_library_compile_pipeline(lib, name, name, cv);
+
+        ggml_metal_cv_free(cv);
+    }
+
+    res.nsg  = 1;
+    res.nr0  = N_R0_MXFP4/2; // rows of each matrix, so a group reads what it did alone
+    res.nr1  = 32;
+    res.smem = 32*sizeof(float);
 
     return res;
 }

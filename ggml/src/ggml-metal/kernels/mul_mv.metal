@@ -10081,6 +10081,109 @@ template [[host_name("kernel_mul_mv_id_tq2_0_f32")]]   kernel kernel_mul_mv_id_t
 template [[host_name("kernel_mul_mv_ext_q3_K_hdr_f32_r1_5_nr0_2")]] kernel mul_mv_ext_q4x4_f32_t kernel_mul_mv_ext_qK_hdr_f32_disp<5, 2, block_q3_K>;
 template [[host_name("kernel_mul_mv_ext_q3_K_hdr_f32_r1_5_nr0_4")]] kernel mul_mv_ext_q4x4_f32_t kernel_mul_mv_ext_qK_hdr_f32_disp<5, 4, block_q3_K>;
 
+// gpt-oss expert gate and up mat-vecs, their per-expert biases and the clamped swiglu in one
+// dispatch; each simdgroup takes half the standalone rows from each matrix, with the same sums
+[[host_name("kernel_mul_mv_id_mxfp4_swiglu_oai_f32")]]
+kernel void kernel_mul_mv_id_mxfp4_swiglu_oai_f32(
+        constant ggml_metal_kargs_mul_mv_id_swiglu_oai & argsg,
+        device const char * src0g,
+        device const char * src0u,
+        device const char * src1,
+        device       char * dst,
+        device const char * ids,
+        device const char * biasg,
+        device const char * biasu,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]]) {
+    constant ggml_metal_kargs_mul_mv_id & args = argsg.mv;
+
+    const short NR0 = N_R0_MXFP4/2;
+
+    const int iid1 = tgpig.z/args.nei0;
+    const int idx  = tgpig.z%args.nei0;
+
+    const int32_t i02 = ((device const int32_t *) (ids + iid1*args.nbi1))[idx];
+
+    threadgroup float * shmem_f32 = (threadgroup float *) shmem;
+
+    shmem_f32[tiisg] = kvalues_mxfp4_f[tiisg%16];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const int first_row = tgpig.x*NR0;
+
+    const uint64_t offset0 = i02*args.nb02 + first_row*args.nb01;
+
+    device const block_mxfp4 * xg = (device const block_mxfp4 *) (src0g + offset0);
+    device const block_mxfp4 * xu = (device const block_mxfp4 *) (src0u + offset0);
+    device const float       * y  = (device const float       *) (src1 + (idx % args.ne11)*args.nb11 + iid1*args.nb12);
+
+    const int nb   = args.ne00/QK_MXFP4;
+    const int ns01 = args.nb01/args.nb00;
+
+    const short NG = FC_mul_mv_nw/2;
+
+    const short ix = tiisg/2;
+    const short it = tiisg%2;
+
+    float4 yl[4];
+    float sumg[NR0]={0.f};
+    float sumu[NR0]={0.f};
+
+    device const float * yb = y + ix*QK_MXFP4 + it*8;
+
+    for (int ib = ix; ib < nb && ib < ns01; ib += NG) {
+        device const float4 * y4 = (device const float4 *) yb;
+
+        yl[0] = y4[0];
+        yl[1] = y4[4];
+        yl[2] = y4[1];
+        yl[3] = y4[5];
+
+        FOR_UNROLL (short row = 0; row < 2*NR0; row++) {
+            device const block_mxfp4 & xb = row < NR0 ? xg[row*ns01 + ib] : xu[(row - NR0)*ns01 + ib];
+            device const uint8_t     * q2 = (device const uint8_t *)(xb.qs + 8*it);
+
+            float4 acc1 = yl[0]*float4(shmem_f32[q2[0] &  0x0F], shmem_f32[q2[1] &  0x0F], shmem_f32[q2[2] &  0x0F], shmem_f32[q2[3] &  0x0F]);
+            float4 acc2 = yl[1]*float4(shmem_f32[q2[0] >> 4   ], shmem_f32[q2[1] >> 4   ], shmem_f32[q2[2] >> 4   ], shmem_f32[q2[3] >> 4   ]);
+            float4 acc3 = yl[2]*float4(shmem_f32[q2[4] &  0x0F], shmem_f32[q2[5] &  0x0F], shmem_f32[q2[6] &  0x0F], shmem_f32[q2[7] &  0x0F]);
+            float4 acc4 = yl[3]*float4(shmem_f32[q2[4] >> 4   ], shmem_f32[q2[5] >> 4   ], shmem_f32[q2[6] >> 4   ], shmem_f32[q2[7] >> 4   ]);
+
+            acc1 = (acc1 + acc3) + (acc2 + acc4);
+
+            const float s = e8m0_to_fp32(xb.e) * ((acc1[0] + acc1[1]) + (acc1[2] + acc1[3]));
+            if (row < NR0) {
+                sumg[row] += s;
+            } else {
+                sumu[row - NR0] += s;
+            }
+        }
+
+        yb += NG * QK_MXFP4;
+    }
+
+    device const float * bg = (device const float *) (biasg + i02*argsg.nbg1);
+    device const float * bu = (device const float *) (biasu + i02*argsg.nbu1);
+
+    device float * dst_f32 = (device float *) dst + (uint64_t)iid1*args.ne1*args.ne0 + (uint64_t)idx*args.ne0;
+
+    for (int row = 0; row < NR0 && first_row + row < args.ne0; ++row) {
+        const float g = simd_sum(sumg[row]);
+        const float u = simd_sum(sumu[row]);
+        if (tiisg == 0) {
+            float x0 = g + bg[first_row + row];
+            float x1 = u + bu[first_row + row];
+
+            x0 = min(x0, argsg.limit);
+            x1 = max(min(x1, argsg.limit), -argsg.limit);
+
+            float out_glu = x0 / (1.0f + exp(-x0 * argsg.alpha));
+            out_glu = out_glu * (1.0f + x1);
+
+            dst_f32[first_row + row] = out_glu;
+        }
+    }
+}
 
 // gate and up mat-vecs of one token and their swiglu in one dispatch; each simdgroup takes half the
 // standalone rows from each matrix, so as many groups stay in flight as the two dispatches had
@@ -10294,6 +10397,87 @@ kernel void kernel_mul_mv_q4_0_swiglu_f32(
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
     kernel_mul_mv_q4_0_swiglu_f32_impl<N_R0_Q4_0/2>(args, src0g, src0u, src1, dst, tgpig, tiisg, sgitg);
+}
+
+[[host_name("kernel_mul_mv_mxfp4_swiglu_f32")]]
+kernel void kernel_mul_mv_mxfp4_swiglu_f32(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0g,
+        device const char * src0u,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const short NSG = FC_mul_mv_nsg;
+    const short NR0 = N_R0_MXFP4/2;
+
+    threadgroup float * shmem_f32 = (threadgroup float *) shmem;
+
+    shmem_f32[tiisg] = kvalues_mxfp4_f[tiisg%16];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const int r0 = (tgpig.x*NSG + sgitg)*NR0;
+
+    device const block_mxfp4 * xg = (device const block_mxfp4 *) (src0g + (uint64_t) r0*args.nb01);
+    device const block_mxfp4 * xu = (device const block_mxfp4 *) (src0u + (uint64_t) r0*args.nb01);
+    device const float       * y  = (device const float       *) src1;
+
+    const int nb   = args.ne00/QK_MXFP4;
+    const int ns01 = args.nb01/args.nb00;
+
+    const short NG = FC_mul_mv_nw/2;
+
+    const short ix = tiisg/2;
+    const short it = tiisg%2;
+
+    float4 yl[4];
+    float sumg[NR0]={0.f};
+    float sumu[NR0]={0.f};
+
+    device const float * yb = y + ix*QK_MXFP4 + it*8;
+
+    for (int ib = ix; ib < nb && ib < ns01; ib += NG) {
+        device const float4 * y4 = (device const float4 *) yb;
+
+        yl[0] = y4[0];
+        yl[1] = y4[4];
+        yl[2] = y4[1];
+        yl[3] = y4[5];
+
+        FOR_UNROLL (short row = 0; row < 2*NR0; row++) {
+            device const block_mxfp4 & xb = row < NR0 ? xg[row*ns01 + ib] : xu[(row - NR0)*ns01 + ib];
+            device const uint8_t     * q2 = (device const uint8_t *)(xb.qs + 8*it);
+
+            float4 acc1 = yl[0]*float4(shmem_f32[q2[0] &  0x0F], shmem_f32[q2[1] &  0x0F], shmem_f32[q2[2] &  0x0F], shmem_f32[q2[3] &  0x0F]);
+            float4 acc2 = yl[1]*float4(shmem_f32[q2[0] >> 4   ], shmem_f32[q2[1] >> 4   ], shmem_f32[q2[2] >> 4   ], shmem_f32[q2[3] >> 4   ]);
+            float4 acc3 = yl[2]*float4(shmem_f32[q2[4] &  0x0F], shmem_f32[q2[5] &  0x0F], shmem_f32[q2[6] &  0x0F], shmem_f32[q2[7] &  0x0F]);
+            float4 acc4 = yl[3]*float4(shmem_f32[q2[4] >> 4   ], shmem_f32[q2[5] >> 4   ], shmem_f32[q2[6] >> 4   ], shmem_f32[q2[7] >> 4   ]);
+
+            acc1 = (acc1 + acc3) + (acc2 + acc4);
+
+            const float s = e8m0_to_fp32(xb.e) * ((acc1[0] + acc1[1]) + (acc1[2] + acc1[3]));
+            if (row < NR0) {
+                sumg[row] += s;
+            } else {
+                sumu[row - NR0] += s;
+            }
+        }
+
+        yb += NG * QK_MXFP4;
+    }
+
+    device float * dst_f32 = (device float *) dst;
+
+    for (int row = 0; row < NR0; ++row) {
+        const float g = simd_sum(sumg[row]);
+        const float u = simd_sum(sumu[row]);
+
+        if (tiisg == 0 && r0 + row < args.ne01) {
+            dst_f32[r0 + row] = g / (1.0f + exp(-g)) * u;
+        }
+    }
 }
 
 template<short nr0>
