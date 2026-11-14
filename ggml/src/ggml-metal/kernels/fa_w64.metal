@@ -165,6 +165,9 @@ kernel void kernel_flash_attn_ext_pf_amd_w64(
             const short row = qg + NQG*rr;
             float mx = -FLT_MAX;
             for (short cc = 0; cc < NKC; ++cc) {
+                if (args.logit_softcap != 0.0f) {
+                    sc[rr][cc] = args.logit_softcap*precise::tanh(sc[rr][cc]);
+                }
                 if (args.has_mask) {
                     sc[rr][cc] += (float) mv[rr][cc];
                 } else if (j0 + kg + LG*cc >= args.ne11) {

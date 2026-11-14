@@ -136,7 +136,9 @@ kernel void kernel_flash_attn_ext_vec_amd(
         }
         const float p = pl; // full DK-dim Q.K
 
-        const float pp   = p*args.scale + mv;
+        // the host has already divided the scale by the softcap
+        const float ps   = p*args.scale;
+        const float pp   = (args.logit_softcap != 0.0f ? args.logit_softcap*precise::tanh(ps) : ps) + mv;
         const float nm   = msk ? m : max(m, pp);
         const float corr = exp(m  - nm);
         const float w    = msk ? 0.0f : exp(pp - nm);
@@ -600,7 +602,8 @@ kernel void kernel_flash_attn_ext_tile_amd(
             }
             const float p = simd_sum(pl); // full DK-dim Q.K
 
-            const float pp   = p*args.scale + mv;
+            const float ps   = p*args.scale;
+            const float pp   = (args.logit_softcap != 0.0f ? args.logit_softcap*precise::tanh(ps) : ps) + mv;
             const float nm   = max(m, pp);
             const float corr = exp(m  - nm);
             const float w    = exp(pp - nm);
@@ -939,6 +942,9 @@ kernel void kernel_flash_attn_ext_pf_amd(
             const short row = qg + NQG*rr;
             float mx = -FLT_MAX;
             for (short cc = 0; cc < NKC; ++cc) {
+                if (args.logit_softcap != 0.0f) {
+                    sc[rr][cc] = args.logit_softcap*precise::tanh(sc[rr][cc]);
+                }
                 if (args.has_mask) {
                     sc[rr][cc] += (float) mv[rr][cc];
                 } else if (j0 + kg + 16*cc >= args.ne11) {

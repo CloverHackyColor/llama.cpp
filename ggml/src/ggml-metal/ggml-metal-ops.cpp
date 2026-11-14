@@ -5024,7 +5024,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
 
     if (TOSH_ENV("TOSH_FA_AMD") != NULL && fa_amd_pipeline[0] != '\0' &&
         !props_dev->has_simdgroup_mm && fa_amd_width_ok &&
-        !has_bias && !has_scap) {
+        !has_bias) {
 
         ggml_metal_kargs_flash_attn_ext_amd args = {
             /*.ne01          =*/ ne01,

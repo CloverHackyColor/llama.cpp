@@ -2793,7 +2793,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     dk_ok &&
                     op->src[2]->ne[0] == dk &&
                     k_std && v_std && turbo_dk_ok &&
-                    max_bias == 0.0f && softcap == 0.0f;
+                    max_bias == 0.0f;
                 if (simple) {
                     return true;
                 }
