@@ -2848,6 +2848,24 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
 
             if (!backend_allreduce_success) {
+                // the metal comm path declined this collective; the fallback costs ~10 command
+                // buffers per visit, so a persistent decline is the first thing to chase when
+                // decode underperforms. TOSH_MGPU_TRACE=1 prints it once per point.
+                static int tosh_trace_fb = -1;
+                if (tosh_trace_fb < 0) { tosh_trace_fb = getenv("TOSH_MGPU_TRACE") ? 1 : 0; }
+                static thread_local std::vector<ggml_tensor *> seen;
+                bool first_seen = false;
+                if (tosh_trace_fb) {
+                    ggml_tensor * t0 = backend_ctx->backend_configs[0].cgraphs[i].cgraph_main->nodes[
+                        backend_ctx->backend_configs[0].cgraphs[i].cgraph_main->n_nodes - 1];
+                    first_seen = true;
+                    for (auto * s : seen) { if (s == t0) { first_seen = false; break; } }
+                    if (first_seen) {
+                        seen.push_back(t0);
+                        fprintf(stderr, "ggml_metal: allreduce subgraph %zu fell back to the generic butterfly\n", i);
+                    }
+                }
+                (void) first_seen;
                 const ggml_status status = allreduce_fallback(i);
                 if (status != GGML_STATUS_SUCCESS) {
                     return status;

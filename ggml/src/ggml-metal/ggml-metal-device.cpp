@@ -3056,6 +3056,44 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_bin_one(ggml_met
     return res;
 }
 
+// The f16 allreduce transport reduces f32 += f16 with an upcast. Same shape as the f32-only
+// one-shot above, but src1 goes through the same name-pair helper the cpy pipelines use, so
+// the instantiation is resolved by type the same way everywhere else.
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_bin_one_src1(ggml_metal_library_t lib, ggml_op op, ggml_type tsrc1) {
+    char base[256];
+    char name[256];
+
+    int op_num = -1;
+
+    switch (op) {
+        case GGML_OP_ADD: op_num = 0; break;
+        case GGML_OP_SUB: op_num = 1; break;
+        case GGML_OP_MUL: op_num = 2; break;
+        case GGML_OP_DIV: op_num = 3; break;
+        default: GGML_ABORT("fatal error");
+    };
+
+    const char * t1_str = ggml_metal_tname_pair(lib, tsrc1, GGML_TYPE_F32);
+
+    snprintf(base, 256, "kernel_bin_fuse_%s_%s_%s", "f32", t1_str, "f32");
+    snprintf(name, 256, "%s_op=%d_nf=%d", base, op_num, 1);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+
+        ggml_metal_cv_set_int16(cv, op_num, FC_BIN + 0);
+        ggml_metal_cv_set_int16(cv, 1,      FC_BIN + 1);
+        ggml_metal_cv_set_bool (cv, false,  FC_BIN + 2);
+
+        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+
+        ggml_metal_cv_free(cv);
+    }
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_l2_norm(ggml_metal_library_t lib, const ggml_tensor * op) {
     assert(op->op == GGML_OP_L2_NORM);
 
