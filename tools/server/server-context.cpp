@@ -1251,7 +1251,15 @@ private:
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
 
-        if (has_spec) {
+        // the memory plan can start the model without an MTP head it had no room for
+        const bool spec_dropped = spec_mtp && !has_draft &&
+            std::find(params_base.speculative.types.begin(), params_base.speculative.types.end(),
+                      COMMON_SPECULATIVE_TYPE_DRAFT_MTP) == params_base.speculative.types.end();
+
+        if (spec_dropped) {
+            load_progress_callback(0.0f, &load_progress_spec);
+            load_progress_callback(1.0f, &load_progress_spec);
+        } else if (has_spec) {
             // spec_mtp doesn't use load a model internally, so we report 0.0 and 1.0 manually
             load_progress_callback(0.0f, &load_progress_spec);
             load_progress_spec.t_last_load_progress_ms = 0;  // reset so internal cbs aren't delayed

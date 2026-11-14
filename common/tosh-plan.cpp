@@ -905,6 +905,7 @@ bool tosh_plan_apply(common_params & params, tosh_plan * out) {
         reserves.push_back(std::max(512.0, reserve_pref - mtp_mib - 256.0));
     }
     p.mtp_head_dropped = false;
+    p.mtp_head_arena   = false;
     // experts on the host lose more than the head gains: every reserve, the head's last, is
     // tried for the GPU modes before any of them settles for whole layers on the host
     for (size_t pass = 0; pass < 2 && sel == nullptr; ++pass)
@@ -917,16 +918,44 @@ bool tosh_plan_apply(common_params & params, tosh_plan * out) {
             if (f16 && f16->valid) { sel = f16; p.reason = "the model and the requested context fit with the reserve"; }
             else if (q8 && q8->valid) { sel = q8; p.reason = "q8_0 cache makes the full model fit with the reserve"; }
         }
-        if (sel == nullptr && !no_dmoe && (force.empty() || force == "dmoe")) {
+        auto pick_dmoe = [&]() -> const tosh_plan_candidate * {
             tosh_plan_candidate * a = pick_ub(kvs[0]);
             tosh_plan_candidate * b = kvs.size() > 1 ? pick_ub(kvs[1]) : nullptr;
             // while the bank does not fit, every MiB the q8_0 cache saves holds experts the CPU would compute
             if (a && b && a->arena_mib < mi.bank_mib && b->arena_mib - a->arena_mib >= std::max(512.0, 0.08*a->arena_mib)) {
-                sel = b; p.reason = "q8_0 cache gives the expert arena a material share of the bank";
-            } else if (a) {
-                sel = a; p.reason = "the requested context and the reserve fit; experts take what is left";
-            } else if (b) {
-                sel = b; p.reason = "only a q8_0 cache leaves a useful expert arena";
+                p.reason = "q8_0 cache gives the expert arena a material share of the bank";
+                return b;
+            }
+            if (a) {
+                p.reason = "the requested context and the reserve fit; experts take what is left";
+                return a;
+            }
+            if (b) {
+                p.reason = "only a q8_0 cache leaves a useful expert arena";
+            }
+            return b;
+        };
+        bool head_off = ri >= n_with_head;
+        if (sel == nullptr && !no_dmoe && (force.empty() || force == "dmoe")) {
+            sel = pick_dmoe();
+            // with mixed execution the head's VRAM comes out of the expert arena, and past this share
+            // the experts it pushes to the host cost more than its drafts save
+            static const double max_share = env_mib("TOSH_AUTO_MTP_ARENA_SHARE", 0.20);
+            if (sel && !head_off && mtp_mib > 0 && max_share > 0) {
+                // the probes above already hold the head's context, so the arena without it comes from
+                // a probe of the model as it loads without the head
+                common_params params_bare = params;
+                params_bare.speculative.types = { COMMON_SPECULATIVE_TYPE_NONE };
+                params_bare.speculative.draft.mparams = common_params_model();
+                const probe pb = run_probe(params_bare, p.n_ctx, sel->kv, sel->ubatch, true, 0);
+                const double arena_bare = pb.ok ? std::max(0.0, p.vram_free_mib - (pb.model + pb.context + pb.compute) -
+                                                                 slots - overhead - reserves[n_with_head]) : 0.0;
+                if (arena_bare > 0 && sel->arena_mib < (1.0 - max_share)*arena_bare) {
+                    evaluate(reserves[n_with_head]);
+                    sel = pick_dmoe();
+                    head_off = sel != nullptr;
+                    p.mtp_head_arena = head_off;
+                }
             }
         }
         if (sel == nullptr && (pass == 1 || force == "legacy") && (force.empty() || force == "legacy")) {
@@ -936,8 +965,9 @@ bool tosh_plan_apply(common_params & params, tosh_plan * out) {
             if (sel) p.reason = "mixed execution is not available here; expert layers go to the host";
         }
         if (sel) {
-            p.mtp_head_dropped = ri >= n_with_head;
-            if (R < reserves[p.mtp_head_dropped ? n_with_head : 0]) p.fallback = string_format("reserve lowered to %.1f GiB", R/1024);
+            p.mtp_head_dropped = head_off;
+            const double R_used = p.mtp_head_arena ? reserves[n_with_head] : R;
+            if (R_used < reserves[p.mtp_head_dropped ? n_with_head : 0]) p.fallback = string_format("reserve lowered to %.1f GiB", R_used/1024);
             break;
         }
     }
@@ -1100,7 +1130,8 @@ bool tosh_plan_apply(common_params & params, tosh_plan * out) {
 
     // apply: the plan owns memory from here
     if (p.mtp_head_dropped) {
-        LOG_WRN("%s: the MTP head does not fit beside the model, starting without it\n", __func__);
+        LOG_WRN("%s: %s, starting without it\n", __func__, p.mtp_head_arena ?
+                "the MTP head would take too much of the expert arena" : "the MTP head does not fit beside the model");
         auto & types = params.speculative.types;
         types.erase(std::remove(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP), types.end());
         if (types.empty()) types = { COMMON_SPECULATIVE_TYPE_NONE };

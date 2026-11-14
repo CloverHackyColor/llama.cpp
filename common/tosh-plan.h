@@ -101,6 +101,7 @@ struct tosh_plan {
     std::string bounded_code;       // BOUNDED_HOST_SELECTED or why not
     bool        host_simulated    = false;
     bool        mtp_head_dropped  = false;   // the MTP head left no room and the plan goes on without it
+    bool        mtp_head_arena    = false;   // dropped because it took too much of the expert arena
     bool        swap_growing      = false;
     double      reclaimable_mib   = 0;
     double      wired_mib         = 0;
