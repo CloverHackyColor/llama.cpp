@@ -48,6 +48,42 @@ async function getFileAsBuffer(file: File): Promise<ArrayBuffer> {
 }
 
 /**
+ * The PDF's own text page by page, for a PDF sent as page images: "[Page N]" before each page and an end line, or
+ * an empty string when it has no usable text layer, as a scan has none.
+ * @param file - The PDF file to process
+ * @returns Promise resolving to the text layer, or ''
+ */
+export async function convertPDFToTextLayer(file: File): Promise<string> {
+	if (!browser) {
+		return '';
+	}
+
+	try {
+		const buffer = await getFileAsBuffer(file);
+		const pdf = await pdfjs.getDocument({ data: buffer }).promise;
+		const pages: string[] = [];
+
+		for (let i = 1; i <= pdf.numPages; i++) {
+			const page = await pdf.getPage(i);
+			const content = await page.getTextContent();
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const text = content.items.map((item: any) => (item.str ?? '') + (item.hasEOL ? '\n' : ' ')).join('');
+			pages.push(text.replace(/[ \t]+\n/g, '\n').trim());
+		}
+
+		if (pages.join('').replace(/\s/g, '').length < 80) {
+			return '';
+		}
+
+		return pages.map((text, i) => `[Page ${i + 1}]\n${text}`).join('\n') + '\n[End of text layer]';
+	} catch (error) {
+		console.warn('Could not read the PDF text layer:', error);
+
+		return '';
+	}
+}
+
+/**
  * Extract text content from a PDF file
  * @param file - The PDF file to process
  * @returns Promise resolving to the extracted text content

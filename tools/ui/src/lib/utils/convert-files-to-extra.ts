@@ -1,4 +1,4 @@
-import { convertPDFToImage, convertPDFToText } from './pdf-processing';
+import { convertPDFToImage, convertPDFToText, convertPDFToTextLayer } from './pdf-processing';
 import { isSvgMimeType, svgBase64UrlToPngDataURL } from './svg-to-png';
 import { isLikelyTextFile, readFileAsText } from './text-files';
 import { isWebpMimeType, webpBase64UrlToPngDataURL } from './webp-to-png';
@@ -155,6 +155,9 @@ export async function parseFilesToMessageExtras(
 							}
 						);
 
+						// the PDF's own text goes with its pages: what an image blurs, the text layer still says
+						const textLayer = await convertPDFToTextLayer(file.file);
+
 						extras.push({
 							base64Data: base64Data,
 							content: `PDF file with ${images.length} pages`,
@@ -162,6 +165,7 @@ export async function parseFilesToMessageExtras(
 							name: file.name,
 							processedAsImages: true,
 							size: file.size,
+							textLayer: textLayer || undefined,
 							type: AttachmentType.PDF
 						});
 					} catch (imageError) {

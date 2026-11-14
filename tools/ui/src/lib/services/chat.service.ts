@@ -280,6 +280,12 @@ export class ChatService {
 						type: ContentPartType.IMAGE_URL
 					});
 				}
+				if (pdfFile.textLayer) {
+					contentParts.push({
+						text: formatAttachmentText(AttachmentLabel.PDF_FILE, `${pdfFile.name} (text layer)`, pdfFile.textLayer),
+						type: ContentPartType.TEXT
+					});
+				}
 			} else {
 				contentParts.push({
 					text: formatAttachmentText(AttachmentLabel.PDF_FILE, pdfFile.name, pdfFile.content),

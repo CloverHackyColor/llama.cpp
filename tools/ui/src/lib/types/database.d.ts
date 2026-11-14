@@ -72,6 +72,8 @@ export interface DatabaseMessageExtraPdfFile {
 	content: string;
 	images?: string[];
 	processedAsImages: boolean;
+	/** The PDF's own text page by page, sent beside its page images. */
+	textLayer?: string;
 }
 
 export interface DatabaseMessageExtraTextFile {
