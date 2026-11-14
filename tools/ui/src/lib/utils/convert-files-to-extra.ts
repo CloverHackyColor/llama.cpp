@@ -5,6 +5,7 @@ import { isWebpMimeType, webpBase64UrlToPngDataURL } from './webp-to-png';
 import { SETTINGS_KEYS } from '$lib/constants';
 import { AttachmentType, FileTypeCategory, SpecialFileType } from '$lib/enums';
 import { modelsStore } from '$lib/stores/models/index.svelte';
+import { serverStore } from '$lib/stores/server.svelte';
 import { settingsStore } from '$lib/stores/settings/index.svelte';
 import type { ChatUploadedFile, DatabaseMessageExtra, FileProcessingResult } from '$lib/types';
 import { getFileTypeCategory } from '$lib/utils';
@@ -139,7 +140,12 @@ export async function parseFilesToMessageExtras(
 				if (shouldProcessAsImages) {
 					// Process PDF as images (only for vision models)
 					try {
-						const images = await convertPDFToImage(file.file);
+						const images = await convertPDFToImage(
+							file.file,
+							Number(settingsStore.getConfig(SETTINGS_KEYS.MAX_IMAGE_RESOLUTION)) ||
+								Number(serverStore.uiSettings?.[SETTINGS_KEYS.MAX_IMAGE_RESOLUTION]) ||
+								0
+						);
 
 						// Show success toast for PDF image processing
 						toast.success(

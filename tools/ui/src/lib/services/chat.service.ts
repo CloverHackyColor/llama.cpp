@@ -34,7 +34,11 @@ import {
 } from '$lib/enums';
 import { modelsStore } from '$lib/stores/models/index.svelte';
 import { settingsStore } from '$lib/stores/settings/index.svelte';
-import type { DatabaseMessageExtraMcpPrompt, DatabaseMessageExtraMcpResource } from '$lib/types';
+import type {
+	DatabaseMessageExtraMcpPrompt,
+	DatabaseMessageExtraMcpResource,
+	ToshChunk
+} from '$lib/types';
 import type {
 	ApiChatCompletionToolCall,
 	ApiChatMessageContentPart,
@@ -392,7 +396,8 @@ export class ChatService {
 					onChunk: (chunk: string) => {
 						titleResponse += chunk;
 					},
-					stream: true
+					stream: true,
+					toshAgent: 'off'
 				},
 				undefined,
 				signal
@@ -443,7 +448,8 @@ export class ChatService {
 		conversationId?: string,
 		abortSignal?: AbortSignal,
 		onConnectionState?: (state: StreamConnectionState) => void,
-		streamModel?: string | null
+		streamModel?: string | null,
+		onTosh?: (tosh: ToshChunk) => void
 	): Promise<void> {
 		let reader = response.body?.getReader();
 
@@ -624,6 +630,14 @@ export class ChatService {
 
 							try {
 								const parsed: ApiChatCompletionStreamChunk = JSON.parse(data);
+
+								// the Tosh agent's progress and metadata; a retract drops the text streamed so far
+								if (parsed.tosh && typeof parsed.tosh === 'object') {
+									if (parsed.tosh.event?.type === 'retract') aggregatedContent = '';
+
+									if (!abortSignal?.aborted) onTosh?.(parsed.tosh);
+								}
+
 								const choice = parsed.choices?.[0];
 								const content = choice?.delta?.content;
 								const reasoningContent = choice?.delta?.reasoning_content;
@@ -1052,6 +1066,7 @@ export class ChatService {
 			onReasoningChunk,
 			onTimings,
 			onToolCallChunk,
+			onTosh,
 			presence_penalty,
 			reasoningEffort,
 			// Penalty parameters
@@ -1067,6 +1082,7 @@ export class ChatService {
 			tools,
 			top_k,
 			top_p,
+			toshAgent,
 			typ_p,
 			xtc_probability,
 			xtc_threshold
@@ -1220,6 +1236,8 @@ export class ChatService {
 		try {
 			const headers: Record<string, string> = { ...getJsonHeaders() };
 
+			if (toshAgent) headers['X-Tosh-Agent'] = toshAgent;
+
 			// tag streaming requests with the conversation id, this single header is the opt in for the
 			// server side replay buffer and powers discoverActiveStream on tab reopen. with an explicit
 			// model the ::model suffix keeps the per model session distinct
@@ -1267,7 +1285,8 @@ export class ChatService {
 					conversationId,
 					signal,
 					onConnectionState,
-					options.model
+					options.model,
+					onTosh
 				);
 
 				return;
