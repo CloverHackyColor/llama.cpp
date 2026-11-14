@@ -11,6 +11,8 @@
 
 #ifdef TOSH_ENABLE_DYNAMIC_MOE
 #include "tosh-dmoe.h"
+#include "tosh-hostcache.h"
+#endif
 
 #import <Foundation/Foundation.h>
 
@@ -1339,6 +1341,7 @@ static void ggml_metal_dmoe_pf_report(void) {
 #define DMOE_RING_CHUNKS 8
 #define DMOE_RING_CHUNK  ((size_t) 16 << 20)
 
+struct dmoe_piece { size_t src, dst, len; const char * host; };   // host: a cached expert, else data + src
 
 static void ggml_metal_dmoe_submit(ggml_metal_t ctx, id<MTLCommandBuffer> cmd_buf, int il) {
     [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
@@ -1359,11 +1362,14 @@ static void ggml_metal_dmoe_ring_flush(ggml_metal_t ctx, const void * data, id<M
     }
     const int c = ctx->dmoe_ring_cur;
     ctx->dmoe_ring_cur = (c + 1) % DMOE_RING_CHUNKS;
+    const double tl_w = tosh_dmoe_host_seconds();
     if (ctx->dmoe_ring_cmds[c]) {
         [ctx->dmoe_ring_cmds[c] waitUntilCompleted];
         [ctx->dmoe_ring_cmds[c] release];
         ctx->dmoe_ring_cmds[c] = nil;
     }
+    const double tl_c = tosh_dmoe_host_seconds();
+    tosh_dmoe_timeline(7, il, tl_w, tl_c);
     char * ring = (char *) ctx->dmoe_ring.contents + (size_t) c*DMOE_RING_CHUNK;
     const size_t sub = (size_t) 1 << 20;
     size_t n_sub = 0;
@@ -1374,11 +1380,13 @@ static void ggml_metal_dmoe_ring_flush(ggml_metal_t ctx, const void * data, id<M
             const size_t m = (p[i].len + sub - 1)/sub;
             if (kk < m) {
                 const size_t o = kk*sub, l = MIN(sub, p[i].len - o);
+                memcpy(ring + p[i].dst + o, (p[i].host ? p[i].host : (const char *) data + p[i].src) + o, l);
                 return;
             }
             kk -= m;
         }
     });
+    tosh_dmoe_timeline(5, il, tl_c, tosh_dmoe_host_seconds());
     id<MTLCommandBuffer> cmd_buf = [ctx->queue commandBuffer];
     if (*first) {
         ggml_metal_encode_pending_waits(ctx, cmd_buf);
@@ -1440,6 +1448,33 @@ static bool ggml_metal_dmoe_compact_upload(ggml_metal_t ctx, const struct tosh_d
     struct dmoe_piece p[64];
     int n = 0;
     size_t fill = 0;
+    if (tosh_hostcache_on()) {
+        // experimental bounded host cache: pin the chunk's missing experts (their reads overlap),
+        // copy each from its cached part, then let them go
+        int32_t need[512];
+        int n_need = 0;
+        for (int e = 0; e < plan->n_expert && n_need < 512; ++e) {
+            if (rows[e] > 0 && plan->slot_of[e] < 0) need[n_need++] = e;
+        }
+        if (!tosh_hostcache_acquire(plan->il, need, n_need, TOSH_HC_PREFILL)) {
+            tosh_dmoe_fail(tosh_hostcache_error());
+            return false;
+        }
+        for (int i = 0; i < n_need; ++i) {
+            if (fill + eb > DMOE_RING_CHUNK || n == 64) {
+                ggml_metal_dmoe_ring_flush(ctx, data, bid_dst.metal, bid_dst.offs, p, n, &first, plan->il);
+                n = 0;
+                fill = 0;
+            }
+            p[n++] = (struct dmoe_piece) { (size_t) need[i]*eb, fill, eb, tosh_hostcache_part(plan->il, need[i], plan->which) };
+            fill += eb;
+            host_bytes += eb;
+        }
+        ggml_metal_dmoe_ring_flush(ctx, data, bid_dst.metal, bid_dst.offs, p, n, &first, plan->il);
+        tosh_hostcache_release(plan->il, need, n_need);
+        n = 0;
+    }
+    for (int e = 0; e < plan->n_expert && !tosh_hostcache_on();) {
         if (rows[e] == 0 || plan->slot_of[e] >= 0) {
             ++e;
             continue;
@@ -1455,11 +1490,15 @@ static bool ggml_metal_dmoe_compact_upload(ggml_metal_t ctx, const struct tosh_d
                 fill = 0;
             }
             const size_t take = MIN(len, DMOE_RING_CHUNK - fill);
+            p[n++] = (struct dmoe_piece) { off, fill, take, NULL };
             fill += take;
             off  += take;
             len  -= take;
         }
         e = e1;
+    }
+    if (!tosh_hostcache_on()) {
+        ggml_metal_dmoe_ring_flush(ctx, data, bid_dst.metal, bid_dst.offs, p, n, &first, plan->il);
     }
 
     if (plan->n_promo > 0) {
@@ -1528,6 +1567,21 @@ static bool ggml_metal_dmoe_bank_upload(ggml_metal_t ctx, struct ggml_tensor * t
     }
     if (plan.rows != NULL && ggml_metal_dmoe_compact_upload(ctx, &plan, bid_dst, bid_arena, data)) {
         return true;
+    }
+    if (tosh_hostcache_on()) {
+        // the bank holds no bytes: without the chunk's routing every expert is taken from the cache
+        static int32_t all_rows[1024];
+        static uint64_t n_all = 0;
+        if (plan.n_expert > 1024) {
+            GGML_ABORT("bounded host cache: a bank upload without routing and more than 1024 experts");
+        }
+        for (int e = 0; e < plan.n_expert; ++e) all_rows[e] = 1;
+        plan.rows = all_rows;
+        if (n_all++ == 0) GGML_LOG_WARN("%s: bounded host cache: a bank upload without routing takes every expert\n", __func__);
+        if (ggml_metal_dmoe_compact_upload(ctx, &plan, bid_dst, bid_arena, data)) {
+            return true;
+        }
+        GGML_ABORT("bounded host cache: a bank upload found no cached path: %s", tosh_hostcache_error() ? tosh_hostcache_error() : "?");
     }
 
     int stage = -1;

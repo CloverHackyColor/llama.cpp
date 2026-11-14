@@ -2902,6 +2902,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_FIT"));
     add_opt(common_arg(
+        { "--dynamic-moe" }, "[on|off]",
+        string_format("plan MoE memory with Dynamic MoE: the planner picks expert residency in VRAM and RAM, "
+                      "or a safe fallback, and refuses to load when nothing fits ('on' or 'off', default: '%s')",
+                      params.dynamic_moe ? "on" : "off"),
+        [](common_params & params, const std::string & value) {
+            if (is_truthy(value)) {
+                params.dynamic_moe = true;
+            } else if (is_falsey(value)) {
+                params.dynamic_moe = false;
+            } else {
+                throw std::runtime_error(
+                    string_format("error: unknown value for --dynamic-moe: '%s'\n", value.c_str()));
+            }
+        }
+    ).set_env("LLAMA_ARG_DYNAMIC_MOE"));
+    add_opt(common_arg(
         { "-fitp", "--fit-print" }, "[on|off]",
         string_format("print the estimated required memory ('on' or 'off', default: '%s')", params.fit_params_print ? "on" : "off"),
         [](common_params & params, const std::string & value) {

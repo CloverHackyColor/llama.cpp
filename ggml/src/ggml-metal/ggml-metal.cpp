@@ -7,6 +7,9 @@
 #include "ggml-metal-fusion.h"
 
 #ifdef TOSH_ENABLE_DYNAMIC_MOE
+#include "tosh-hostcache.h"
+#include "tosh-dmoe.h"
+#endif
 #include "ggml-metal-context.h"
 #include "ggml-metal-ops.h"
 #include "ggml-metal-tuning.h"
@@ -847,13 +850,16 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
 static bool ggml_backend_metal_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
 
+    int min_batch = ggml_metal_device_get_props(ctx_dev)->op_offload_min_batch_size;
+#ifdef TOSH_ENABLE_DYNAMIC_MOE
     // mixed execution takes every batch above its host path: the CPU backend would compute the
     // resident experts too, and a bounded host cache leaves it no bytes. The device read the
     // threshold before a plan could lower it
     if (tosh_dmoe_enabled() || tosh_hostcache_on()) min_batch = std::min(min_batch, TOSH_DMOE_MAX_TOKENS + 1);
+#endif
     return (op->op == GGML_OP_MUL_MAT ||
             op->op == GGML_OP_MUL_MAT_ID) &&
-            get_op_batch_size(op) >= ggml_metal_device_get_props(ctx_dev)->op_offload_min_batch_size;
+            get_op_batch_size(op) >= min_batch;
 }
 
 static ggml_backend_event_t ggml_backend_metal_device_event_new(ggml_backend_dev_t dev) {

@@ -9,6 +9,7 @@
 
 #ifdef TOSH_ENABLE_DYNAMIC_MOE
 #include "tosh-dmoe.h"
+#include "tosh-hostcache.h"
 #endif
 
 #include <algorithm>
@@ -98,6 +99,8 @@ struct miss {
     int t;      // token
     int j;      // router position
     int e;      // expert id
+    // bounded host cache: the expert's cached gate, up and down, pinned for this job
+    const char * g = nullptr, * u = nullptr, * d = nullptr;
 };
 
 struct executor {
@@ -215,6 +218,8 @@ struct executor {
             const int i0 = grp[c/c1], i1 = grp[c/c1 + 1];
             const miss & m = misses[i0];
             const int r0 = (c % c1)*rows1;
+            const char * g = m.g ? m.g : (const char *) bank->gate->data + (size_t) m.e*bank->gate->nb[2];
+            const char * u = m.u ? m.u : (const char *) up_t->data + (size_t) m.e*up_t->nb[2] + up_off;
             const float * gb = bank->gate_b.empty() ? nullptr : bank->gate_b.data() + (size_t) m.e*n_ff;
             const float * ub = bank->up_b.empty()   ? nullptr : bank->up_b.data()   + (size_t) m.e*n_ff;
             const int act = bank->act.load(std::memory_order_relaxed);
@@ -333,6 +338,36 @@ struct executor {
         }
     }
 
+    std::vector<int32_t> pinned;
+    int pinned_il = -1;
+
+    bool pin_misses(int il, int kind) {
+        if (!tosh_hostcache_on() || misses.empty()) {
+            return true;
+        }
+        pinned.clear();
+        for (const miss & m : misses) pinned.push_back(m.e);
+        pinned_il = il;
+        if (!tosh_hostcache_acquire(il, pinned.data(), (int) pinned.size(), kind)) {
+            tosh_dmoe_fail(tosh_hostcache_error());
+            return false;
+        }
+        const size_t up_off = bank->fused ? (size_t) n_ff*bank->gate->nb[1] : 0;
+        for (miss & m : misses) {
+            m.g = tosh_hostcache_part(il, m.e, 0);
+            m.u = bank->fused ? m.g + up_off : tosh_hostcache_part(il, m.e, 1);
+            m.d = tosh_hostcache_part(il, m.e, 2);
+        }
+        return true;
+    }
+
+    void unpin_misses() {
+        if (!pinned.empty()) {
+            tosh_hostcache_release(pinned_il, pinned.data(), (int) pinned.size());
+            pinned.clear();
+        }
+    }
+
     // a wide batch: the positions the GPU skipped, grouped by expert so its weights stay in cache
     bool job_wide(int il, const tosh_dmoe_job & jb) {
         const double t0 = tosh_dmoe_host_seconds();
@@ -388,12 +423,16 @@ struct executor {
                     wide_seen[m.t] = 1;
                 }
             }
+            if (!pin_misses(il, TOSH_HC_WIDE)) {
+                return false;
+            }
             wide = true;
             next1.store(0, std::memory_order_relaxed);
             next2.store(0, std::memory_order_relaxed);
             kick();
             run(0);
             wide = false;
+            unpin_misses();
         }
         n_wide++;
         n_wide_miss    += misses.size();
@@ -483,10 +522,14 @@ struct executor {
             }
             us_quant += (uint64_t) us_since(tq);
 
+            if (!pin_misses(il, TOSH_HC_DECODE)) {
+                return false;
+            }
             next1.store(0, std::memory_order_relaxed);
             next2.store(0, std::memory_order_relaxed);
             kick();
             run(0);
+            unpin_misses();
         }
 
         n_jobs++;
@@ -783,6 +826,9 @@ struct policy {
     uint64_t exchanged = 0;
     double   us_exchange = 0;
 
+    // bounded host cache: an expert leaving VRAM goes back to RAM, which holds what VRAM does not
+    void demote(int il, int s) {
+        const int e = slots[(size_t) il*Q + s].e;
         if (!tosh_hostcache_on() || e < 0) {
             return;
         }
@@ -790,6 +836,10 @@ struct policy {
         if (copy_back && up->download != nullptr) {
             if (tosh_hostcache_store(il, e)) exchanges.push_back({ il, s, e });
         } else {
+            tosh_hostcache_prefetch(il, e);
+        }
+    }
+
     // the slots are not reused before a later cycle, so one copy per cycle takes them all
     void flush_exchanges() {
         if (exchanges.empty()) {
@@ -819,11 +869,21 @@ struct policy {
         const host_bank & b = (*banks)[il];
         const int e = slots[(size_t) il*Q + s].e;
         bool ok = true;
+        const int32_t eid = e;
+        const bool hc = tosh_hostcache_on();
+        if (hc && !tosh_hostcache_acquire(il, &eid, 1, TOSH_HC_VERIFY)) {
+            return false;
+        }
+        int part = -1;
         for (auto [bank, arena] : { std::pair{ b.gate, dl->arena_gate }, { b.up, dl->arena_up }, { b.down, dl->arena_down } }) {
+            part++;
             if (bank == nullptr) continue;
             std::vector<uint8_t> got(arena->nb[2]);
             ggml_backend_tensor_get(arena, got.data(), (size_t) s*arena->nb[2], got.size());
+            const char * src = hc ? tosh_hostcache_part(il, e, part) : (const char *) bank->data + (size_t) e*bank->nb[2];
+            ok = ok && memcmp(got.data(), src, got.size()) == 0;
         }
+        if (hc) tosh_hostcache_release(il, &eid, 1);
         return ok;
     }
 
@@ -932,6 +992,7 @@ struct policy {
             if (st == 1) {
                 sl.state = RESIDENT; sl.since = now; sl.uses = 0;
                 resident_slot[key] = s;
+                if (tosh_hostcache_on()) tosh_hostcache_drop(il, sl.e);
                 upload_done++;
                 us_upload_wall += std::chrono::duration<double, std::micro>(clk::now() - sl.issued).count();
                 us_upload_gpu  += up->gpu_us(up->ctx, sl.ticket);
@@ -988,6 +1049,7 @@ struct policy {
                 } else if (sl.parts == full[il] && sync > sl.encoded_sync) {
                     sl.state = RESIDENT; sl.since = now; sl.uses = 0; sl.claimed = false;
                     resident_slot[key] = s;
+                    if (tosh_hostcache_on()) tosh_hostcache_drop(il, sl.e);
                     pending[key] = 0;
                     dirty = true;
                     if (verify_every > 0 && vpromotions % verify_every == 0) {
@@ -1060,6 +1122,7 @@ struct policy {
                         if (victim < 0 || v < vs) { victim = s; vs = v; }
                     }
                     if (victim < 0 || vs + margin >= sc) continue;
+                    demote(il, victim);
                     slot & sl = slots[(size_t) il*Q + victim];
                     const size_t vkey = (size_t) il*n_expert + sl.e;
                     resident_slot[vkey] = -1;
@@ -1098,12 +1161,22 @@ struct policy {
                 const host_bank & b = (*banks)[il];
                 tosh_dmoe_copy copies[3];
                 int n_copies = 0;
+                const int32_t eid = e;
+                const bool hc = tosh_hostcache_on();
+                if (hc && !tosh_hostcache_acquire(il, &eid, 1, TOSH_HC_PROMOTE)) {
+                    tosh_dmoe_fail(tosh_hostcache_error());
+                }
+                int part = -1;
                 for (auto [bank, arena] : { std::pair{ b.gate, dl->arena_gate }, { b.up, dl->arena_up }, { b.down, dl->arena_down } }) {
+                    part++;
                     if (bank == nullptr) continue;
+                    const char * src = hc ? tosh_hostcache_part(il, e, part) : (const char *) bank->data + (size_t) e*bank->nb[2];
+                    copies[n_copies++] = { arena, (size_t) s*arena->nb[2], src, arena->nb[2] };
                 }
                 sl.e = e; sl.gen++; sl.issued = clk::now();
                 const clk::time_point tu = clk::now();
                 sl.ticket = up->upload(up->ctx, copies, n_copies);
+                if (hc) tosh_hostcache_release(il, &eid, 1);
                 us_upload_call += std::chrono::duration<double, std::micro>(clk::now() - tu).count();
                 if (sl.ticket == 0) {
                     failed++;
@@ -1143,6 +1216,7 @@ struct policy {
                         if (victim < 0 || v < vs) { victim = s; vs = v; }
                     }
                     if (victim < 0) break;
+                    demote(il, victim);
                     slot & sl = slots[(size_t) il*Q + victim];
                     const size_t vkey = (size_t) il*n_expert + sl.e;
                     resident_slot[vkey] = -1;
@@ -1503,15 +1577,80 @@ static void dmoe_lock_bank(const std::vector<llama_layer> & layers) {
     LLAMA_LOG_INFO("%s: expert bank locked in host memory, %.0f MiB\n", __func__, bytes/1048576.0);
 }
 
+// EXPERIMENTAL: the bank tensors were left unread; the cache reads experts from the file. The
+// untouched bank pages are made inaccessible so a reader that bypasses the cache fails loudly.
+static void dmoe_start_hostcache(const std::vector<llama_layer> & layers, const llama_hparams & hparams) {
+    static bool started = false;
+    if (started) {
+        return;
+    }
+    const char * ob = getenv("GGML_OP_OFFLOAD_MIN_BATCH");
+    if (ob == nullptr || atoi(ob) > TOSH_DMOE_MAX_TOKENS + 1) {
+        throw std::runtime_error(format("the bounded host cache needs GGML_OP_OFFLOAD_MIN_BATCH=%d: smaller batches would compute experts from the bank on the CPU backend", TOSH_DMOE_MAX_TOKENS + 1));
+    }
+    int n_moe = 0;
+    for (int il = 0; il < (int) layers.size(); ++il) {
+        const llama_layer & L = layers[il];
+        if (!dmoe_gate(L)) continue;
+        // parts keep fixed places: 0 gate (or fused gate/up), 1 up, 2 down; biases and scales stay loaded
+        int part = 0;
+        for (const ggml_tensor * t : { (const ggml_tensor *) dmoe_gate(L), (const ggml_tensor *) L.ffn_up_exps, (const ggml_tensor *) L.ffn_down_exps }) {
+            if (t != nullptr && !tosh_hostcache_bind(il, part, t->data, t->nb[2], (int) hparams.n_expert)) {
+                throw std::runtime_error(tosh_hostcache_error());
+            }
+            part++;
+        }
+        n_moe++;
+    }
+    if (n_moe == 0 || !tosh_hostcache_start((int) layers.size(), (int) hparams.n_expert)) {
+        throw std::runtime_error(tosh_hostcache_error() ? tosh_hostcache_error() : "no expert bank");
+    }
+    const size_t page = (size_t) sysconf(_SC_PAGESIZE);
+    for (const llama_layer & L : layers) {
+        for (const ggml_tensor * t : { (const ggml_tensor *) dmoe_gate(L), (const ggml_tensor *) L.ffn_up_exps, (const ggml_tensor *) L.ffn_down_exps }) {
+            if (t == nullptr) continue;
+            const uintptr_t a = ((uintptr_t) t->data + page - 1) & ~(uintptr_t) (page - 1);
+            const uintptr_t b = ((uintptr_t) t->data + ggml_nbytes(t)) & ~(uintptr_t) (page - 1);
+            if (b > a) mprotect((void *) a, b - a, PROT_NONE);
+        }
+    }
+    atexit(tosh_hostcache_report);
+    started = true;
+}
+
 static void dmoe_init_or_off(std::vector<llama_layer> & layers, const llama_hparams & hparams, const char * path, double cache_mib) {
     if (path != nullptr) {
         dmoe_init(layers, hparams, path, cache_mib);
         return;
     }
     try {
+        if (tosh_hostcache_on()) {
+            dmoe_start_hostcache(layers, hparams);
+        } else {
+            dmoe_lock_bank(layers);
+            if (getenv("TOSH_DMOE_HOST_BYTECHECK")) {
+                // the cache reads the loader's own offsets: check them against the bank it loaded
+                int n = 0, bad = 0;
+                for (const llama_layer & L : layers) {
+                    for (const ggml_tensor * t : { (const ggml_tensor *) dmoe_gate(L), (const ggml_tensor *) L.ffn_up_exps, (const ggml_tensor *) L.ffn_down_exps }) {
+                        if (t == nullptr) continue;
+                        for (int e : { 0, 1, 37, 128, 200, (int) t->ne[2] - 1 }) {
+                            if (e >= t->ne[2]) continue;
+                            n++;
+                            bad += !tosh_hostcache_bytecheck(t->data, t->nb[2], e);
+                        }
+                    }
+                }
+                LLAMA_LOG_INFO("%s: expert bytes read from the file against the loaded bank: %d checked in %d file(s), %d differ\n",
+                               __func__, n, tosh_hostcache_n_files(), bad);
+            }
+        }
         dmoe_init(layers, hparams, path, cache_mib);
         dmoe_status(true, "DMOE_ON", "", g_arena_buf ? ggml_backend_buffer_get_size(g_arena_buf)/1048576.0 : 0.0);
     } catch (const std::exception & err) {
+        if (tosh_hostcache_on()) {
+            throw;   // the bank holds no data: there is no path without the cache
+        }
         LLAMA_LOG_WARN("%s: mixed expert execution stays off: %s\n", __func__, err.what());
         llama_tosh_dmoe_shutdown();
         delete g_policy;
@@ -1529,6 +1668,9 @@ static const llama_hparams *      g_defer_hparams = nullptr;
 void llama_tosh_dmoe_init(std::vector<llama_layer> & layers, const llama_hparams & hparams) {
     const char * path      = getenv("TOSH_DMOE_RESIDENCY");
     const char * cache_mib = getenv("TOSH_DMOE_CACHE_MIB");
+    if (tosh_hostcache_on() && (cache_mib == nullptr || path != nullptr)) {
+        throw std::runtime_error("the bounded host cache needs TOSH_DMOE_CACHE_MIB (a VRAM arena) and no residency file");
+    }
     if ((path == nullptr && cache_mib == nullptr) || g_exec != nullptr) {
         return;
     }
@@ -1621,6 +1763,9 @@ void llama_tosh_dmoe_budget(size_t gpu_bytes) {
     }
     // a planner passes the smallest arena it judged useful for this model
     const double min_arena = std::max(256.0*M, envmib("TOSH_DMOE_MIN_ARENA_MIB", 0));
+    if (arena < min_arena && tosh_hostcache_on()) {
+        throw std::runtime_error("the bounded host cache needs mixed expert execution, and the VRAM arena is under its minimum");
+    }
     if (arena < min_arena) {
         LLAMA_LOG_WARN("%s: under %.0f MiB left for experts, mixed execution stays off\n", __func__, min_arena/M);
         dmoe_status(false, "DMOE_ARENA_BELOW_MINIMUM", format("%.0f MiB left, %.0f needed", std::max(0.0, arena)/M, min_arena/M), 0.0);

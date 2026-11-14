@@ -14,6 +14,7 @@
 #include "ggml-impl.h"
 #ifdef TOSH_ENABLE_DYNAMIC_MOE
 #include "tosh-dmoe.h"
+#include "tosh-hostcache.h"
 #else
 static inline bool   tosh_dmoe_compact(void) { return false; }
 static inline float  tosh_dmoe_token_decay(void) { return 0.0f; }
@@ -21,6 +22,12 @@ static inline void   tosh_dmoe_set_chunk_rows(const int32_t *, const float *, in
 static inline void   tosh_dmoe_note_time(int, int64_t) {}
 static inline void   tosh_dmoe_timeline(int, int, double, double) {}
 static inline double tosh_dmoe_host_seconds(void) { return 0.0; }
+static inline bool   tosh_hostcache_on(void) { return false; }
+static inline bool   tosh_hostcache_lookup(const void *, int *, int *) { return false; }
+static inline bool   tosh_hostcache_acquire(int, const int32_t *, int, int) { return false; }
+static inline const char * tosh_hostcache_part(int, int, int) { return nullptr; }
+static inline void   tosh_hostcache_release(int, const int32_t *, int) {}
+#define TOSH_HC_PREFILL 3
 #endif
 
 #include <assert.h>
@@ -2140,6 +2147,22 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         }
 
                         prev_ids_tensor = ids_tensor;
+                    }
+
+                    // bounded host cache: the bank has no bytes; each used expert comes from the cache,
+                    // pinned until the copies are done
+                    int hc_il = -1, hc_part = -1;
+                    if (tosh_hostcache_on() && tosh_hostcache_lookup(input->data, &hc_il, &hc_part)) {
+                        std::vector<int32_t> pin;
+                        for (int32_t e = 0; e < n_expert; ++e) if (ggml_bitset_get(used_ids.data(), e)) pin.push_back(e);
+                        if (pin.empty()) continue;
+                        GGML_ASSERT(tosh_hostcache_acquire(hc_il, pin.data(), (int) pin.size(), TOSH_HC_PREFILL) && "bounded host cache read failed");
+                        for (int32_t e : pin) {
+                            ggml_backend_tensor_set_async(split_backend, input_cpy, tosh_hostcache_part(hc_il, e, hc_part), (size_t) e*expert_size, expert_size);
+                        }
+                        ggml_backend_synchronize(split_backend);
+                        tosh_hostcache_release(hc_il, pin.data(), (int) pin.size());
+                        continue;
                     }
 
                     // group consecutive experts and copy them together

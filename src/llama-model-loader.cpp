@@ -1,5 +1,10 @@
 #include "llama-model-loader.h"
 
+#ifdef TOSH_ENABLE_DYNAMIC_MOE
+#include "tosh-hostcache.h"
+#endif
+
+
 #include "ggml-alloc.h"
 #include "ggml.h"
 #include "gguf.h"
@@ -1385,6 +1390,13 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         if (buft == nullptr) {
             return NULL;
         }
+        // the fused tensor has no place in the file: a mapped CPU buffer cannot hold it and a
+        // repacking one only takes whole tensors, so those keep the file's two tensors
+        ggml_backend_dev_t buft_dev = ggml_backend_buft_get_device(buft);   // null for the plain CPU type
+        const bool on_cpu = buft_dev == nullptr || ggml_backend_dev_type(buft_dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+        if (on_cpu && (use_mmap || buft != ggml_backend_cpu_buffer_type())) {
+            return NULL;
+        }
 
         ggml_context * ctx = ctx_for_buft(buft);
         ggml_tensor * fused = ggml_dup_tensor(ctx, &t_meta);
@@ -1671,6 +1683,31 @@ bool llama_model_loader::load_all_data(
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
         tensors.push_back(cur);
     }
+#ifdef TOSH_ENABLE_DYNAMIC_MOE
+    // bounded host cache: start it before the other weights are read, so filling it overlaps the load
+    if (tosh_hostcache_on()) {
+        int n_layer = 0, n_expert = 0;
+        for (ggml_tensor * cur : tensors) {
+            const char * name = ggml_get_name(cur);
+            int il = -1;
+            if (cur->buffer == nullptr || !ggml_backend_buffer_is_host(cur->buffer) || !tosh_hostcache_is_bank_name(name) ||
+                sscanf(name, "blk.%d.", &il) != 1) continue;
+            const auto it_fused = fused_map.find(name);
+            if (it_fused != fused_map.end()) {
+                const auto & fu = it_fused->second;
+                tosh_hostcache_note_fused_tensor(cur->data, ggml_nbytes(cur), files.at(fu.idx)->file_id(), fu.offs_a, fu.offs_b);
+            } else {
+                const auto & w = require_weight(name);
+                tosh_hostcache_note_file_tensor(cur->data, ggml_nbytes(cur), files.at(w.idx)->file_id(), w.offs);
+            }
+            const int part = strstr(name, ".ffn_up_exps.") ? 1 : strstr(name, ".ffn_down_exps.") ? 2 : 0;
+            tosh_hostcache_bind(il, part, cur->data, cur->nb[2], (int) cur->ne[2]);
+            n_layer = std::max(n_layer, il + 1);
+            n_expert = (int) cur->ne[2];
+        }
+        if (n_layer > 0) tosh_hostcache_start(n_layer, n_expert);
+    }
+#endif
 
     // without mmap, tensors in non-host buffers are staged through a temporary buffer sized like the tensor
     // load them biggest-first so the largest staging buffer is allocated while the fewest weights are resident
@@ -1693,6 +1730,16 @@ bool llama_model_loader::load_all_data(
                 const auto & fu = it_fused->second;
                 const size_t dst_stride = ggml_nbytes(cur)/(size_t) fu.n_expert;
                 GGML_ASSERT(dst_stride == 2*fu.stride);
+#ifdef TOSH_ENABLE_DYNAMIC_MOE
+                if ((tosh_hostcache_on() || getenv("TOSH_DMOE_HOST_BYTECHECK")) && ggml_backend_buffer_is_host(cur->buffer) &&
+                    tosh_hostcache_is_bank_name(ggml_get_name(cur))) {
+                    tosh_hostcache_note_fused_tensor(cur->data, ggml_nbytes(cur), files.at(fu.idx)->file_id(), fu.offs_a, fu.offs_b);
+                    if (tosh_hostcache_on()) {
+                        size_done += ggml_nbytes(cur);
+                        continue;
+                    }
+                }
+#endif
 
                 std::vector<uint8_t> buf(dst_stride);
                 const auto & file = files.at(fu.idx);
@@ -1761,6 +1808,17 @@ bool llama_model_loader::load_all_data(
         } else {
             const auto & file = files.at(weight->idx);
 
+#ifdef TOSH_ENABLE_DYNAMIC_MOE
+            // experimental bounded host cache: the expert bank stays in the file, read on demand
+            if ((tosh_hostcache_on() || getenv("TOSH_DMOE_HOST_BYTECHECK")) && ggml_backend_buffer_is_host(cur->buffer) &&
+                tosh_hostcache_is_bank_name(ggml_get_name(cur))) {
+                tosh_hostcache_note_file_tensor(cur->data, n_size, file->file_id(), weight->offs);
+                if (tosh_hostcache_on()) {
+                    size_done += n_size;
+                    continue;
+                }
+            }
+#endif
             if (ggml_backend_buffer_is_host(cur->buffer)) {
                 file->seek(weight->offs, SEEK_SET);
                 file->read_raw(cur->data, n_size);
