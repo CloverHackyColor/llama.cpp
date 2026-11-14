@@ -126,6 +126,10 @@ struct ggml_metal_op {
         return gf;
     }
 
+    int graph_index(int i) const {
+        return idxs[i];
+    }
+
     bool has_n_uses(int i, int n) const {
         assert(i >= 0 && i < (int) idxs.size());
         return ggml_node_has_n_uses(gf, idxs[i], n);
@@ -439,7 +443,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
         case GGML_OP_LOG:
         case GGML_OP_UNARY:
             {
-                n_fuse = ggml_metal_op_unary(ctx, idx);
+                n_fuse = ggml_metal_op_tosh_gate_add(ctx, idx);
+                if (n_fuse == 0) {
+                    n_fuse = ggml_metal_op_unary(ctx, idx);
+                }
             } break;
         case GGML_OP_SILU_BACK:
             {
@@ -988,6 +995,106 @@ int ggml_metal_op_acc(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_dispatch_threadgroups(enc, ne11, ne12, ne13, nth, 1, 1);
 
     return 1;
+}
+
+// sigmoid -> mul -> add [-> add]: a gated shared expert joining the routed sum and the residual. Three
+// small dispatches per MoE layer become one; unified memory keeps the separate ones, unmeasured there.
+int ggml_metal_op_tosh_gate_add(ggml_metal_op_t ctx, int idx) {
+    static const bool disabled = TOSH_ENV("TOSH_GATE_ADD_FUSION_DISABLE") != nullptr;
+    if (disabled || !ctx->use_fusion() || idx + 2 >= ctx->n_nodes() ||
+        ggml_metal_device_get_props(ctx->dev)->has_unified_memory) {
+        return 0;
+    }
+
+    ggml_tensor * sig = ctx->node(idx);
+    ggml_tensor * mul = ctx->node(idx + 1);
+    ggml_tensor * add = ctx->node(idx + 2);
+    if (sig->op != GGML_OP_UNARY || ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID ||
+        mul->op != GGML_OP_MUL || add->op != GGML_OP_ADD) {
+        return 0;
+    }
+
+    ggml_tensor * g = sig->src[0];
+    ggml_tensor * x = mul->src[0] == sig ? mul->src[1] : mul->src[1] == sig ? mul->src[0] : nullptr;
+    ggml_tensor * y = add->src[0] == mul ? add->src[1] : add->src[1] == mul ? add->src[0] : nullptr;
+    if (!x || !y) {
+        return 0;
+    }
+    if (ggml_metal_fb_residual_armed(ctx->dev, add->src[0])) {
+        return 0;
+    }
+
+    int n_fuse = 3;
+    ggml_tensor * dst = add;
+    ggml_tensor * r   = nullptr;
+    if (idx + 3 < ctx->n_nodes() && ctx->node(idx + 3)->op == GGML_OP_ADD && ctx->has_n_uses(idx + 2, 1) &&
+        !ggml_metal_fb_residual_armed(ctx->dev, ctx->node(idx + 3)->src[0])) {
+        ggml_tensor * add2 = ctx->node(idx + 3);
+        ggml_tensor * res  = add2->src[0] == add ? add2->src[1] : add2->src[1] == add ? add2->src[0] : nullptr;
+        if (res && res != add && ggml_are_same_shape(res, add2) && ggml_are_same_shape(add2, add) &&
+            res->type == GGML_TYPE_F32 && ggml_is_contiguous(res)) {
+            n_fuse = 4;
+            dst    = add2;
+            r      = res;
+        }
+    }
+
+    auto f32c = [](const ggml_tensor * t) {
+        return t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && (uintptr_t) t->data % 16 == 0;
+    };
+    // the inputs the kernel streams may share dst's memory only in place; g is read across rows
+    auto apart = [dst](const ggml_tensor * t) { return t->data == dst->data || !ggml_metal_ranges_overlap(t, dst); };
+
+    const bool ok =
+        f32c(g) && f32c(sig) && f32c(x) && f32c(mul) && f32c(y) && f32c(add) && f32c(dst) &&
+        g->ne[0] == 1 && ggml_are_same_shape(g, sig) &&
+        ggml_are_same_shape(x, mul) && ggml_are_same_shape(y, add) && ggml_are_same_shape(mul, add) &&
+        g->ne[1] == x->ne[1] && g->ne[2] == x->ne[2] && g->ne[3] == x->ne[3] &&
+        x->ne[0] % 4 == 0 &&
+        ctx->has_n_uses(idx, 1) && ctx->has_n_uses(idx + 1, 1) &&
+        !ggml_metal_ranges_overlap(g, dst) && apart(x) && apart(y) && (!r || apart(r));
+    if (!ok) {
+        return 0;
+    }
+
+    for (int i = 1; i < n_fuse; ++i) {
+        if (!ggml_metal_op_concurrency_check(ctx, ctx->node(idx + i))) {
+            ggml_metal_op_concurrency_reset(ctx);
+            break;
+        }
+    }
+
+    auto pipeline = ggml_metal_library_get_pipeline(ctx->lib, "tosh_gate_add_f32");
+    if (!pipeline.pipeline) {
+        pipeline = ggml_metal_library_compile_pipeline(ctx->lib, "tosh_gate_add_f32", "tosh_gate_add_f32", nullptr);
+    }
+    if (!pipeline.pipeline) {
+        return 0;
+    }
+
+    struct {
+        int32_t ne0_4;
+        int32_t n_4;
+        int32_t has_res;
+    } args = {
+        (int32_t) (x->ne[0]/4),
+        (int32_t) (ggml_nelements(dst)/4),
+        r ? 1 : 0,
+    };
+
+    ggml_metal_encoder_t enc = ctx->enc;
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(g),       1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(x),       2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(y),       3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(r ? r : y), 4);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(dst),     5);
+
+    const int nth = 256;
+    ggml_metal_encoder_dispatch_threadgroups(enc, (args.n_4 + nth - 1)/nth, 1, 1, nth, 1, 1);
+
+    return n_fuse;
 }
 
 int ggml_metal_op_unary(ggml_metal_op_t ctx, int idx) {
@@ -7507,41 +7614,57 @@ static bool ggml_metal_tosh_topk_moe_fusion(ggml_metal_op_t ctx, int idx, ggml_m
         return false;
     }
 
-    // one use means no normalisation follows and get_rows already is the weights;
-    // the normalising router reads it twice, from sum_rows and from div
-    if (ctx->has_n_uses(idx + 2, 1)) {
-        plan.n_fuse  = 3;
-        plan.weights = getrows;
-    } else if (idx + 5 < ctx->n_nodes()) {
+    // the normalising router reads get_rows twice, from sum_rows and from div, either directly or
+    // through one reshape; without that chain get_rows already is the weights
+    bool norm = false;
+    if (idx + 5 < ctx->n_nodes()) {
         ggml_tensor * sumrows = ctx->node(idx + 3);
         ggml_tensor * clamp   = ctx->node(idx + 4);
         ggml_tensor * div     = ctx->node(idx + 5);
 
-        if (sumrows->op != GGML_OP_SUM_ROWS || clamp->op != GGML_OP_CLAMP || div->op != GGML_OP_DIV ||
-            !ggml_metal_tosh_topk_moe_same(sumrows->src[0], getrows) ||
-            !ggml_metal_tosh_topk_moe_same(clamp->src[0], sumrows) ||
-            !ggml_metal_tosh_topk_moe_same(div->src[0], getrows) ||
-            !ggml_metal_tosh_topk_moe_same(div->src[1], clamp) ||
-            !ggml_is_contiguous(div) ||
-            !ctx->has_n_uses(idx + 3, 1) ||
-            !ctx->has_n_uses(idx + 4, 1)) {
-            return false;
+        bool uses_ok = ctx->has_n_uses(idx + 2, 2);
+        if (!uses_ok && ctx->has_n_uses(idx + 2, 1)) {
+            const ggml_cgraph * gf = ctx->graph();
+            for (int j = ctx->graph_index(idx + 2) + 1; j < ctx->graph_index(idx + 3); ++j) {
+                if (ggml_metal_view_base(gf->nodes[j]) == getrows) {
+                    uses_ok = ggml_node_get_use_count(gf, j) == 2 &&
+                        !(gf->nodes[j]->flags & GGML_TENSOR_FLAG_OUTPUT);
+                    break;
+                }
+            }
         }
 
         float cmin = 0.0f;
         float cmax = 0.0f;
-        memcpy(&cmin, ((const int32_t *) clamp->op_params) + 0, sizeof(float));
-        memcpy(&cmax, ((const int32_t *) clamp->op_params) + 1, sizeof(float));
-        if (!std::isinf(cmax) || cmax < 0.0f) {
-            return false;
+        if (clamp->op == GGML_OP_CLAMP) {
+            memcpy(&cmin, ((const int32_t *) clamp->op_params) + 0, sizeof(float));
+            memcpy(&cmax, ((const int32_t *) clamp->op_params) + 1, sizeof(float));
         }
 
-        plan.n_fuse    = 6;
-        plan.with_norm = true;
-        plan.clamp     = cmin;
-        plan.weights   = div;
-    } else {
-        return false;
+        norm = uses_ok &&
+            sumrows->op == GGML_OP_SUM_ROWS && clamp->op == GGML_OP_CLAMP && div->op == GGML_OP_DIV &&
+            ggml_metal_tosh_topk_moe_same(sumrows->src[0], getrows) &&
+            ggml_metal_tosh_topk_moe_same(clamp->src[0], sumrows) &&
+            ggml_metal_tosh_topk_moe_same(div->src[0], getrows) &&
+            ggml_metal_tosh_topk_moe_same(div->src[1], clamp) &&
+            ggml_is_contiguous(div) && div->ne[0] <= 32 &&
+            ctx->has_n_uses(idx + 3, 1) &&
+            ctx->has_n_uses(idx + 4, 1) &&
+            std::isinf(cmax) && cmax > 0.0f;
+
+        if (norm) {
+            plan.n_fuse    = 6;
+            plan.with_norm = true;
+            plan.clamp     = cmin;
+            plan.weights   = div;
+        }
+    }
+    if (!norm) {
+        if (!ctx->has_n_uses(idx + 2, 1)) {
+            return false;
+        }
+        plan.n_fuse  = 3;
+        plan.weights = getrows;
     }
 
     const int64_t n_expert = softmax->ne[0];
@@ -7629,8 +7752,9 @@ int ggml_metal_op_tosh_topk_moe(ggml_metal_op_t ctx, int idx) {
     }
 
     const int32_t n_expert      = plan.logits->ne[0];
-    const int32_t n_expert_used = plan.delayed ? plan.weights->ne[0] : plan.weights->ne[1];
     const int32_t nrows         = ggml_nrows(plan.logits);
+    // get_rows leaves [1, n_used, rows], div and the delayed softmax [n_used, rows]
+    const int32_t n_expert_used = ggml_nelements(plan.weights)/nrows;
 
     int nth = 32;
     while (2*nth <= n_expert && 2*nth <= (int) ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {

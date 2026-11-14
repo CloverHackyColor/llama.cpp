@@ -92,6 +92,8 @@ struct ggml_metal_pipeline_with_params ggml_metal_device_pipeline_add3(ggml_meta
 struct ggml_metal_pipeline_with_params ggml_metal_device_pipeline_add3_rms_mul(ggml_metal_device_t dev);
 // true when t still lacks the peer partial of a TP2 boundary and the caller is its residual add
 bool ggml_metal_fb_residual_take(ggml_metal_device_t dev, const struct ggml_tensor * t, struct ggml_metal_buffer_id * peer);
+// the add whose first source is t folds a TP2 partial, so no fusion may take it in
+bool ggml_metal_fb_residual_armed(ggml_metal_device_t dev, const struct ggml_tensor * t);
 
 void ggml_metal_encoder_set_bytes (ggml_metal_encoder_t encoder, void * data, size_t size, int idx);
 void ggml_metal_encoder_set_buffer(ggml_metal_encoder_t encoder, struct ggml_metal_buffer_id buffer, int idx);

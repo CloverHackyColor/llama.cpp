@@ -183,3 +183,30 @@ kernel void tosh_dmoe_observe(
         ring[t*args.n_used + j] = ((device const int32_t *) (ids + t*args.nb1))[j];
     }
 }
+
+// y + x*sigmoid(g) [+ r] over float4, g one value per row: the gated shared expert and the sums
+// that close a MoE block
+struct tosh_gate_add_args {
+    int32_t ne0_4;
+    int32_t n_4;
+    int32_t has_res;
+};
+
+kernel void tosh_gate_add_f32(
+        constant tosh_gate_add_args & args,
+        device const float  * g,
+        device const float4 * x,
+        device const float4 * y,
+        device const float4 * r,
+        device       float4 * dst,
+        uint tpig[[thread_position_in_grid]]) {
+    if ((int) tpig >= args.n_4) {
+        return;
+    }
+    const float s = 1.0f/(1.0f + exp(-g[tpig/args.ne0_4]));
+    float4 v = y[tpig] + x[tpig]*s;
+    if (args.has_res) {
+        v += r[tpig];
+    }
+    dst[tpig] = v;
+}

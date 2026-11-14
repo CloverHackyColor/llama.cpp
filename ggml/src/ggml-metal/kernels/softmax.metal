@@ -234,6 +234,8 @@ kernel void kernel_tosh_topk_moe_f32(
         threadgroup int   * si [[threadgroup(1)]],
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint  tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]],
         uint3 ntgg [[threads_per_threadgroup]]) {
     const uint ntg = ntgg.x;
     const int row = tgpig.x;
@@ -351,23 +353,27 @@ kernel void kernel_tosh_topk_moe_f32(
         threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
     }
 
+    // the same arithmetic as sum_rows (one lane per element, float4 when it divides), clamp and div,
+    // so the fused router gives the separate ops' weights bit for bit; the host keeps nu within a simdgroup
     if (args.with_norm != 0) {
-        float lsum = 0.0f;
-        for (int i = tiitg; i < nu; i += ntg) {
-            lsum += weights[i];
-        }
-        rv[tiitg] = lsum;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint s = ntg/2; s > 0; s >>= 1) {
-            if (tiitg < s) {
-                rv[tiitg] += rv[tiitg + s];
+        if (sgitg == 0) {
+            float s;
+            if (nu % 4 == 0) {
+                const int i = 4*tiisg;
+                float4 v = tiisg < nu/4 ? float4(weights[i], weights[i + 1], weights[i + 2], weights[i + 3]) : float4(0.0f);
+                v = simd_sum(v);
+                s = sum(v);
+            } else {
+                s = simd_sum(tiisg < nu ? weights[tiisg] : 0.0f);
             }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (tiisg == 0) {
+                rv[0] = s;
+            }
         }
-        const float inv = 1.0f/max(rv[0], args.clamp);
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float s = clamp(rv[0], args.clamp, INFINITY);
         for (int i = tiitg; i < nu; i += ntg) {
-            weights[i] *= inv;
+            weights[i] = weights[i] / s;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
     }

@@ -2645,6 +2645,14 @@ static struct ggml_metal_fb_residual_state * ggml_metal_fb_residual_get(ggml_met
     return res;
 }
 
+bool ggml_metal_fb_residual_armed(ggml_metal_device_t dev, const struct ggml_tensor * t) {
+    if (!ggml_metal_fb_residual()) {
+        return false;
+    }
+    struct ggml_metal_fb_residual_state * st = ggml_metal_fb_residual_get(dev);
+    return st != NULL && st->state == 2 && t != NULL && (st->t == t || st->alias == t);
+}
+
 bool ggml_metal_fb_residual_take(ggml_metal_device_t dev, const struct ggml_tensor * t, struct ggml_metal_buffer_id * peer) {
     if (!ggml_metal_fb_residual()) {
         return false;
