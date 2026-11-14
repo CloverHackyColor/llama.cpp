@@ -1,3 +1,4 @@
+#include <os/lock.h>
 #import "ggml-metal-device.h"
 #import "ggml-metal-fusion.h"
 
@@ -843,6 +844,110 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
 struct ggml_metal_encoder {
     id<MTLComputeCommandEncoder> obj;
 };
+
+struct ggml_metal_pipeline_with_params ggml_metal_device_pipeline_add3(ggml_metal_device_t dev) {
+    static ggml_metal_device_t     devs[8];
+    static struct ggml_metal_pipeline pls[8];
+    static dispatch_once_t         once[8];
+
+    static os_unfair_lock          lock = OS_UNFAIR_LOCK_INIT;
+
+    struct ggml_metal_pipeline_with_params res = { 0 };
+    os_unfair_lock_lock(&lock);
+    int i = 0;
+    for (; i < 8 && devs[i] != NULL && devs[i] != dev; i++) {}
+    if (i < 8) {
+        devs[i] = dev;
+    }
+    os_unfair_lock_unlock(&lock);
+    if (i == 8) {
+        return res;
+    }
+    dispatch_once(&once[i], ^{
+        static const char * src =
+            "#include <metal_stdlib>\n"
+            "using namespace metal;\n"
+            "kernel void kernel_add3_f32_4(device const float4 * a [[buffer(0)]], device const float4 * b [[buffer(1)]],\n"
+            "                              device const float4 * c [[buffer(2)]], device float4 * d [[buffer(3)]],\n"
+            "                              constant uint & n [[buffer(4)]], uint i [[thread_position_in_grid]]) {\n"
+            "    if (i < n) { d[i] = (a[i] + b[i]) + c[i]; }\n"
+            "}\n";
+        id<MTLDevice> mtl = (id<MTLDevice>) ggml_metal_device_get_obj(dev);
+        NSError * err = nil;
+        id<MTLLibrary> lib = [mtl newLibraryWithSource:[NSString stringWithUTF8String:src] options:nil error:&err];
+        id<MTLFunction> fn = [lib newFunctionWithName:@"kernel_add3_f32_4"];
+        pls[i].obj = fn != nil ? [mtl newComputePipelineStateWithFunction:fn error:&err] : nil;
+        [fn release];
+        [lib release];
+    });
+    if (pls[i].obj != nil) {
+        res.pipeline = &pls[i];
+    }
+    return res;
+}
+
+struct ggml_metal_pipeline_with_params ggml_metal_device_pipeline_add3_rms_mul(ggml_metal_device_t dev) {
+    static ggml_metal_device_t        devs[8];
+    static struct ggml_metal_pipeline pls[8];
+    static dispatch_once_t            once[8];
+    static os_unfair_lock             lock = OS_UNFAIR_LOCK_INIT;
+
+    struct ggml_metal_pipeline_with_params res = { 0 };
+    os_unfair_lock_lock(&lock);
+    int i = 0;
+    for (; i < 8 && devs[i] != NULL && devs[i] != dev; i++) {}
+    if (i < 8) {
+        devs[i] = dev;
+    }
+    os_unfair_lock_unlock(&lock);
+    if (i == 8) {
+        return res;
+    }
+    dispatch_once(&once[i], ^{
+        // the reduction mirrors kernel_rms_norm_fuse_impl so the norm matches it bit for bit
+        static const char * src =
+            "#include <metal_stdlib>\n"
+            "using namespace metal;\n"
+            "kernel void kernel_add3_rms_mul_f32_4(device const float4 * a [[buffer(0)]], device const float4 * b [[buffer(1)]],\n"
+            "        device const float4 * c [[buffer(2)]], device float4 * x [[buffer(3)]], device const float4 * w [[buffer(4)]],\n"
+            "        device float4 * y [[buffer(5)]], constant uint & n4 [[buffer(6)]], constant float & eps [[buffer(7)]],\n"
+            "        constant uint & ne00 [[buffer(8)]], threadgroup float * shmem [[threadgroup(0)]],\n"
+            "        uint row [[threadgroup_position_in_grid]], ushort tp [[thread_position_in_threadgroup]],\n"
+            "        ushort sg [[simdgroup_index_in_threadgroup]], ushort ti [[thread_index_in_simdgroup]],\n"
+            "        ushort ntg [[threads_per_threadgroup]]) {\n"
+            "    if (sg == 0) { shmem[ti] = 0.0f; }\n"
+            "    const uint r = row*n4;\n"
+            "    float sumf = 0.0f;\n"
+            "    for (uint i = tp; i < n4; i += ntg) {\n"
+            "        const float4 v = (a[r + i] + b[r + i]) + c[r + i];\n"
+            "        x[r + i] = v;\n"
+            "        sumf += dot(v, v);\n"
+            "    }\n"
+            "    sumf = simd_sum(sumf);\n"
+            "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+            "    if (ti == 0) { shmem[sg] = sumf; }\n"
+            "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+            "    sumf = shmem[ti];\n"
+            "    sumf = simd_sum(sumf);\n"
+            "    const float mean  = sumf/ne00;\n"
+            "    const float scale = 1.0f/sqrt(mean + eps);\n"
+            "    for (uint i = tp; i < n4; i += ntg) {\n"
+            "        y[r + i] = (x[r + i]*scale)*w[i];\n"
+            "    }\n"
+            "}\n";
+        id<MTLDevice> mtl = (id<MTLDevice>) ggml_metal_device_get_obj(dev);
+        NSError * err = nil;
+        id<MTLLibrary> lib = [mtl newLibraryWithSource:[NSString stringWithUTF8String:src] options:nil error:&err];
+        id<MTLFunction> fn = [lib newFunctionWithName:@"kernel_add3_rms_mul_f32_4"];
+        pls[i].obj = fn != nil ? [mtl newComputePipelineStateWithFunction:fn error:&err] : nil;
+        [fn release];
+        [lib release];
+    });
+    if (pls[i].obj != nil) {
+        res.pipeline = &pls[i];
+    }
+    return res;
+}
 
 ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, bool concurrent) {
     ggml_metal_encoder_t res = calloc(1, sizeof(struct ggml_metal_encoder));

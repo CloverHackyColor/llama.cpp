@@ -4139,6 +4139,38 @@ int ggml_metal_op_add_id(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+// Measured depth where the 32-way split starts to win for a single-row dk128 query on 64 lanes, per
+// local query and KV heads; shapes that were not measured keep the full-die depth.
+static int64_t ggml_metal_fa_wg_dk128_min_kv_w64(int64_t n_head, int64_t n_head_kv) {
+    static const struct { int64_t n_head, n_head_kv, min_kv; } measured[] = {
+        {  8, 4, 1536 },
+        { 16, 8, 3584 },
+        { 16, 4, 3072 },
+        { 16, 2, 3584 },
+        { 16, 1, 4096 },
+        { 20, 4, 4608 },
+    };
+    for (const auto & m : measured) {
+        if (m.n_head == n_head && m.n_head_kv == n_head_kv) {
+            return m.min_kv;
+        }
+    }
+    return 16384;
+}
+
+// The same for dk64, where the split only pays with few local query heads; 0 keeps it closed.
+static int64_t ggml_metal_fa_wg_dk64_min_kv_w64(int64_t n_head, int64_t n_head_kv) {
+    static const struct { int64_t n_head, n_head_kv, min_kv; } measured[] = {
+        { 16, 4, 6144 },
+    };
+    for (const auto & m : measured) {
+        if (m.n_head == n_head && m.n_head_kv == n_head_kv) {
+            return m.min_kv;
+        }
+    }
+    return 0;
+}
+
 // A kernel the driver refuses to build (local memory over the device limit) is refused
 // every time, and asking again costs a compile per layer and token.
 static ggml_metal_pipeline_with_params ggml_metal_fa_amd_pipeline(ggml_metal_library_t lib, const char * name) {
@@ -4877,9 +4909,15 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             ne00 == 256 || ne00 == 512 || (ne00 == 576 && ne20 == 512) ||
             (ne00 == 320 && ne20 == 256);
         const int64_t wg_dk128_min_kv = wg_dk128_env >= 0 ? wg_dk128_env
+                                      : (props_dev->simd_width == 64 ? ggml_metal_fa_wg_dk128_min_kv_w64(ne02, ne12) : 24576);
         const bool wg_dk128_width_ok = props_dev->simd_width == 32 || props_dev->simd_width == 64;
+        // TOSH_FA_WG_DK64=<kv> sets the head-64 depth for every shape, 0 closes it
+        static const int64_t wg_dk64_env = []() {
             const char * s = TOSH_ENV("TOSH_FA_WG_DK64");
+            return s ? (int64_t) atoll(s) : (int64_t) -1;
         }();
+        const int64_t wg_dk64_min_kv = wg_dk64_env >= 0 ? wg_dk64_env
+                                     : (props_dev->simd_width == 64 ? ggml_metal_fa_wg_dk64_min_kv_w64(ne02, ne12) : 0);
         const bool wg_dk64 = ne00 == 64 && ne20 == 64 && wg_dk128_width_ok &&
                              wg_dk64_min_kv > 0 && ne11 >= wg_dk64_min_kv;
         const bool wg_dk128 = (ne00 == 128 && ne20 == 128 && wg_dk128_width_ok &&
@@ -5613,6 +5651,69 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
 }
 
 int ggml_metal_op_bin(ggml_metal_op_t ctx, int idx) {
+    {
+        ggml_tensor * op = ctx->node(idx);
+        ggml_metal_buffer_id bid_peer;
+        if (op->op == GGML_OP_ADD && ggml_metal_fb_residual_take(ctx->dev, op->src[0], &bid_peer)) {
+            // the norm that reads the sum and its weight can run in the same kernel when nothing
+            // else reads the unweighted norm
+            static int fuse_rms = -1;
+            if (fuse_rms < 0) { const char * e = getenv("TOSH_MGPU_FB_RMS"); fuse_rms = (e && e[0] == '0') ? 0 : 1; }
+            ggml_tensor * rms = idx + 2 < ctx->n_nodes() ? ctx->node(idx + 1) : nullptr;
+            ggml_tensor * mul = idx + 2 < ctx->n_nodes() ? ctx->node(idx + 2) : nullptr;
+            bool fuse = fuse_rms && rms != nullptr && mul != nullptr &&
+                        rms->op == GGML_OP_RMS_NORM && rms->src[0] == op && ggml_is_contiguous(rms) &&
+                        mul->op == GGML_OP_MUL && mul->src[0] == rms && ggml_is_contiguous(mul) &&
+                        mul->type == GGML_TYPE_F32 && mul->src[1]->type == GGML_TYPE_F32 &&
+                        ggml_is_contiguous(mul->src[1]) && mul->src[1]->ne[0] == op->ne[0] && ggml_nrows(mul->src[1]) == 1 &&
+                        ggml_are_same_shape(mul, op) && op->ne[0] % 4 == 0;
+            for (int j = idx + 3; fuse && j < ctx->n_nodes(); j++) {
+                const ggml_tensor * nd = ctx->node(j);
+                for (int k = 0; k < GGML_MAX_SRC && fuse; k++) {
+                    for (const ggml_tensor * sx = nd->src[k]; sx != nullptr; sx = sx->view_src) {
+                        if (sx == rms) { fuse = false; break; }
+                    }
+                }
+            }
+            auto prms = fuse ? ggml_metal_device_pipeline_add3_rms_mul(ctx->dev) : ggml_metal_pipeline_with_params{};
+            if (prms.pipeline != nullptr) {
+                const uint32_t n4   = (uint32_t) (op->ne[0]/4);
+                const uint32_t ne00 = (uint32_t) op->ne[0];
+                float eps;
+                memcpy(&eps, rms->op_params, sizeof(float));
+                const int nmax = ggml_metal_pipeline_max_theads_per_threadgroup(prms);
+                int nth = 32;
+                while (nth < (int) n4 && nth < nmax) {
+                    nth *= 2;
+                }
+                nth = std::min(nth, nmax);
+                nth = std::min(nth, ((int) n4 + 31)/32*32);
+                ggml_metal_encoder_set_pipeline(ctx->enc, prms);
+                ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(op->src[0]), 0);
+                ggml_metal_encoder_set_buffer  (ctx->enc, bid_peer, 1);
+                ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+                ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(op), 3);
+                ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(mul->src[1]), 4);
+                ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(mul), 5);
+                ggml_metal_encoder_set_bytes   (ctx->enc, (void *) &n4,   sizeof(n4),   6);
+                ggml_metal_encoder_set_bytes   (ctx->enc, (void *) &eps,  sizeof(eps),  7);
+                ggml_metal_encoder_set_bytes   (ctx->enc, (void *) &ne00, sizeof(ne00), 8);
+                ggml_metal_encoder_set_threadgroup_memory_size(ctx->enc, 64*sizeof(float), 0);
+                ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (int) ggml_nrows(op), 1, 1, nth, 1, 1);
+                return 3;
+            }
+            const uint32_t n4 = (uint32_t) (ggml_nelements(op)/4);
+            ggml_metal_encoder_set_pipeline(ctx->enc, ggml_metal_device_pipeline_add3(ctx->dev));
+            ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(op->src[0]), 0);
+            ggml_metal_encoder_set_buffer  (ctx->enc, bid_peer, 1);
+            ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+            ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(op), 3);
+            ggml_metal_encoder_set_bytes   (ctx->enc, (void *) &n4, sizeof(n4), 4);
+            ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (n4 + 255)/256, 1, 1, 256, 1, 1);
+            return 1;
+        }
+    }
+
     int n_fuse = 1;
     const ggml_metal_fusion * fusion = nullptr;
 
