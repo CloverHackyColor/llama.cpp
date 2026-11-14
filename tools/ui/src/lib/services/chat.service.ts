@@ -479,6 +479,8 @@ export class ChatService {
 
 		let decoder = new TextDecoder();
 		let aggregatedContent = '';
+		// text of an agent pass that may still end in tool calls: shown, never kept as the answer
+		let drafted = false;
 		let fullReasoningContent = '';
 		let aggregatedToolCalls: ApiChatCompletionToolCall[] = [];
 		let lastTimings: ChatMessageTimings | undefined;
@@ -633,9 +635,24 @@ export class ChatService {
 
 								// the Tosh agent's progress and metadata; a retract drops the text streamed so far
 								if (parsed.tosh && typeof parsed.tosh === 'object') {
-									if (parsed.tosh.event?.type === 'retract') aggregatedContent = '';
+									const event = parsed.tosh.event;
+
+									if (event?.type === 'retract') {
+										aggregatedContent = '';
+										drafted = false;
+									}
 
 									if (!abortSignal?.aborted) onTosh?.(parsed.tosh);
+
+									if (
+										event?.type === 'draft' &&
+										typeof event.content === 'string' &&
+										event.content
+									) {
+										drafted = true;
+
+										if (!abortSignal?.aborted) onChunk?.(event.content);
+									}
 								}
 
 								const choice = parsed.choices?.[0];
@@ -667,6 +684,14 @@ export class ChatService {
 
 								if (content) {
 									finalizeOpenToolCallBatch();
+
+									// the answer replaces the draft shown before it
+									if (drafted) {
+										drafted = false;
+
+										if (!abortSignal?.aborted) onTosh?.({ event: { type: 'retract' } });
+									}
+
 									aggregatedContent += content;
 
 									if (!abortSignal?.aborted) {
