@@ -1675,6 +1675,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                 } else {
                     nsg = N_SG_Q8_0;
                     nr0 = N_R0_Q8_0;
+                    // a row shorter than the simdgroups' blocks leaves some with nothing to sum but zeros
+                    if (simd_width == 32 && !ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->has_unified_memory &&
+                        TOSH_ENV("TOSH_MV_Q8_0_NSG_DISABLE") == nullptr) {
+                        nsg = std::max(1, std::min(nsg, (ne00/32 + 7)/8));
+                    }
                 }
                 // the reduction buffer scales with the rows, so it follows the effective nr0
                 smem = 32*sizeof(float)*nr0;
@@ -2326,6 +2331,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
                 nsg = N_SG_Q8_0;
                 nr0 = N_R0_Q8_0;
                 smem = 32*sizeof(float)*N_R0_Q8_0;
+                // as in the dense path, short rows leave simdgroups with only zeros to sum
+                if (simd_width == 32 && !ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->has_unified_memory &&
+                    TOSH_ENV("TOSH_MV_Q8_0_NSG_DISABLE") == nullptr) {
+                    nsg = std::max(1, std::min(nsg, (ne00/32 + 7)/8));
+                }
             } break;
         case GGML_TYPE_MXFP4:
             {
@@ -2507,6 +2517,12 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
         if (tsrc0 == GGML_TYPE_Q5_1 && !props_id->has_unified_memory && TOSH_ENV("TOSH_MV_Q5_1_L2_DISABLE") == nullptr) {
             nr0    = 2;
             suffix = "_L2r2";
+        }
+        // rows of two super-blocks leave half the lane groups idle, the _s2 twin gives them a second set of rows
+        if (tsrc0 == GGML_TYPE_Q4_K && ne00 == 2*256 && ne01 % (2*N_R0_Q4_K*N_SG_Q4_K) == 0 && !props_id->has_unified_memory &&
+            TOSH_ENV("TOSH_MVID_SPLIT_DISABLE") == nullptr) {
+            nr0    = 2*N_R0_Q4_K;
+            suffix = "_s2";
         }
     }
 
