@@ -1029,6 +1029,20 @@ static void system_message_not_supported(json & messages) {
     }
 }
 
+// A system message that the template would drop or reject becomes a user message in place.
+// Merging it into the first system message would change the prompt prefix and miss the cache every turn.
+static void late_system_message_not_supported(json & messages) {
+    bool started = false;
+    for (auto & message : messages) {
+        const std::string role = message.value("role", "");
+        if (role != "system") {
+            started = true;
+        } else if (started) {
+            message["role"] = "user";
+        }
+    }
+}
+
 static void requires_non_null_content(json & messages) {
     GGML_ASSERT(messages.is_array());
     for (auto & message : messages) {
@@ -1154,6 +1168,11 @@ std::optional<common_chat_params> common_chat_try_specialized_template(
         src.find("<|START_ACTION|>") != std::string::npos) {
         LOG_DBG("Using specialized template: Cohere2 MoE\n");
         return common_chat_params_init_cohere2moe(tmpl, params);
+    }
+
+    if (is_llama4_template(src)) {
+        LOG_DBG("Using specialized template: Llama 4\n");
+        return common_chat_params_init_llama4(tmpl, params);
     }
 
     if (is_lfm2_template(src)) {
@@ -1283,6 +1302,10 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
 
     if (!tmpl.original_caps().supports_system_role) {
         workaround::system_message_not_supported(params.messages);
+    }
+
+    if (tmpl.original_caps().supports_system_role && !tmpl.original_caps().supports_late_system) {
+        workaround::late_system_message_not_supported(params.messages);
     }
 
     if (tmpl.original_caps().supports_tool_calls) {

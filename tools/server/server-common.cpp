@@ -1413,6 +1413,13 @@ json oaicompat_chat_params_parse(
     // Parse the OAI "reasoning_effort" field; "none" disables reasoning.
     if (body.contains("reasoning_effort")) {
         auto reasoning_effort = json_value(body, "reasoning_effort", std::string(""));
+        // clients spell the levels many ways, and a template that does not know one raises on it
+        std::transform(reasoning_effort.begin(), reasoning_effort.end(), reasoning_effort.begin(), ::tolower);
+        if (reasoning_effort == "off" || reasoning_effort == "minimal" || reasoning_effort == "disabled" || reasoning_effort == "false") {
+            reasoning_effort = "none";
+        } else if (reasoning_effort == "max" || reasoning_effort == "maximum") {
+            reasoning_effort = "high";
+        }
         if (reasoning_effort == "none") {
             inputs.enable_thinking = false;
             inputs.chat_template_kwargs.erase("reasoning_effort");
