@@ -3860,6 +3860,15 @@ void ggml_metal_device_read_batch_end(ggml_metal_device_t dev) {
         return;
     [dev->stage_lock unlock];
 }
+
+static void ggml_metal_device_stage_batch_flush(ggml_metal_device_t dev);
+
+// a read batch drains every few MiB: larger batches wait less on a desktop host but copy out
+// of the staging buffer slower on a Xeon W one, and 4 MiB was the size that won on both
+static size_t ggml_metal_stage_batch_cap(void) {
+    return (size_t) 4*1024*1024;
+}
+
 bool ggml_metal_device_stage_get(ggml_metal_device_t dev, struct ggml_metal_buffer_id bid_src, void * data, size_t size) {
     if (size == 0) {
         return true;
@@ -3873,7 +3882,15 @@ bool ggml_metal_device_stage_get(ggml_metal_device_t dev, struct ggml_metal_buff
     [dev->stage_lock lock];
 
     // inside an open read batch: queue the blit, defer the wait to batch end
+        if (ggml_metal_device_stage_buf(dev) == nil) {
             [dev->stage_lock unlock];
+            return false;   // no buffer: caller falls back to the direct path
+        }
+        // a full batch drains and reopens, so a long run of reads still pays one wait per
+        // staging buffer instead of one per read
+        if (dev->stage_batch_n == 16 || dev->stage_batch_used + size > ggml_metal_stage_batch_cap()) {
+            ggml_metal_device_stage_batch_flush(dev);
+            // the caller sits in an autorelease pool that drains before the batch ends
         [dev->stage_batch_enc copyFromBuffer:bid_src.metal
                                 sourceOffset:bid_src.offs
                                     toBuffer:dev->stage_buf

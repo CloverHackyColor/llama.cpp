@@ -3911,13 +3911,17 @@ ggml_tensor * llm_graph_context::build_rs(
         const llm_graph_get_rows_fn & get_state_rows) const {
     const auto * kv_state = inp->mctx;
 
+    // the ubatch states keep their own gather: the Metal gated_delta_net reads a single sequence's
+    // state from the cache only when it is fed by that gather, not by a view of a shared one
+    const llm_graph_get_rows_fn getter = get_state_rows ? get_state_rows : llm_graph_get_rows_fn(ggml_get_rows);
+
     // a custom getter reads the states of the ubatch straight from the cache, so the gather skips the first
     // state: it still holds the n_rs - n_seqs extra states and copies no state of a single sequence ubatch
-    ggml_tensor * state_copy = get_state_rows ? inp->s_copy_tail : inp->s_copy;
+    ggml_tensor * state_copy = inp->s_copy_tail;
 
     return build_rs(s, state_copy, inp->s_copy_main, state_size, n_seqs,
                     kv_state->get_n_rs(), kv_state->get_head(), kv_state->get_size(), kv_state->get_rs_z(),
-                    get_state_rows);
+                    getter);
 }
 
 ggml_tensor * llm_graph_context::build_rwkv_token_shift_load(

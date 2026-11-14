@@ -433,6 +433,18 @@ void ggml_backend_tensor_set_async(ggml_backend_t backend, struct ggml_tensor * 
     }
 }
 
+void ggml_backend_read_batch_begin(ggml_backend_t backend) {
+    if (backend && backend->iface.read_batch_begin) {
+        backend->iface.read_batch_begin(backend);
+    }
+}
+
+void ggml_backend_read_batch_end(ggml_backend_t backend) {
+    if (backend && backend->iface.read_batch_end) {
+        backend->iface.read_batch_end(backend);
+    }
+}
+
 void ggml_backend_tensor_get_async(ggml_backend_t backend, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     GGML_ASSERT(backend);
     GGML_ASSERT(tensor);
@@ -1925,6 +1937,27 @@ static bool ggml_backend_sched_prefetch_init(ggml_backend_sched_t sched, ggml_ba
         }
     }
     return true;
+}
+
+// whether a node that will be computed reads the tensor, directly or through a view
+static bool ggml_backend_sched_input_is_read(const ggml_cgraph * graph, const ggml_tensor * t) {
+    for (int i = 0; i < graph->n_nodes; i++) {
+        const ggml_tensor * node = graph->nodes[i];
+        if (!(node->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+            continue;
+        }
+        if (node->view_src == t) {
+            return true;
+        }
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            if (node->src[j] == t) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1980,6 +2013,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     break;
                 }
             }
+        }
+
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
         if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
@@ -1995,6 +2030,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+
+            // a tensor that only feeds a branch ggml_build_forward_select left out is never read
+            // here; on a discrete GPU each of these copies is a synchronous upload
+            if (!ggml_backend_sched_input_is_read(&split->graph, input_cpy)) {
+                continue;
+            }
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done

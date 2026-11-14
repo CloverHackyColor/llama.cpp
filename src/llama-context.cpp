@@ -2911,12 +2911,23 @@ private:
 class llama_io_write_host : public llama_io_write_i {
 public:
     llama_io_write_host(
-            uint8_t * p, size_t len) : ptr(p), buf_size(len) {}
+            uint8_t * p, size_t len, const std::vector<ggml_backend_ptr> * backends = nullptr) : ptr(p), buf_size(len), backends(backends) {}
 
     ~llama_io_write_host() {
-        // TODO: add backend support to batch tensor_get? or some other way to speed this up
+        // on a discrete GPU each read is a round trip over the bus; batching them leaves one
+        // wait per staging buffer instead of one per tensor
+        if (backends) {
+            for (const auto & b : *backends) {
+                ggml_backend_read_batch_begin(b.get());
+            }
+        }
         for (const auto & winfo : winfos) {
             ggml_backend_tensor_get(winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
+        }
+        if (backends) {
+            for (const auto & b : *backends) {
+                ggml_backend_read_batch_end(b.get());
+            }
         }
     }
 
@@ -2959,6 +2970,7 @@ private:
         size_t offset;
     };
     std::vector<write_info> winfos;
+    const std::vector<ggml_backend_ptr> * backends;
 };
 
 class llama_io_read_host : public llama_io_read_i {
@@ -3385,7 +3397,7 @@ size_t llama_context::state_get_size() {
 }
 
 size_t llama_context::state_get_data(uint8_t * dst, size_t size) {
-    llama_io_write_host io(dst, size);
+    llama_io_write_host io(dst, size, &backends);
     try {
         return state_write_data(io);
     } catch (const std::exception & err) {
@@ -3425,7 +3437,7 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
         io = std::make_unique<llama_io_write_device>(dst, size, mem_storage[seq_id]);
     } else {
-        io = std::make_unique<llama_io_write_host>(dst, size);
+        io = std::make_unique<llama_io_write_host>(dst, size, &backends);
     }
 
     try {
