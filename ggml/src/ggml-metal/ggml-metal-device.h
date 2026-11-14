@@ -140,6 +140,9 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_mm
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_mma_auto   (ggml_metal_library_t lib, const struct ggml_tensor * op, bool add);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm            (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv            (ggml_metal_library_t lib, const struct ggml_tensor * op);
+
+// rows per simdgroup of the few-column mat-vec for this type, lane width and column count,
+// 0 if the batch does not take it
 int ggml_metal_mv_nc2_rows(enum ggml_type type, int simd_width, int ne11, int ne01, int ne00);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map0    (ggml_metal_library_t lib, int ne02, int ne20);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_amax(ggml_metal_library_t lib);

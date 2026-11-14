@@ -2658,10 +2658,59 @@ static int ggml_metal_op_mul_mat_mv(ggml_metal_op_t ctx, int idx) {
         pattern = qvk_w64 ? decltype(pattern){ "kernel_mul_mv_qvk_q4_0_q4_0_q4_0_f32_w64", 1, 4, 4, 4 }
                           : decltype(pattern){ "kernel_mul_mv_qvk_q4_0_q4_0_q4_0_f32",     1, 4, 4, 4 };
     } else if (tq == GGML_TYPE_Q2_K && tv == GGML_TYPE_Q4_K && tk == GGML_TYPE_Q2_K) {
+
+// K-quants asked for four columns while every other type batches from two, so at two or three
+// sequences each column paid its own full pass over the weights
+static int kquant_ext_floor() {
+    static const int v = []() {
         const char * s = TOSH_ENV("TOSH_EXT_KQ_FLOOR");
+        return s ? atoi(s) : 2;
+    }();
+    return v;
+}
+
+// on 64 lanes the batched kernel loses to one mat-vec pass per column for these types: at every
+// width for the table lookups and q2_K, and at two columns for the rest
+static bool ext_loses_w64(ggml_type t, int ne11) {
+    static const bool disabled = TOSH_ENV("TOSH_EXT_W64_SKIP_DISABLE") != nullptr;
+    if (disabled) {
+        return false;
+    }
+    switch (t) {
+        case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_MXFP4:
+        case GGML_TYPE_Q2_K: return true;
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1: return ne11 == 2;
+        default: return false;
+    }
+}
+
+// nine and ten columns only beat the tile with five per group, which needs the two-row variant
+// and a cheap dequant: q5_K measures flat there and q6_K loses
+static bool ext_wide_group(ggml_type tsrc0) {
+    return tsrc0 == GGML_TYPE_Q4_K || tsrc0 == GGML_TYPE_Q2_K || tsrc0 == GGML_TYPE_Q3_K;
+}
+
+// above eight columns the matmul tile takes over, but on 64 lanes it costs the same from nine
+// columns to thirty-two, so three column groups of the batched kernel are still cheaper
+static int ext_ceil(int simd_width, ggml_type tsrc0) {
+    static const int v = []() {
         const char * s = TOSH_ENV("TOSH_EXT_MAX");
         return s ? atoi(s) : 0;
     }();
+
+    if (v) {
+        return v;
+    }
+
+    if (simd_width == 64) {
+        return 12;
+    }
+
+    return ext_wide_group(tsrc0) ? 10 : 8;
+}
     static const bool disabled = TOSH_ENV("TOSH_SWIGLU_FUSION_DISABLE") != nullptr;
     if (disabled || !ctx->use_fusion() || idx + 2 >= ctx->n_nodes()) {
 int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
@@ -2699,6 +2748,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     // these should be efficient for BS [2, ~8]
     if (op->src[1]->type == GGML_TYPE_F32 && (ne00%128 == 0) &&
     static const bool ext_disabled = TOSH_ENV("TOSH_EXT_DISABLE") != nullptr;
+        !(props_dev->simd_width == 64 && ext_loses_w64(op->src[0]->type, ne11)) &&
         ggml_metal_mv_nc2_rows(op->src[0]->type, props_dev->simd_width, ne11, ne01, ne00) == 0 &&
         op->src[1]->type == GGML_TYPE_F32 && (ne00%128 == 0) &&
         (
@@ -2716,7 +2766,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
            op->src[0]->type == GGML_TYPE_Q8_0 ||
            op->src[0]->type == GGML_TYPE_MXFP4 ||
            op->src[0]->type == GGML_TYPE_IQ4_NL ||
-           false) && (ne11 >= 2 && ne11 <= 8)
+           false) && (ne11 >= 2 && ne11 <= ext_ceil(props_dev->simd_width, op->src[0]->type))
          ) ||
          (
           (
@@ -2725,7 +2775,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
            op->src[0]->type == GGML_TYPE_Q6_K ||
            op->src[0]->type == GGML_TYPE_Q2_K ||
            op->src[0]->type == GGML_TYPE_Q3_K ||
-           false) && (ne11 >= 4 && ne11 <= 8)
+           false) && (ne11 >= kquant_ext_floor() && ne11 <= ext_ceil(props_dev->simd_width, op->src[0]->type))
          )
         )
        ) {
@@ -2787,7 +2837,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
             case 5:
                 r1ptg = 5; break;
             default:
-                GGML_ABORT("unsupported ne11");
+                r1ptg = 4; break;
         };
 
         // 2 rows per thread: the activation chunk is loaded once and reused across them
@@ -2823,6 +2873,11 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
 
         const int16_t nr0   = nr0_2 ? (nr0_env ? nr0_env : ((nr0_wide || nr0_w64) ? 4 : 2)) : 1;
 
+        // each group makes a full pass over the weights, so the cost is groups by group width:
+        // nine and ten columns fit in two groups of five instead of three of four
+        if (ext_wide_group(op->src[0]->type) && (ne11 == 9 || ne11 == 10)) {
+            r1ptg = 5;
+        }
 
         // the wave64 q6_K variant keeps four rows per simdgroup, so the row split does not apply
         // keep the gate in sync with the pipeline picker in ggml_metal_library_get_pipeline_mul_mv_ext

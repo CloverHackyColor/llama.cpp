@@ -94,6 +94,7 @@
 #define N_SG_IQ4_NL 2
 
 #define N_R0_IQ4_XS 2
+#define N_R0_IQ4_XS_NC_W64 4
 #define N_SG_IQ4_XS 2
 
 #define N_R0_TQ2_0 4
@@ -124,6 +125,7 @@
 #define FC_FLASH_ATTN_EXT_TENSOR       2200
 #define FC_LIGHTNING_INDEXER           2200
 #define FC_MUL_MV_MMA                  2300
+#define FC_TURBO_WHT                   2400
 
 // op-specific constants
 #define OP_FLASH_ATTN_EXT_NQPSG 8

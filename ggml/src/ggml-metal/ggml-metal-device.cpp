@@ -825,9 +825,17 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ext(ggml_
     char tname[64];
     // q6_K measured slower with the header cached (its dequant is register-heavy), so it stays generic
     const bool is_khdr = tsrc0 == GGML_TYPE_Q5_K || tsrc0 == GGML_TYPE_Q2_K || tsrc0 == GGML_TYPE_Q3_K;
+    // staging the activation chunk in shared memory pays from three columns up: with two, half the
+    // simdgroup idles in the staging loop. Measured on 64 lanes only, so it stays gated there;
+    // TOSH_EXT_LDS asks for it on 32 lanes to A/B it
+    const int simd_width_lds = ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->simd_width;
+    const bool use_lds =
         (simd_width_lds == 64 || TOSH_ENV("TOSH_EXT_LDS") != nullptr) &&
         TOSH_ENV("TOSH_EXT_LDS_DISABLE") == nullptr &&
+        nr0 > 1 && r1ptg >= 3;
+
     if (!no_raw && tsrc0 == GGML_TYPE_Q4_K) {
+        snprintf(tname, sizeof(tname), use_lds ? "%s_raw_lds" : "%s_raw", ggml_type_name(tsrc0));
     } else if (!no_raw && is_khdr) {
         snprintf(tname, sizeof(tname), "%s_hdr", ggml_type_name(tsrc0));
     } else {
@@ -1097,7 +1105,23 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     return res;
 }
 
+// a pair of columns shares one read of each block, where one pass per column would read and
+// unpack the weights twice. Four columns go as two pairs where that measured faster.
+// TOSH_MV_NC2_PROBE=R opens the untuned widths with R rows, for measuring
+static int nc2_probe() {
+    static const int r = TOSH_ENV("TOSH_MV_NC2_PROBE") ? atoi(TOSH_ENV("TOSH_MV_NC2_PROBE")) : 0;
+    return r;
+}
+
 int ggml_metal_mv_nc2_rows(ggml_type type, int simd_width, int ne11, int ne01, int ne00) {
+    static const bool disabled = TOSH_ENV("TOSH_MV_NC2_DISABLE") != nullptr;
+    if (disabled || ne11 < 2 || ne11 > 4) {
+        return 0;
+    }
+    const bool w64 = simd_width == 64;
+    // three columns in one pass, where that beat the batched kernel
+    if (ne11 == 3) {
+        static const bool nc3_off = TOSH_ENV("TOSH_MV_NC3_DISABLE") != nullptr;
         if (nc3_off) {
             return 0;
         }
@@ -1106,6 +1130,15 @@ int ggml_metal_mv_nc2_rows(ggml_type type, int simd_width, int ne11, int ne01, i
             if (type == GGML_TYPE_Q8_0) {
                 return ne01 < 2048 ? 2 : (ne00 >= 2048 || ne01 >= 8192 ? 8 : 0);
             }
+            return 0;
+        }
+        switch (type) {
+            case GGML_TYPE_Q5_K:    return 4;
+            default: return 0;
+        }
+    }
+    switch (type) {
+        case GGML_TYPE_Q4_K: return w64 ? (ne11 == 2 ? 8 : 0) : 4;
         // on 32 lanes four columns of q4_0/q4_1 stay on the batched kernel, which reads them
         // faster; on 64 lanes eight rows per simdgroup beat it at two and four columns. q4_0 only
         // keeps eight for a pair where the grid comes out in whole waves or is large enough
@@ -1116,8 +1149,15 @@ int ggml_metal_mv_nc2_rows(ggml_type type, int simd_width, int ne11, int ne01, i
         case GGML_TYPE_Q5_1: return 4;
         // four q8_0 columns in one pass on 64 lanes; two passes of two cost twice the reads
         case GGML_TYPE_Q8_0: return w64 ? (ne11 == 4 ? (ne01 >= 2048 ? 4 : 2) : 8) : 0;
+        case GGML_TYPE_IQ3_S: return w64 ? nc2_probe() : 8;
+        case GGML_TYPE_IQ3_XXS: return w64 ? nc2_probe() : 8;
         // 64 lanes only gain on matrices of few rows, with two rows per simdgroup
         case GGML_TYPE_Q5_K: return w64 ? (nc2_probe() ? nc2_probe() : (ne11 == 2 && ne01 <= 5120 ? 2 : 0)) : 4;
+        case GGML_TYPE_Q6_K: return w64 ? nc2_probe() : (ne11 == 2 ? 2 : 0);
+        default: return 0;
+    }
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_metal_library_t lib, const ggml_tensor * op) {
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
@@ -1134,6 +1174,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
     const ggml_type tsrc0 = op->src[0]->type;
     const ggml_type tsrc1 = op->src[1]->type;
 
+    const int simd_width = ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->simd_width;
 
     const char * suffix = "";
     bool w64 = false;
@@ -1481,6 +1522,17 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                 if (simd_width == 64 && TOSH_ENV("TOSH_MV_W64_DISABLE") == nullptr) {
                     w64 = true;
                 }
+                // up to three columns share one pass over the weights; four columns spill
+                // the registers, so wider batches split into even groups of two or three
+                if (ne11 >= 2 && suffix[0] == '\0' && TOSH_ENV("TOSH_MV_IQ4_XS_NC_DISABLE") == nullptr) {
+                    const int passes = (ne11 + 2)/3;
+                    nr1 = (ne11 + passes - 1)/passes;
+                    if (w64) {
+                        nr0 = N_R0_IQ4_XS_NC_W64;
+                    }
+                    snprintf(sweep_sfx, sizeof(sweep_sfx), "_c%d", nr1);
+                    suffix = sweep_sfx;
+                }
             } break;
         case GGML_TYPE_TQ2_0:
             {
@@ -1572,9 +1624,19 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
     }
 
     if (const int rows = ggml_metal_mv_nc2_rows(tsrc0, simd_width, ne11, ne01, ne00); rows > 0) {
+        nr0 = rows;
         nr1 = ne11 == 3 ? 3 : (ne11 == 4 && tsrc0 == GGML_TYPE_Q8_0 && simd_width == 64 ? 4 : 2);
+        nsg = simd_width == 64 ? 1 : 2;
+        static thread_local char nc_sfx[16];
+        snprintf(nc_sfx, sizeof(nc_sfx), "_c%d_r%d", nr1, rows);
+        suffix = nc_sfx;
         // q4_K and q5_K have a 64-lane twin; the others run their one kernel at either width
         w64 = simd_width == 64 && (tsrc0 == GGML_TYPE_Q4_K || tsrc0 == GGML_TYPE_Q5_K);
+        if (const char * sg = TOSH_ENV("TOSH_MV_NC2_SG")) {
+            nsg = atoi(sg);
+        }
+    }
+
     char sfx[64];
     if (w64) {
         snprintf(sfx, sizeof(sfx), "%s_w64", suffix);
