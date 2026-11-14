@@ -1138,6 +1138,13 @@ std::optional<common_chat_params> common_chat_try_specialized_template(
         return common_chat_params_init_functionary_v3_2(tmpl, params);
     }
 
+    // GLM-4-0414 - calls in the assistant header ("<|assistant|>name") and results as <|observation|> turns
+    if (src.find("<|observation|>") != std::string::npos && src.find("[gMASK]<sop>") != std::string::npos &&
+        src.find("message.get(\"metadata\"") != std::string::npos) {
+        LOG_DBG("Using specialized template: GLM-4-0414\n");
+        return common_chat_params_init_glm4(tmpl, params);
+    }
+
     // Kimi K2 Thinking - uses unique tool call ID format: functions.<name>:<index>
     // Detection: template has "<|tool_calls_section_begin|>" and "functions." prefix in tool call IDs
     if (src.find("<|tool_calls_section_begin|>") != std::string::npos &&
