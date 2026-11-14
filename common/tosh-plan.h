@@ -89,6 +89,7 @@ struct tosh_plan {
     double      bank_mib           = 0;
     double      model_mib          = 0;  // every tensor, across all shards
     double      host_weights_mib   = 0;  // weights the backends keep in host memory besides the bank
+    double      host_lazy_mib      = 0;  // weights read from the file on demand, outside host_weights_mib
     double      warm_floor_mib     = 0;  // smallest RAM cache that holds one layer per expert size
     int         n_split            = 1;
     std::string mlock;              // required, not_required, not_lockable
