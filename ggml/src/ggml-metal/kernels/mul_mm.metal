@@ -503,10 +503,10 @@ kernel void kernel_mul_mm(
     } else if (!FC_mul_mm_bc_out || (r0 + NR0 <= args.ne0 && r1 + NR1 <= args.ne1)) {
         device float * C = (device float *) dst +
             (r0 + 32*(sgitg &  1)) +
-            (r1 + 16*(sgitg >> 1)) * args.ne0 + im*args.ne1*args.ne0;
+            (int64_t) (r1 + 16*(sgitg >> 1))*args.ne0 + (int64_t) im*args.ne1*args.ne0;
 
         for (short i = 0; i < 8; i++) {
-            simdgroup_store(mc[i], C + 8*(i%4) + 8*args.ne0*(i/4), args.ne0, 0, false);
+            simdgroup_store(mc[i], C + 8*(i%4) + (int64_t) 8*args.ne0*(i/4), args.ne0, 0, false);
         }
     } else {
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -521,7 +521,7 @@ kernel void kernel_mul_mm(
 
         if (sgitg == 0) {
             for (int j = tiitg; j < nr1; j += NR1) {
-                device float  * D  = (device float  *) dst + r0 + (r1 + j)*args.ne0 + im*args.ne1*args.ne0;
+                device float  * D  = (device float  *) dst + r0 + (int64_t) (r1 + j)*args.ne0 + (int64_t) im*args.ne1*args.ne0;
                 device float4 * D4 = (device float4 *) D;
 
                 threadgroup float  * C  = temp_str + (j*NR0);
@@ -1174,7 +1174,7 @@ kernel void kernel_mul_mm_id(
             const int ide = id % args.ne20;
             const int idt = id / args.ne20;
 
-            device float  * D  = (device float  *) dst + r0 + ide*args.ne0 + idt*args.ne1*args.ne0;
+            device float  * D  = (device float  *) dst + r0 + (int64_t) ide*args.ne0 + (int64_t) idt*args.ne1*args.ne0;
             device float4 * D4 = (device float4 *) D;
 
             threadgroup float  * C  = (threadgroup float  *) shmem + j*NR0;

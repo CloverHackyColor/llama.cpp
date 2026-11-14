@@ -575,7 +575,7 @@ kernel void kernel_mul_mm_id_w64(
             const int ide = id % args.ne20;
             const int idt = id / args.ne20;
 
-            device float  * D  = (device float  *) dst + r0 + ide*args.ne0 + idt*args.ne1*args.ne0;
+            device float  * D  = (device float  *) dst + r0 + (int64_t) ide*args.ne0 + (int64_t) idt*args.ne1*args.ne0;
             device float4 * D4 = (device float4 *) D;
 
             threadgroup float  * C  = (threadgroup float  *) shmem + j*NR0;
