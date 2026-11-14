@@ -2513,6 +2513,20 @@ private:
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
 
+        // a surviving checkpoint at this point already holds the state of the same prefix, e.g. the one just restored
+        {
+            const int64_t n_tokens_new = slot.prompt.n_tokens() - n_tokens_cur;
+            auto & ckpts = slot.prompt.checkpoints;
+            for (auto it = ckpts.begin(); it != ckpts.end(); ++it) {
+                if (it->n_tokens == n_tokens_new && it->pos_min == pos_min && it->pos_max == pos_max) {
+                    it->id_task = id_task;
+                    ckpts.splice(ckpts.end(), ckpts, it);
+                    SLT_TRC(slot, "kept context checkpoint at n_tokens = %" PRId64 "\n", n_tokens_new);
+                    return;
+                }
+            }
+        }
+
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
         // only when the list is full, otherwise short prompts keep just the oldest checkpoint
