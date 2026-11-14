@@ -1060,10 +1060,12 @@ static void func_args_not_string(json & messages) {
                 if (tool_call.contains("function") && tool_call["function"].contains("arguments")) {
                     auto & args = tool_call["function"]["arguments"];
                     if (args.is_string()) {
+                        // a call the model cut short stays in the history; failing on it would fail every later turn
                         try {
                             args = json::parse(args.get<std::string>());
-                        } catch (const std::exception & e) {
-                            throw std::runtime_error("Failed to parse tool call arguments as JSON: " + std::string(e.what()));
+                        } catch (const std::exception &) {
+                            LOG_WRN("%s: tool call arguments are not valid JSON, sending an empty object\n", __func__);
+                            args = json::object();
                         }
                     }
                 }
