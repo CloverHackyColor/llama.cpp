@@ -56,6 +56,7 @@ set(METALLIB_KERNEL_SOURCES
     kernels/mul_mv_mma.metal
     kernels/mul_mv_w64.metal
     kernels/mul_mm.metal
+    kernels/mul_mm_w64.metal
     kernels/quantize.metal
     kernels/softmax.metal
     kernels/norm.metal
@@ -67,12 +68,14 @@ set(METALLIB_KERNEL_SOURCES
     kernels/wkv.metal
     kernels/gated_delta_net.metal
     kernels/solve_tri.metal
+    kernels/turbo.metal
     kernels/rope.metal
     kernels/conv.metal
     kernels/upscale.metal
     kernels/argsort.metal
     kernels/pool.metal
     kernels/misc.metal
+    kernels/tosh_moe.metal
 )
 
 if (GGML_METAL_EMBED_LIBRARY)

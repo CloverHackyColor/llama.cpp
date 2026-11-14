@@ -134,6 +134,7 @@ int ggml_metal_pipeline_max_theads_per_threadgroup(struct ggml_metal_pipeline_wi
     X(MUL_MV_MMA,      mul_mv_mma)     \
     X(MUL_MV_W64,      mul_mv_w64)     \
     X(MUL_MM,          mul_mm)         \
+    X(MUL_MM_W64,      mul_mm_w64)     \
     X(QUANTIZE,        quantize)       \
     X(SOFTMAX,         softmax)        \
     X(NORM,            norm)           \
@@ -150,6 +151,8 @@ int ggml_metal_pipeline_max_theads_per_threadgroup(struct ggml_metal_pipeline_wi
     X(UPSCALE,         upscale)        \
     X(ARGSORT,         argsort)        \
     X(POOL,            pool)           \
+    X(TURBO,           turbo)          \
+    X(TOSH_MOE,        tosh_moe)       \
     X(MISC,            misc)
 
 enum ggml_metal_lib_kind {
@@ -716,6 +719,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline(ggml_meta
         /*.smem     =*/ 0,
         /*.c4       =*/ false,
         /*.cnt      =*/ false,
+        /*.sgw      =*/ 0,
     };
 
     res.pipeline = ggml_metal_pipelines_get(lib->pipelines, name);
@@ -734,6 +738,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
         /*.smem     =*/ 0,
         /*.c4       =*/ false,
         /*.cnt      =*/ false,
+        /*.sgw      =*/ 0,
     };
 
     [lib->lock lock];

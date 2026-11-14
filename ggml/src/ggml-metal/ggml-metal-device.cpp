@@ -1158,6 +1158,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     const bool acc_f32 = use_mm_manual && (!ggml_is_contiguous(op->src[0]) || tsrc0 == GGML_TYPE_BF16) &&
                          TOSH_ENV("TOSH_MM_ACC_F32_DISABLE") == nullptr;
 
+    // the 64-lane GEMM lives in mul_mm_w64.metal: one wave is one tile there, so it needs the
+    // dispatch to hand it whole waves instead of the 32-thread groups the shared kernel expects
     // iq4_nl is the one type this kernel does not suit at every batch: it costs 3.9% at 256
     // tokens and gains 1.0% at 512, so it takes a floor rather than lose the gain.
     static const int w64_floor_env = []() {
@@ -1167,8 +1169,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     const int w64_floor = w64_floor_env ? w64_floor_env :
                           (tsrc0 == GGML_TYPE_IQ4_NL ? 384 : 0);
 
+    const bool w64 = simd_width == 64 && use_mm_manual && !has_tensor &&
                      op->ne[1] >= w64_floor &&
                      TOSH_ENV("TOSH_MM_W64_DISABLE") == nullptr;
+
+    snprintf(base, 256, "kernel_mul_mm_%s_%s%s%s", ggml_metal_tname_pair(lib, tsrc0, tsrc1), ggml_type_name(tsrc1), wide ? "_w" : "", w64 ? "_w64" : "");
     // measured on 32 lanes only; the 64-lane tile lives in its own kernel
     const bool uniform_scale = (tsrc0 == GGML_TYPE_Q4_K || tsrc0 == GGML_TYPE_Q5_K) && wide && !w64 &&
                                use_mm_manual && !has_tensor && simd_width == 32 &&
@@ -1211,9 +1216,13 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
         res.smem = use_mm_double_buffer ? 16384 : ((bc_out || use_mm_manual) ? 8192 : (4096 + 2048));
     }
 
-    res.nsg = N_MM_SIMD_GROUP_X * N_MM_SIMD_GROUP_Y;
     res.nsg = (!has_tensor && use_mm_manual) ? ((wide || narrow) ? 4 : 8) : N_MM_SIMD_GROUP_X * N_MM_SIMD_GROUP_Y;
 
+    if (w64) {
+        // same thread count as the 32-lane path, grouped into whole waves
+        res.sgw = 64;
+        res.nsg = (wide || narrow) ? 2 : 4;
+    }
 
     return res;
 }
@@ -1900,7 +1909,14 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id(ggml_m
             default: wide = false; break;
         }
     }
+
+    // the 64-lane twin lives in mul_mm_w64.metal, beside the dense one; it has no src1 rescale
+    const int simd_width_id = ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->simd_width;
+    const bool w64 = simd_width_id == 64 && use_mm_manual && !amax &&
                      TOSH_ENV("TOSH_MMID_W64_DISABLE") == nullptr;
+
+    snprintf(base, 256, "kernel_mul_mm_id_%s_%s%s%s", ggml_metal_tname_pair(lib, tsrc0, tsrc1), ggml_type_name(tsrc1), wide ? "_w" : "", w64 ? "_w64" : "");
+    snprintf(name, 256, "%s_bci=%d_mm=%d_af=%d_amax=%d", base, bc_inp, use_mm_manual, acc_f32, amax);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
