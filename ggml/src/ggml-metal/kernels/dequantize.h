@@ -24,6 +24,21 @@ void dequantize_f32_t4(device const float4 * src, short il, thread type4 & reg) 
 }
 
 template <typename type4x4>
+void dequantize_bf16e(device const bf16e4x4 * src, short il, thread type4x4 & reg) {
+    FOR_UNROLL (short i = 0; i < 4; ++i) {
+        const float4 f = as_type<float4>(uint4(src->b[i]) << 16);
+        reg[i][0] = f.x;
+        reg[i][1] = f.y;
+        reg[i][2] = f.z;
+        reg[i][3] = f.w;
+    }
+}
+
+template <typename type4>
+void dequantize_bf16e_t4(device const bf16e4 * src, short il, thread type4 & reg) {
+    reg = (type4) as_type<float4>(uint4(src->b) << 16);
+}
+template <typename type4x4>
 void dequantize_f16(device const half4x4 * src, short il, thread type4x4 & reg) {
     reg = (type4x4)(*src);
 }

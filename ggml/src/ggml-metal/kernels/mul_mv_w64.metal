@@ -5,6 +5,28 @@
 
 #include "common.h"
 #include "dequantize.h"
+
+constant bool  FC_mul_mv_align [[function_constant(FC_MUL_MV + 8)]];
+
+// The 22-, 34-, 98-, 110- and 210-byte blocks leave every other one two bytes short of a word,
+// and a dword read there is undefined on a card that requires natural alignment. The constant
+// picks the pair of shorts for those cards, so every other one keeps the single read.
+inline uint mv_ld_u32(device const void * p) {
+    if (FC_mul_mv_align) {
+        device const ushort * s = (device const ushort *) p;
+        return (uint) s[0] | ((uint) s[1] << 16);
+    }
+    return *(device const uint *) p;
+}
+
+inline uint2 mv_ld_u32x2(device const void * p) {
+    if (FC_mul_mv_align) {
+        device const ushort * s = (device const ushort *) p;
+        return uint2((uint) s[0] | ((uint) s[1] << 16), (uint) s[2] | ((uint) s[3] << 16));
+    }
+    return *(device const uint2 *) p;
+}
+
 constant short FC_mul_mv_nsg  [[function_constant(FC_MUL_MV + 0)]];
 constant short FC_mul_mv_ne12 [[function_constant(FC_MUL_MV + 2)]];
 constant short FC_mul_mv_r2   [[function_constant(FC_MUL_MV + 3)]];
@@ -127,6 +149,8 @@ inline float block_q_n_dot_y_o(device const block_q4_1 * qb_curr, float sumy, th
 
 inline float block_q_n_dot_y_o(device const block_q5_0 * qb_curr, float sumy, thread float * yl, int il) {
     float d = qb_curr->d;
+           const uint32_t   qh = (uint32_t) ((device const ushort *) qb_curr->qh)[0] |
+                              ((uint32_t) ((device const ushort *) qb_curr->qh)[1] << 16);
 
     float acc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
 
@@ -145,6 +169,8 @@ inline float block_q_n_dot_y_o(device const block_q5_0 * qb_curr, float sumy, th
 inline float block_q_n_dot_y_o(device const block_q5_1 * qb_curr, float sumy, thread float * yl, int il) {
     float d = qb_curr->d;
     float m = qb_curr->m;
+           const uint32_t   qh = (uint32_t) ((device const ushort *) qb_curr->qh)[0] |
+                              ((uint32_t) ((device const ushort *) qb_curr->qh)[1] << 16);
 
     float acc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
 
@@ -203,6 +229,8 @@ inline float block_q_n_dot_y_q(device const block_q5_0 * qb_curr, float sumy, th
     float acc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
 
     device const uint16_t * qs =  ((device const uint16_t *)qb_curr + 3 + il/2);
+           const uint32_t   qh = (uint32_t) ((device const ushort *) qb_curr->qh)[0] |
+                              ((uint32_t) ((device const ushort *) qb_curr->qh)[1] << 16);
 
     for (int i = 0; i < 4; i += 2) {
         acc[0] += yl[i + 0] * ((qs[i / 2] & 0x000F) | ((qh >> (i+0+il        ) << 4 ) & 0x00010));
@@ -221,6 +249,8 @@ inline float block_q_n_dot_y_q(device const block_q5_1 * qb_curr, float sumy, th
     float acc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
 
     device const uint16_t * qs =  ((device const uint16_t *)qb_curr + 4 + il/2);
+           const uint32_t   qh = (uint32_t) ((device const ushort *) qb_curr->qh)[0] |
+                              ((uint32_t) ((device const ushort *) qb_curr->qh)[1] << 16);
 
     for (int i = 0; i < 4; i += 2) {
         acc[0] += yl[i + 0] * ((qs[i / 2] & 0x000F) | ((qh >> (i+0+il        ) << 4 ) & 0x00010));
@@ -273,6 +303,8 @@ inline float block_q_n_dot_y(device const block_q5_0 * qb_curr, float sumy, thre
     float acc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
 
     device const uint16_t * qs =  ((device const uint16_t *)qb_curr + 3 + il/2);
+           const uint32_t   qh = (uint32_t) ((device const ushort *) qb_curr->qh)[0] |
+                              ((uint32_t) ((device const ushort *) qb_curr->qh)[1] << 16);
 
     for (int i = 0; i < 8; i+=2) {
         acc[0] += yl[i + 0] * ((qs[i / 2] & 0x000F) | ((qh >> (i+0+il        ) << 4 ) & 0x00010));
@@ -291,6 +323,8 @@ inline float block_q_n_dot_y(device const block_q5_1 * qb_curr, float sumy, thre
     float acc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
 
     device const uint16_t * qs =  ((device const uint16_t *)qb_curr + 4 + il/2);
+           const uint32_t   qh = (uint32_t) ((device const ushort *) qb_curr->qh)[0] |
+                              ((uint32_t) ((device const ushort *) qb_curr->qh)[1] << 16);
 
     for (int i = 0; i < 8; i+=2) {
         acc[0] += yl[i + 0] * ((qs[i / 2] & 0x000F) | ((qh >> (i+0+il        ) << 4 ) & 0x00010));
@@ -424,6 +458,9 @@ void kernel_mul_mv_q6_K_f32_w64_wide_impl(
             // two-word fallback keeps the odd strides correct
             uint2 w1, w2, wh;
             if (FC_mul_mv_row8) {
+                w1 = mv_ld_u32x2(q1);
+                w2 = mv_ld_u32x2(q2);
+                wh = mv_ld_u32x2(qh);
             } else {
                 device const ushort * s1 = (device const ushort *) q1;
                 device const ushort * s2 = (device const ushort *) q2;
@@ -1767,6 +1804,9 @@ void kernel_mul_mv_q6_K_f32_w64_impl(
             // right on every block, and one word is fine where the row stride allows it
             uint w1 = 0, w2 = 0, wh = 0;
             if (FC_mul_mv_row8) {
+                w1 = mv_ld_u32(q1);
+                w2 = mv_ld_u32(q2);
+                wh = mv_ld_u32(qh);
             } else if (FC_mul_mv_row4) {
                 device const ushort * s1 = (device const ushort *) q1;
                 device const ushort * s2 = (device const ushort *) q2;
@@ -1889,6 +1929,12 @@ void kernel_mul_mv_q6_K_f32_L8_w64_impl(
             uint w1 = 0, w2 = 0, wh = 0;
             uint v1 = 0, v2 = 0, vh = 0;
             if (FC_mul_mv_row8) {
+                w1 = mv_ld_u32(q1);
+                w2 = mv_ld_u32(q2);
+                wh = mv_ld_u32(qh);
+                v1 = mv_ld_u32(q1 + 4);
+                v2 = mv_ld_u32(q2 + 4);
+                vh = mv_ld_u32(qh + 4);
             } else if (FC_mul_mv_row4) {
                 device const ushort * s1 = (device const ushort *) q1;
                 device const ushort * s2 = (device const ushort *) q2;
@@ -2133,6 +2179,7 @@ void kernel_mul_mv_q8_0_f32_w64_impl(
             float sumq = 0.f;
 
             FOR_UNROLL (short w = 0; w < NQ/4; ++w) {
+                const char4 q = as_type<char4>(mv_ld_u32(qs + 4*w));
 
                 sumq += dot(float4(q.x, q.y, q.z, q.w), yl[w]);
             }
@@ -2218,6 +2265,7 @@ void kernel_mul_mv_q8_0_f32_L8_w64_impl(
             float sumq = 0.f;
 
             FOR_UNROLL (short w = 0; w < NQ/4; ++w) {
+                const char4 q = as_type<char4>(mv_ld_u32(qs + 4*w));
 
                 sumq += dot(float4(q.x, q.y, q.z, q.w), yl[w]);
             }
@@ -2875,6 +2923,8 @@ void kernel_mul_mv_iq3_xxs_f32_w64_impl(
 
             // the eight index bytes and the two halves of aux32 are contiguous, so the
             // whole block header comes in as three words instead of ten narrow reads
+            const uint2 q3w = mv_ld_u32x2(q3);
+            const uint32_t aux32 = mv_ld_u32(gas);
 
             thread const uint8_t * q3b = (thread const uint8_t *)&q3w;
 

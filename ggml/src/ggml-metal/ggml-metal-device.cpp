@@ -82,15 +82,41 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_base(ggml
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cpy(ggml_metal_library_t lib, ggml_type tsrc, ggml_type tdst) {
+// bf16 read as raw bits and widened by hand. Cards without the Metal 3 family have no bfloat
+// at all, and the ones that do have no arithmetic for it either, so the manual path is also
+// the faster one wherever the simdgroup matrix unit is missing.
+static bool ggml_metal_bf16_manual(ggml_metal_library_t lib) {
+    const struct ggml_metal_device_props * props =
+        ggml_metal_device_get_props(ggml_metal_library_get_device(lib));
+
+    // escape hatch for the A/B; a card with no bfloat has no other path
     static const bool off = TOSH_ENV("TOSH_BF16_MANUAL_DISABLE") != nullptr;
 
+    return !props->has_bfloat || (!props->has_simdgroup_mm && !off);
+}
+
+static const char * ggml_metal_tname(ggml_metal_library_t lib, ggml_type t) {
+    if (t == GGML_TYPE_BF16 && ggml_metal_bf16_manual(lib)) {
+        return "bf16e";
+    }
+
+    return ggml_type_name(t);
+}
+
+// Only the pairs the manual kernels are instantiated for: bf16 weights against f32.
+static const char * ggml_metal_tname_pair(ggml_metal_library_t lib, ggml_type t, ggml_type other) {
+    if (t == GGML_TYPE_BF16 && other == GGML_TYPE_F32) {
+        return ggml_metal_tname(lib, t);
+    }
+
+    return ggml_type_name(t);
+}
 
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cpy(ggml_metal_library_t lib, ggml_type tsrc, ggml_type tdst, bool contig) {
     char base[256];
     char name[256];
 
-    snprintf(base, 256, "kernel_cpy_%s_%s", ggml_type_name(tsrc), ggml_type_name(tdst));
+    snprintf(base, 256, "kernel_cpy_%s%s_%s", contig ? "contig_" : "", ggml_metal_tname_pair(lib, tsrc, tdst), ggml_metal_tname_pair(lib, tdst, tsrc));
     snprintf(name, 256, "%s", base);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
@@ -155,7 +181,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_get_rows(ggml_me
     char base[256];
     char name[256];
 
-    snprintf(base, 256, "kernel_get_rows_%s", ggml_type_name(tsrc));
+    snprintf(base, 256, "kernel_get_rows_%s", ggml_metal_tname(lib, tsrc));
     snprintf(name, 256, "%s", base);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
@@ -224,7 +250,13 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_concat(ggml_meta
     char base[256];
     char name[256];
 
-    snprintf(base, 256, "kernel_concat_%s", ggml_type_name(tsrc));
+    const auto * props = ggml_metal_device_get_props(ggml_metal_library_get_device(lib));
+
+    // only the block types that are not a multiple of four bytes have an aligned variant
+    const bool align = props->needs_aligned_loads &&
+        (tsrc == GGML_TYPE_Q4_0 || tsrc == GGML_TYPE_Q5_0 || tsrc == GGML_TYPE_Q8_0);
+
+    snprintf(base, 256, "kernel_concat_%s%s", ggml_type_name(tsrc), align ? "_al" : "");
     snprintf(name, 256, "%s", base);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
@@ -860,6 +892,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ext(ggml_
     } else if (!no_raw && is_khdr) {
         snprintf(tname, sizeof(tname), "%s_hdr", ggml_type_name(tsrc0));
     } else {
+        snprintf(tname, sizeof(tname), "%s", ggml_metal_tname(lib, tsrc0));
+    }
 
     // q6_K on 64 lanes uses the wave64-shaped variant; TOSH_EXT_W64_DISABLE falls back to the generic kernel
     static const bool w64_disable = TOSH_ENV("TOSH_EXT_W64_DISABLE") != nullptr;
@@ -1735,6 +1769,10 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
     const bool row8_width   = nw == 64 || (nw == 32 && tsrc0 == GGML_TYPE_Q8_0);
     const bool row8 = row8_aligned && row8_width && TOSH_ENV("TOSH_MV_ROW8_DISABLE") == nullptr;
 
+    // Cards that require natural alignment read the wrong bytes from the odd blocks of the
+    // 22-, 34-, 98-, 110- and 210-byte types, so the wide read splits in two there.
+    const bool align = props->needs_aligned_loads;
+
     // Sweep hook: TOSH_SWEEP_TYPE names one ggml type and TOSH_SWEEP_NR0 / TOSH_SWEEP_NSG
     // force its rows per lane and simdgroups, so the register front can be measured without
     // rebuilding. The pipeline name carries both, so a run can be checked against what it asked.
@@ -1786,6 +1824,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
         suffix = sfx;
     }
 
+    snprintf(base, 256, "kernel_mul_mv_%s_%s%s", ggml_metal_tname_pair(lib, tsrc0, tsrc1), ggml_type_name(tsrc1), suffix);
+    snprintf(name, 256, "%s_nsg=%d_ne12=%d_r2=%d_r3=%d_nw=%d_a4=%d_a8=%d_al=%d", base, nsg, ne12, r2, r3, nw, row4, row8, align);
+
     if (TOSH_ENV("TOSH_SWEEP_DEBUG") != nullptr) {
         fprintf(stderr, "SWEEP pipeline = %s (nsg=%d nr0=%d)\n", name, nsg, nr0);
     }
@@ -1801,6 +1842,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
         ggml_metal_cv_set_int16(cv, nw,             FC_MUL_MV + 5);
         ggml_metal_cv_set_bool (cv, row4,           FC_MUL_MV + 6);
         ggml_metal_cv_set_bool (cv, row8,           FC_MUL_MV + 7);
+        ggml_metal_cv_set_bool (cv, align,          FC_MUL_MV + 8);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 
@@ -2204,6 +2246,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
                       (nw == 64 || (nw == 32 && tsrc0 == GGML_TYPE_Q8_0)) &&
                       TOSH_ENV("TOSH_MV_ROW8_DISABLE") == nullptr;
 
+    const bool align = props_id->needs_aligned_loads;
+
     snprintf(base, 256, "kernel_mul_mv_id_%s_%s%s%s", ggml_metal_tname_pair(lib, tsrc0, tsrc1), ggml_type_name(tsrc1), suffix, id_w64 ? "_w64" : "");
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
@@ -2217,6 +2261,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
         ggml_metal_cv_set_int16(cv, nw,  FC_MUL_MV + 5);
         ggml_metal_cv_set_bool (cv, row4, FC_MUL_MV + 6);
         ggml_metal_cv_set_bool (cv, row8, FC_MUL_MV + 7);
+        ggml_metal_cv_set_bool (cv, align, FC_MUL_MV + 8);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 

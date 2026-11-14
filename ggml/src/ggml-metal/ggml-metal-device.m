@@ -1278,8 +1278,13 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
                     snprintf(simd_width_env, sizeof(simd_width_env), "%d", dev->props.simd_width);
                     setenv("TOSH_METAL_SIMD_WIDTH", simd_width_env, 1);
                 }
+
                 dev->props.has_simdgroup_reduction  = [dev->mtl_device supportsFamily:MTLGPUFamilyApple7];
                 dev->props.has_simdgroup_reduction |= [dev->mtl_device supportsFamily:MTLGPUFamilyMetal3_GGML];
+                // macOS 12 has no Metal3 family, but AMD cards already reduce across a simdgroup on Mac2
+                if (strstr(dev->mtl_device.name.UTF8String ?: "", "AMD") != NULL) {
+                    dev->props.has_simdgroup_reduction |= [dev->mtl_device supportsFamily:MTLGPUFamilyMac2];
+                }
                 // simdgroup reduction kernels produce corrupted output on AMD RDNA 2 (e.g. RX 6700 XT)
                 if (TOSH_ENV("GGML_METAL_SIMDGROUP_REDUCTION_DISABLE") != NULL) {
                     dev->props.has_simdgroup_reduction = false;
@@ -1299,7 +1304,65 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
                             dev->props.simd_width);
                     dev->props.has_simdgroup_reduction = false;
                 }
+
+                // A dword read off a multiple of four is undefined in Metal, and the GCN cards
+                // before Vega return the bytes of the aligned address instead. Assume a wave64
+                // card needs the aligned path unless it is one of the families measured to
+                // tolerate it, so an unknown card errs on the side of correct output.
+                {
+                    // amdgpu_gfx<N> names the ISA target: gfx6xx-8xx are GCN 1 to 4, gfx9xx is
+                    // Vega. Older than Vega reads a dword off a word boundary as the aligned
+                    // one. The name is the fallback for macOS 12 and 13, which have no
+                    // architecture property, and it grants the fast path rather than the safe
+                    // one so an unknown card stays correct.
+                    bool tolerant = false;
+                    bool known    = false;
+                    char how[64]  = "unknown";
+
+                    if (@available(macOS 14.0, *)) {
+                        const char * arch = dev->mtl_device.architecture.name.UTF8String;
+                        int gfx = 0;
+                        if (arch != NULL && sscanf(arch, "amdgpu_gfx%d", &gfx) == 1 && gfx > 0) {
+                            tolerant = gfx >= 900;
+                            known    = true;
+                            snprintf(how, sizeof(how), "%s", arch);
+                        }
+                    }
+                    if (!known) {
+                        const char * name = dev->mtl_device.name.UTF8String;
+                        tolerant = name != NULL &&
+                            (strstr(name, "Vega")          != NULL ||
+                             strstr(name, "Radeon VII")    != NULL ||
+                             strstr(name, "Radeon Pro VII")!= NULL ||
+                             strstr(name, "WX 8200")       != NULL ||
+                             strstr(name, "WX 9100")       != NULL ||
+                             strstr(name, "Instinct MI25") != NULL ||
+                             strstr(name, "Instinct MI50") != NULL ||
+                             strstr(name, "Instinct MI60") != NULL);
+                        snprintf(how, sizeof(how), "name (no architecture before macOS 14)");
+                    }
+                    dev->props.needs_aligned_loads = is_wave64 && !tolerant;
+
+                    // the macOS 12 driver misreads unaligned mat-vec loads on RDNA too
+                    const bool monterey = [[NSProcessInfo processInfo] operatingSystemVersion].majorVersion < 13 &&
+                                          ![dev->mtl_device supportsFamily:MTLGPUFamilyApple1];
+                    if (monterey && !dev->props.needs_aligned_loads) {
+                        dev->props.needs_aligned_loads = true;
+                        snprintf(how, sizeof(how), "macOS 12");
+                    }
+
                     const char * force = TOSH_ENV("TOSH_MV_ALIGN");
+                    if (force != NULL) {
+                        dev->props.needs_aligned_loads = atoi(force) != 0;
+                        snprintf(how, sizeof(how), "TOSH_MV_ALIGN=%s", force);
+                    }
+                    if (is_wave64 || monterey || force != NULL) {
+                        fprintf(stderr, "ggml_metal: aligned mat-vec reads %s by %s "
+                                        "(override with TOSH_MV_ALIGN=1 or =0)\n",
+                                dev->props.needs_aligned_loads ? "ON" : "off", how);
+                    }
+                }
+
                 // (large tg win, validated on GCN); escape hatch forces it off.
                 // GGML_METAL_WAVE64_SAFEMODE is the user-facing alias the app documents.
                 dev->props.wave64_decode = is_wave64 && TOSH_ENV("GGML_METAL_WAVE64_DECODE_DISABLE") == NULL
@@ -1870,14 +1933,39 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
     const bool wave64_decode           = dev->props.wave64_decode;
     const bool has_bfloat              = dev->props.has_bfloat;
 
+    // No bfloat in Metal: bf16 runs on the kernels that widen the raw bits by hand, and only
+    // the ops that have one. Anything else has to stay off the device, weights included: a
+    // pre-allocated tensor the scheduler cannot place aborts the whole load.
     if (!has_bfloat) {
-        if (op->type == GGML_TYPE_BF16) {
-            return false;
+        bool bf16 = op->type == GGML_TYPE_BF16;
+        for (size_t i = 0, n = 3; i < n; ++i) {
+            bf16 = bf16 || (op->src[i] != NULL && op->src[i]->type == GGML_TYPE_BF16);
         }
 
-        for (size_t i = 0, n = 3; i < n; ++i) {
-            if (op->src[i] != NULL && op->src[i]->type == GGML_TYPE_BF16) {
-                return false;
+        if (bf16) {
+            switch (op->op) {
+                case GGML_OP_NONE:
+                case GGML_OP_RESHAPE:
+                case GGML_OP_VIEW:
+                case GGML_OP_PERMUTE:
+                case GGML_OP_TRANSPOSE:
+                    return true;
+                case GGML_OP_GET_ROWS:
+                    return op->src[0]->type == GGML_TYPE_BF16 && op->type == GGML_TYPE_F32;
+                case GGML_OP_MUL_MAT:
+                case GGML_OP_MUL_MAT_ID:
+                    // the emulated set covers bf16 weights against f32 activations
+                    if (op->src[0]->type != GGML_TYPE_BF16 || op->src[1]->type != GGML_TYPE_F32) {
+                        return false;
+                    }
+                    break;
+                case GGML_OP_CPY:
+                case GGML_OP_CONT:
+                case GGML_OP_DUP:
+                    return (op->src[0]->type == GGML_TYPE_F32  && op->type == GGML_TYPE_BF16) ||
+                           (op->src[0]->type == GGML_TYPE_BF16 && op->type == GGML_TYPE_F32);
+                default:
+                    return false;
             }
         }
     }

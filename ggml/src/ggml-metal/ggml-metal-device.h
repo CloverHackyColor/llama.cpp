@@ -319,6 +319,10 @@ struct ggml_metal_device_props {
     // kernels assume 32, so a non-32 width signals a wave64 device.
     int simd_width;
 
+    // GCN before Vega reads a dword off a word boundary as the aligned one, so the mat-vec
+    // kernels take a pair of shorts there instead
+    bool needs_aligned_loads;
+
     bool has_bfloat;
     bool has_tensor;
     bool use_residency_sets;
