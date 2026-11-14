@@ -3389,6 +3389,27 @@ void kernel_mul_mv_iq2_xxs_f32_impl(
         device const block_iq2_xxs * xr = x + ibl;
         device const uint16_t * q2 = xr->qs + 4 * ib;
         device const half * dh = &xr->d;
+
+        for (short row = 0; row < nr0; row++) {
+            const float db = dh[0];
+            device const uint8_t * aux8 = (device const uint8_t *)q2;
+            const uint32_t aux32 = q2[2] | (q2[3] << 16);
+            const float d = db * (0.5f + (aux32 >> 28));
+
+            float sum = 0;
+            for (short l = 0; l < 4; ++l) {
+                // one 32-bit read per half instead of eight byte reads; RDNA2 has no
+                // native 64-bit shift, so two uint32 beat one uint64 here
+                const threadgroup uint32_t * gp = (const threadgroup uint32_t *)(svalues + aux8[l]);
+                const uint32_t ga = gp[0], gb = gp[1];
+                const uint8_t signs = ssigns[(aux32 >> 7*l) & 127];
+                for (short j = 0; j < 8; ++j) {
+                    const uint32_t gw = j < 4 ? ga : gb;
+                    sum += yl[8*l + j] * (float)((gw >> (8*(j & 3))) & 0xFF) * (signs & kmask_iq2xs[j] ? -1.f : 1.f);
+                }
+            }
+            sumf[row] += d * sum;
+
             dh += args.nb01/2;
             q2 += args.nb01/2;
         }
@@ -3479,6 +3500,32 @@ void kernel_mul_mv_iq2_xs_f32_impl(
         device const uint16_t * q2 = xr->qs + 4 * ib;
         device const uint8_t  * sc = xr->scales + ib;
         device const half * dh = &xr->d;
+
+        for (short row = 0; row < nr0; row++) {
+            const float db = dh[0];
+            const uint8_t ls1 = sc[0] & 0xf;
+            const uint8_t ls2 = sc[0] >>  4;
+            const float d1 = db * (0.5f + ls1);
+            const float d2 = db * (0.5f + ls2);
+
+            float sum1 = 0, sum2 = 0;
+            for (short l = 0; l < 2; ++l) {
+                // one 32-bit read per half instead of eight byte reads; RDNA2 has no
+                // native 64-bit shift, so two uint32 beat one uint64 here
+                const threadgroup uint32_t * gp = (const threadgroup uint32_t *)(svalues + (q2[l] & 511));
+                const uint32_t ga = gp[0], gb = gp[1];
+                const uint8_t signs = ssigns[(q2[l] >> 9)];
+                for (short j = 0; j < 8; ++j) {
+                    const uint32_t gw = j < 4 ? ga : gb;
+                    sum1 += yl[8*l + j] * (float)((gw >> (8*(j & 3))) & 0xFF) * (signs & kmask_iq2xs[j] ? -1.f : 1.f);
+                }
+            }
+            for (short l = 2; l < 4; ++l) {
+                const threadgroup uint8_t * grid = (const threadgroup uint8_t *)(svalues + (q2[l] & 511));
+                const uint8_t signs = ssigns[(q2[l] >> 9)];
+                for (short j = 0; j < 8; ++j) {
+                    sum2 += yl[8*l + j] * grid[j] * (signs & kmask_iq2xs[j] ? -1.f : 1.f);
+                }
             }
             sumf[row] += d1 * sum1 + d2 * sum2;
 
@@ -4092,6 +4139,19 @@ void kernel_mul_mv_iq2_s_f32_impl(
         device const uint8_t * qh = xr->qh + ib;
         device const uint8_t * sc = xr->scales + ib;
         device const uint8_t * signs = qs + QK_K/8;
+        device const half * dh = &xr->d;
+
+        for (short row = 0; row < nr0; row++) {
+            const float db = dh[0];
+            const float d1 = db * (0.5f + (sc[0] & 0xf));
+            const float d2 = db * (0.5f + (sc[0] >>  4));
+
+            float2 sum = {0};
+            for (short l = 0; l < 2; ++l) {
+                //const threadgroup uint8_t * grid1 = (const threadgroup uint8_t *)(svalues + (qs[l+0] | ((qh[0] << (8-2*l)) & 0x300)));
+                //const threadgroup uint8_t * grid2 = (const threadgroup uint8_t *)(svalues + (qs[l+2] | ((qh[0] << (4-2*l)) & 0x300)));
+                // each grid entry is the eight bytes of this group, so one 64-bit read
+                // replaces the eight byte reads the loop used to do
                 // two 32-bit reads: RDNA2 has no native 64-bit shift, so a uint64 extract
                 // is emulated and costs more than the byte reads it replaces
                 const threadgroup uint32_t * p1 = (const threadgroup uint32_t *)(svalues + (qs[l+0] | ((qh[0] << (8-2*l)) & 0x300)));
@@ -4929,6 +4989,34 @@ void kernel_mul_mv_tq2_0_f32_impl(
                     const float f0 = v;
                     const float f1 = floor(v*0.25f);    // v>>2
                     const float f2 = floor(v*0.0625);   // v>>4
+        /*.nb13 =*/ args.nb12, // ne12 == 1
+        /*.ne0  =*/ args.ne0,
+        /*.ne1  =*/ 1, // args.ne1,
+        /*.nr0  =*/ args.nr0,
+        /*.r2   =*/ 1,
+        /*.r3   =*/ 1,
+    };
+
+    disp_fn(
+        args0,
+        /* src0 */ src0_cur,
+        /* src1 */ src1_cur,
+        /* dst  */ dst_cur,
+        shmem,
+        tgpig,
+        tiitg,
+        tiisg,
+        sgitg);
+}
+
+typedef decltype(kernel_mul_mv_id<mmv_fn<kernel_mul_mv_t_t_disp<float, float>>>) kernel_mul_mv_id_t;
+
+typedef decltype(kernel_mul_mv_id<mmv_fn<kernel_mul_mv_t_t_4_disp<float, float4, float, float4>>>) kernel_mul_mv_id_4_t;
+
+#if defined(GGML_METAL_HAS_BF16)
+#endif
+#if defined(GGML_METAL_HAS_BF16)
+#endif
 
 // byte of the 12-byte scale array held in three registers, no dynamic indexing
 static inline uint sbyte(uint s0, uint s1, uint s2, short idx) {

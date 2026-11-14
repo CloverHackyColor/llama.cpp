@@ -14,6 +14,8 @@
 #include <algorithm>
 #include <limits>
 #include <cmath>
+#include <unordered_set>
+#include <string>
 
 // threadgroups needed to fill the GPU
 // TODO: dedup
@@ -3348,6 +3350,30 @@ int ggml_metal_op_add_id(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+// A kernel the driver refuses to build (local memory over the device limit) is refused
+// every time, and asking again costs a compile per layer and token.
+static ggml_metal_pipeline_with_params ggml_metal_fa_amd_pipeline(ggml_metal_library_t lib, const char * name) {
+    static std::mutex refused_mtx;
+    static std::unordered_set<std::string> refused;
+
+    auto pipeline = ggml_metal_library_get_pipeline(lib, name);
+    if (pipeline.pipeline) {
+        return pipeline;
+    }
+    {
+        std::lock_guard<std::mutex> lock(refused_mtx);
+        if (refused.count(name)) {
+            return pipeline;
+        }
+    }
+    pipeline = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    if (!pipeline.pipeline) {
+        std::lock_guard<std::mutex> lock(refused_mtx);
+        refused.insert(name);
+    }
+    return pipeline;
+}
+
 // Suffix for the AMD vec FA pipeline name, or nullptr for types we don't instantiate.
 static const char * ggml_metal_fa_amd_type_suffix(enum ggml_type t) {
     switch (t) {
@@ -3760,14 +3786,32 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
     // Keeps quantized KV on the GPU instead of the CPU fallback. Gated by TOSH_FA_AMD.
     char fa_amd_pipeline[80] = {0};
     // dk 72 is instantiated for f16 K/V only (vision towers); see the .metal side.
+    const bool fa_amd_f16_kv =
         op->src[1]->type == GGML_TYPE_F16 && op->src[2]->type == GGML_TYPE_F16;
+    const bool fa_amd_dk72 = ne00 == 72 && fa_amd_f16_kv;
+    // UNet diffusion heads, f16 only like dk72: SD 1.5 runs 40 at full resolution,
+    // where the score matrix costs 2.7 GB at 768 and does not fit at all at 1024
+    const bool fa_amd_unet = (ne00 == 40 || ne00 == 80 || ne00 == 160) && fa_amd_f16_kv;
+    // dk 384/640 are instantiated for Turbo KV only; see the .metal side
+    const auto fa_amd_is_turbo = [](enum ggml_type t) {
+        return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0;
+    };
+    const bool fa_amd_turbo_kv = fa_amd_is_turbo(op->src[1]->type) || fa_amd_is_turbo(op->src[2]->type);
+        (ne00 == 64 || ne00 == 128 || ne00 == 256 || ne00 == 512 ||
+         ((ne00 == 384 || ne00 == 640) && fa_amd_turbo_kv) ||
+         fa_amd_dk72 || fa_amd_unet)) {
         const char * ks = ggml_metal_fa_amd_type_suffix(op->src[1]->type);
         const char * vs = ggml_metal_fa_amd_type_suffix(op->src[2]->type);
             snprintf(fa_amd_pipeline, sizeof(fa_amd_pipeline), "kernel_flash_attn_ext_vec_amd_dk%d_k%s_v%s%s", (int) ne00, ks, vs,
                      props_dev->simd_width == 64 ? "_w64" : "");
         }
+    } else if (((ne00 == 576 && ne20 == 512) || (ne00 == 320 && ne20 == 256)) &&
+               op->src[1]->type == op->src[2]->type) {
         const char * ks = ggml_metal_fa_amd_type_suffix(op->src[1]->type);
         const char * vs = ggml_metal_fa_amd_type_suffix(op->src[2]->type);
+            snprintf(fa_amd_pipeline, sizeof(fa_amd_pipeline), "kernel_flash_attn_ext_vec_amd_dk%d_dv%d_k%s_v%s%s",
+                     (int) ne00, (int) ne20, ks, vs, props_dev->simd_width == 64 ? "_w64" : "");
+        }
     }
     // wave32 rides on simdgroup_reduction; wave64 uses the _w64 instantiations and
     // is gated by wave64_decode (simdgroup_reduction is forced off there).
@@ -3816,11 +3860,28 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
 
         // queries per threadgroup, matching the instantiation for this head size
         static const bool pf512 = TOSH_ENV("TOSH_FA_PF_DK512") != nullptr;
+        // MLA keeps K wider than V; the tile kernel it used to fall back to measures ~26% slower
         static const bool pfmla = TOSH_ENV("TOSH_FA_PF_MLA_DISABLE") == nullptr;
+        const bool fa_pf_512 = pf512 && ne00 == 512 && ne00 == ne20;
+        const bool fa_pf_mla = pfmla && ne00 == 576 && ne20 == 512 &&
+                               op->src[2]->type == GGML_TYPE_F16;
+        const bool fa_pf_mla320 = ne00 == 320 && ne20 == 256 && op->src[1]->type == op->src[2]->type;
+        // BQ must match the instantiation: dispatching in wider blocks than the kernel
+        // covers leaves most queries uncomputed
+            : ((fa_pf_512 || fa_pf_mla || fa_pf_mla320) ? 16 : 64);
         const bool fa_pf_head_ok =
+            ne00 == 64 || ne00 == 128 || ne00 == 256 || fa_amd_dk72 || fa_amd_unet || fa_pf_512 ||
+            fa_pf_mla || fa_pf_mla320;
         if (TOSH_ENV("TOSH_FA_PF_DEBUG") != nullptr) {
             ne01 >= 32 && fa_pf_head_ok && TOSH_ENV("TOSH_FA_PF_DISABLE") == NULL) {
             char fa_pf_pipeline[80];
+            if (fa_pf_mla) {
+                snprintf(fa_pf_pipeline, sizeof(fa_pf_pipeline), "kernel_flash_attn_ext_pf_amd_dk576_dv512_k%s_vf16",
+                         ggml_metal_fa_amd_type_suffix(op->src[1]->type));
+            } else if (ne20 != ne00) {
+                snprintf(fa_pf_pipeline, sizeof(fa_pf_pipeline), "kernel_flash_attn_ext_pf_amd_dk%d_dv%d_k%s_v%s",
+                         (int) ne00, (int) ne20,
+                         ggml_metal_fa_amd_type_suffix(op->src[1]->type), ggml_metal_fa_amd_type_suffix(op->src[2]->type));
             snprintf(fa_pf_pipeline, sizeof(fa_pf_pipeline), "kernel_flash_attn_ext_pf_amd_dk%d_k%s_v%s", (int) ne00,
                      ggml_metal_fa_amd_type_suffix(op->src[1]->type), ggml_metal_fa_amd_type_suffix(op->src[2]->type));
                     const char * s = TOSH_ENV("TOSH_FA_PF_LG");
@@ -3829,8 +3890,17 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
                     TOSH_ENV("TOSH_FA_PF_W64_DISABLE") == nullptr) {
                 TOSH_ENV("TOSH_FA_PF_W64_DISABLE") == nullptr) {
                 const char * slg = TOSH_ENV("TOSH_FA_PF_LG");
+                if (ggml_metal_fa_amd_pipeline(lib, w64_name).pipeline) {
+            auto pipeline = ggml_metal_fa_amd_pipeline(lib, fa_pf_pipeline);
+
             if (TOSH_ENV("TOSH_FA_PF_DEBUG") != nullptr) {
             // it fits in registers with nothing to spare; a compiler bump could
+            // push it under the 256 threads it dispatches. A driver that refused to build
+            // the kernel leaves the pipeline null, which the tile path below covers: older
+            // GCN cards reject these over their local storage limit.
+            if (pipeline.pipeline &&
+                ggml_metal_pipeline_max_theads_per_threadgroup(pipeline) >= 256) {
+                ggml_metal_encoder_set_pipeline(enc, pipeline);
                 ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
                 ggml_metal_encoder_set_buffer  (enc, bid_src0, 1);
                 ggml_metal_encoder_set_buffer  (enc, bid_src1, 2);
@@ -3851,6 +3921,10 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         // decode keeps the per-query vec kernel
         if (ne01 >= 16 && TOSH_ENV("TOSH_FA_TILE_DISABLE") == NULL) {
             char fa_tile_pipeline[80];
+            if (ne20 != ne00) {
+                // MLA heads carry the value width in the name: 576/512 and 320/256
+                snprintf(fa_tile_pipeline, sizeof(fa_tile_pipeline), "kernel_flash_attn_ext_tile_amd_dk%d_dv%d_k%s_v%s%s",
+                         (int) ne00, (int) ne20,
                          ggml_metal_fa_amd_type_suffix(op->src[1]->type), ggml_metal_fa_amd_type_suffix(op->src[2]->type),
                          props_dev->simd_width == 64 ? "_w64" : "");
             } else {
@@ -3859,12 +3933,35 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
                          props_dev->simd_width == 64 ? "_w64" : "");
             }
 
+            auto pipeline = ggml_metal_fa_amd_pipeline(lib, fa_tile_pipeline);
+
+            // a missed instantiation leaves a null pipeline; fall through to the vec route
+            if (pipeline.pipeline) {
+                ggml_metal_encoder_set_pipeline(enc, pipeline);
+                ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+                ggml_metal_encoder_set_buffer  (enc, bid_src0, 1);
+                ggml_metal_encoder_set_buffer  (enc, bid_src1, 2);
+                ggml_metal_encoder_set_buffer  (enc, bid_src2, 3);
+                ggml_metal_encoder_set_buffer  (enc, bid_src3, 4);
+                ggml_metal_encoder_set_buffer  (enc, bid_src4, 5);
+                ggml_metal_encoder_set_buffer  (enc, bid_pad,  6);
+                ggml_metal_encoder_set_buffer  (enc, bid_dst,  7);
+
+                // queries per threadgroup must match the instantiation: 16 on wave32, 8 on wave64
+                const int fa_nq = props_dev->simd_width == 64 ? 8 : 16;
+                ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + fa_nq - 1)/fa_nq, ne02, ne03, props_dev->simd_width, fa_nq, 1);
+
+                return 1;
+            }
+        }
+
         // must match the .metal instantiations: q4_0 dequant caps the pipeline, so those
         // pairs drop to 24 (dk128 q4_0 keys, dk64 subw=8 with q4_0 in either K or V).
         int fa_amd_nsg = ne00 == 128 ? 16 : ne00 <= 128 ? 32 : 16;
         if (props_dev->simd_width == 32) {
             const bool k_q4 = op->src[1]->type == GGML_TYPE_Q4_0;
             const bool v_q4 = op->src[2]->type == GGML_TYPE_Q4_0;
+            if (!fa_amd_turbo_kv && ((ne00 == 128 && k_q4) || (ne00 == 64 && (k_q4 || v_q4)))) {
                 fa_amd_nsg = 24;
             }
         }
@@ -3897,25 +3994,52 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         // Head 128 needs a deeper cache than the wide heads before the 32-way reduce pays
         // for itself, so it carries its own threshold. The depth it turns at is not the same
         // on both widths, so each keeps its own.
+        static const int64_t wg_dk128_env = []() {
             const char * s = TOSH_ENV("TOSH_FA_WG_DK128_MIN_KV");
+            return s ? (int64_t) atoll(s) : (int64_t) -1;
+        }();
         const bool wg_wide_head =
             ne00 == 256 || ne00 == 512 || (ne00 == 576 && ne20 == 512) ||
             (ne00 == 320 && ne20 == 256);
+        const int64_t wg_dk128_min_kv = wg_dk128_env >= 0 ? wg_dk128_env
         const bool wg_dk128_width_ok = props_dev->simd_width == 32 || props_dev->simd_width == 64;
             const char * s = TOSH_ENV("TOSH_FA_WG_DK64");
+        }();
         const bool wg_dk64 = ne00 == 64 && ne20 == 64 && wg_dk128_width_ok &&
                              wg_dk64_min_kv > 0 && ne11 >= wg_dk64_min_kv;
         const bool wg_dk128 = (ne00 == 128 && ne20 == 128 && wg_dk128_width_ok &&
+                               wg_dk128_min_kv > 0 && ne11 >= wg_dk128_min_kv) || wg_dk64;
         const int fa_amd_nwg =
+            (wg_wide_head || wg_dk128) && ne01 == 1 && !has_sinks &&
+            (props_dev->simd_width == 32 || props_dev->simd_width == 64) &&
+            (wg_dk128 || ne11 >= 1024) &&
             TOSH_ENV("TOSH_FA_WG_DISABLE") == NULL ? 32 : 1;
 
         char fa_amd_wg_pipeline[96];
         if (fa_amd_nwg > 1) {
             snprintf(fa_amd_wg_pipeline, sizeof(fa_amd_wg_pipeline), "%s_wg32", fa_amd_pipeline);
         }
+        auto pipeline = ggml_metal_fa_amd_pipeline(lib, fa_amd_nwg > 1 ? fa_amd_wg_pipeline : fa_amd_pipeline);
+        // 32 KB of threadgroup memory (GCN 1.0) does not hold the 64-lane kernel; its twin
+        // with half the simdgroups does. TOSH_FA_AMD_LDS32=1 takes the twin on any wave64 card.
+        static const bool lds32_force = TOSH_ENV("TOSH_FA_AMD_LDS32") != NULL;
+        if ((!pipeline.pipeline || lds32_force) && props_dev->simd_width == 64) {
+            char lds_pipeline[112];
+            snprintf(lds_pipeline, sizeof(lds_pipeline), "%s_lds32", fa_amd_nwg > 1 ? fa_amd_wg_pipeline : fa_amd_pipeline);
+            auto lds = ggml_metal_fa_amd_pipeline(lib, lds_pipeline);
+            if (lds.pipeline) {
+                pipeline = lds;
+                fa_amd_nsg /= 2;
+            }
+        }
 
         // dispatching more threads than the pipeline admits hangs the GPU, and how many
         // it admits depends on the K type's dequant; fall through rather than risk it
+        if (!pipeline.pipeline) {
+            // a missed instantiation leaves a null pipeline; fall through rather than crash
+            GGML_LOG_WARN("%s: %s is not instantiated; using the generic kernels\n",
+                          __func__, fa_amd_nwg > 1 ? fa_amd_wg_pipeline : fa_amd_pipeline);
+        } else if (ggml_metal_pipeline_max_theads_per_threadgroup(pipeline) < fa_amd_nsg*props_dev->simd_width) {
             GGML_LOG_WARN("%s: %s wants %d threads, pipeline allows %d; using the generic kernels\n",
                           __func__, fa_amd_pipeline, fa_amd_nsg*props_dev->simd_width,
                           ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
