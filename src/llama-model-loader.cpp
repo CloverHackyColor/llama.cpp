@@ -1334,6 +1334,58 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     }
 
     LLAMA_LOG_DEBUG("%s: loading tensor %s\n", __func__, tn.str().c_str());
+
+    // one tensor out of the file's gate and up experts: the rows of an expert sit together,
+    // so the graph issues one mul_mat_id where it would issue two
+    if (flags & TENSOR_FUSE_GATE_UP) {
+        const std::string fused_name = tn.str();
+        const size_t pos = fused_name.find("gate_up");
+        GGML_ASSERT(pos != std::string::npos && ne.size() == 3);
+
+        std::string name_a = fused_name; name_a.replace(pos, 7, "gate");
+        std::string name_b = fused_name; name_b.replace(pos, 7, "up");
+
+        const auto * wa = get_weight(name_a.c_str());
+        const auto * wb = get_weight(name_b.c_str());
+        if (wa == nullptr || wb == nullptr) {
+            return NULL;
+        }
+
+        const ggml_tensor * ta = wa->tensor;
+        const ggml_tensor * tb = wb->tensor;
+        const int64_t n_embd_a   = ne.begin()[0];
+        const int64_t n_ff_fused = ne.begin()[1];
+        const int64_t n_exp_a    = ne.begin()[2];
+        if (ta->type != tb->type || wa->idx != wb->idx ||
+            ta->ne[0] != n_embd_a || tb->ne[0] != n_embd_a ||
+            ta->ne[1] != n_ff_fused/2 || tb->ne[1] != n_ff_fused/2 ||
+            ta->ne[2] != n_exp_a || tb->ne[2] != n_exp_a) {
+            return NULL;
+        }
+
+        ggml_tensor t_meta = *ta;
+        t_meta.ne[1] = n_ff_fused;
+        t_meta.nb[2] = t_meta.nb[1]*t_meta.ne[1];
+        t_meta.nb[3] = t_meta.nb[2]*t_meta.ne[2];
+        ggml_set_name(&t_meta, fused_name.c_str());
+
+        ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
+        if (buft == nullptr) {
+            return NULL;
+        }
+
+        ggml_context * ctx = ctx_for_buft(buft);
+        ggml_tensor * fused = ggml_dup_tensor(ctx, &t_meta);
+        ggml_set_name(fused, fused_name.c_str());
+
+        fused_map.emplace(fused_name, llama_tensor_fused {
+                wa->idx, wa->offs, wb->offs, ggml_nbytes(ta)/(size_t) n_exp_a, n_exp_a });
+
+        n_created += 2;   // both file tensors are consumed here
+
+        return fused;
+    }
+
     const struct ggml_tensor * cur = check_tensor_dims(tn.str(), ne, !(flags & TENSOR_NOT_REQUIRED), flags & TENSOR_ALLOW_RESHAPE);
     if (cur == NULL) {
         return NULL;
@@ -1624,6 +1676,32 @@ bool llama_model_loader::load_all_data(
     for (struct ggml_tensor * cur : tensors) {
         const auto * weight = get_weight(ggml_get_name(cur));
         if (weight == nullptr) {
+            const auto it_fused = fused_map.find(ggml_get_name(cur));
+            if (it_fused != fused_map.end()) {
+                const auto & fu = it_fused->second;
+                const size_t dst_stride = ggml_nbytes(cur)/(size_t) fu.n_expert;
+                GGML_ASSERT(dst_stride == 2*fu.stride);
+
+                std::vector<uint8_t> buf(dst_stride);
+                const auto & file = files.at(fu.idx);
+                const uint8_t * map_addr = mappings.empty() ? nullptr : (const uint8_t *) mappings.at(fu.idx)->addr();
+
+                for (int64_t e = 0; e < fu.n_expert; ++e) {
+                    if (map_addr) {
+                        memcpy(buf.data(),             map_addr + fu.offs_a + e*fu.stride, fu.stride);
+                        memcpy(buf.data() + fu.stride, map_addr + fu.offs_b + e*fu.stride, fu.stride);
+                    } else {
+                        file->seek(fu.offs_a + e*fu.stride, SEEK_SET);
+                        file->read_raw(buf.data(), fu.stride);
+                        file->seek(fu.offs_b + e*fu.stride, SEEK_SET);
+                        file->read_raw(buf.data() + fu.stride, fu.stride);
+                    }
+                    ggml_backend_tensor_set(cur, buf.data(), e*dst_stride, dst_stride);
+                }
+
+                size_done += ggml_nbytes(cur);
+                continue;
+            }
             // this can happen with split experts models
             continue;
         }

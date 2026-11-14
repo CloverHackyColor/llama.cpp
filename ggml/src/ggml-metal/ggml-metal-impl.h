@@ -247,6 +247,8 @@ typedef struct {
     float    val;
     float    min;
     float    max;
+    float    pre;  // SILU/SIGMOID: input and output factors of a fused SCALE
+    float    post;
 } ggml_metal_kargs_unary;
 
 typedef struct {
@@ -1295,6 +1297,17 @@ typedef struct {
     int32_t ne02; // n_tokens
 } ggml_metal_kargs_moe_reduce;
 
+typedef struct {
+    int32_t n_expert;
+    int32_t n_expert_used;
+    int32_t nrows;
+    int32_t mode;            // 0 softmax, 1 sigmoid, 2 sqrt(softplus), 3 raw (delayed softmax)
+    int32_t with_norm;
+    int32_t delayed_softmax;
+    int32_t has_bias;
+    float   clamp;
+    float   scale;
+} ggml_metal_kargs_tosh_topk_moe;
 typedef struct {
     int32_t nrows;
 } ggml_metal_kargs_fwht;

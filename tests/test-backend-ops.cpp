@@ -3653,6 +3653,44 @@ struct test_norm_mul_add : public test_case {
         return out;
     }
 };
+// GGML_OP_SCALE + SILU/SIGMOID [+ GGML_OP_SCALE]
+struct test_scale_unary : public test_case {
+    const ggml_unary_op op;
+    const std::array<int64_t, 4> ne;
+    const float pre;
+    const float post; // 0: no trailing scale
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SCALE_UNARY";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(op, ne, pre, post);
+    }
+
+    test_scale_unary(ggml_unary_op op = GGML_UNARY_OP_SILU, std::array<int64_t, 4> ne = {128, 2, 1, 1},
+            float pre = 0.25f, float post = 0.0f)
+        : op(op), ne(ne), pre(pre), post(post) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * b = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_param(a); ggml_set_param(b);
+        ggml_set_name(a, "a"); ggml_set_name(b, "b");
+
+        ggml_tensor * x = ggml_add(ctx, a, b);
+        ggml_tensor * out = ggml_unary(ctx, ggml_scale(ctx, x, pre), op);
+        if (post != 0.0f) {
+            out = ggml_scale(ctx, out, post);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_NORM/RMS_NORM + GGML_OP_SCALE
 struct test_norm_scale : public test_case {
     const ggml_type type;
@@ -9488,6 +9526,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_I64, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_I32, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_Q8_0, GGML_TYPE_I32, { 256, 5, 1, 3 }, { 1, 1, }, 1, false));
+    }
     for (ggml_type src_type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
         for (ggml_type type : all_types) {
             for (int b : {1, 7}) {
@@ -10153,6 +10192,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_norm_mul_add(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, true));
             test_cases.emplace_back(new test_add_rms_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, false));
             test_cases.emplace_back(new test_add_rms_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, true));
+        }
+    }
+    for (ggml_unary_op u : {GGML_UNARY_OP_SILU, GGML_UNARY_OP_SIGMOID}) {
+        for (float post : {0.0f, 2.0f}) {
+            test_cases.emplace_back(new test_scale_unary(u, {10240, 1, 1, 1}, 0.25f, post));
+            test_cases.emplace_back(new test_scale_unary(u, {4, 3, 1, 1}, 0.25f, post));
+            test_cases.emplace_back(new test_scale_unary(u, {320, 4, 1, 1}, -1.5f, post));
         }
     }
     for (uint32_t n : {1, 511, 1025, 8192, 33*512}) {
