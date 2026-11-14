@@ -628,7 +628,8 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
     }
 
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
-    GGML_ASSERT(hparams.n_pos_per_embd() == 1 && "seq_add() is only supported for n_pos_per_embd() == 1");
+    // M-RoPE only needs the time component shifted; the per-cell 2D extras stay put
+    GGML_ASSERT(get_can_shift() && "seq_add() requires a shiftable cache");
 
     auto & cells = v_cells[seq_to_stream[seq_id]];
     auto & head  = v_heads[seq_to_stream[seq_id]];
@@ -1246,8 +1247,10 @@ bool llama_kv_cache::get_can_shift() const {
     if (model.arch == LLM_ARCH_STEP35) {
         return false;
     }
+    // M-RoPE: a time shift rotates every section by the same delta, which build_rope_shift
+    // already does as a neox rope; the per-cell 2D extras are untouched. ref: PR #13870
     if (hparams.n_pos_per_embd() > 1) {
-        return false;
+        return getenv("TOSH_MROPE_SHIFT_DISABLE") == nullptr;
     }
     return true;
 }
