@@ -286,10 +286,16 @@ kernel void kernel_ssm_conv_f32_f32_batched_4(
     }
 
     // the encoder dispatched ne01 x ceil(ne1/BATCH_SIZE) threadgroups of BATCH_SIZE threads
+//    const int ngy      = (n_t + (int) ntg.x - 1)/(int) ntg.x;
+//    const int nthreads = ntg.x*ntg.y*ntg.z;
+//    const int ngroups  = (int) args.ne01*ngy;
+//    const int gid      = tgpig.x + (int) args.ne01*(tgpig.y + ngy*tgpig.z);
+    const int i3       = (int) tgpig.z;
     const int ngy      = (n_t + (int) ntg.x - 1)/(int) ntg.x;
     const int nthreads = ntg.x*ntg.y*ntg.z;
+    // ngroups covers rows and token-batches only; the z-axis (sequences) is the grid's z-dim
     const int ngroups  = (int) args.ne01*ngy;
-    const int gid      = tgpig.x + (int) args.ne01*(tgpig.y + ngy*tgpig.z);
+    const int gid      = tgpig.x + (int) args.ne01*tgpig.y;
     const int tid      = tpitg.x + ntg.x*(tpitg.y + ntg.y*tpitg.z);
     const int nwarp    = nthreads/32;
     const int warp     = tid/32;
@@ -318,7 +324,8 @@ kernel void kernel_ssm_conv_f32_f32_batched_4(
                 }
                 device const float * s = (device const float *)((device const char *) src0
                                                                 + (uint64_t) cg*args.nb01
-                                                                + (uint64_t) tg*args.nb00);
+                                                                + (uint64_t) tg*args.nb00
+                                                                + (uint64_t) i3*args.nb02);
                 const float sumf = s[0]*k0 + s[1]*k1 + s[2]*k2 + s[3]*k3;
                 tile[c*(SSM_CONV_TT + 1) + t] = FC_ssm_conv_silu ? sumf/(1.0f + exp(-sumf)) : sumf;
             }
@@ -332,7 +339,8 @@ kernel void kernel_ssm_conv_f32_f32_batched_4(
             if (tg >= n_t) {
                 break;
             }
-            device float * row = (device float *)((device char *) dst + (uint64_t) tg*args.nb1);
+            device float * row = (device float *)((device char *) dst + (uint64_t) tg*args.nb1
+                                + (uint64_t) i3*args.nb2);
             for (int c = lane; c < SSM_CONV_TC; c += 32) {
                 const int cg = c0 + c;
                 if (cg >= nch) {
