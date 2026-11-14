@@ -1624,6 +1624,12 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                     nsg = 1;
                     nr0 = 8;
                     suffix = "_r8";
+                } else if (simd_width == 32 && !ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->has_unified_memory &&
+                           TOSH_ENV("TOSH_MV_Q5_1_L2_DISABLE") == nullptr) {
+                    // two lanes per block with two rows each on discrete 32-lane cards: +10% of generation
+                    nsg    = N_SG_Q5_1;
+                    nr0    = 2;
+                    suffix = "_L2r2";
                 } else {
                     nsg = N_SG_Q5_1;
                     nr0 = N_R0_Q5_1;

@@ -320,6 +320,15 @@ struct ggml_metal {
     int n_nodes_1;      // remaining number of nodes submitted by the n_cb threads
     int n_nodes_per_cb;
 
+    // main thread's share sized from its measured encode and GPU time per node, per graph size
+    bool     adapt_n_main;
+    int      am_nodes[4];
+    int      am_main[4];
+    float    am_enc[4];   // seconds per node, moving averages
+    float    am_gpu[4];
+    int      am_prev;     // node count of the graph whose buffers are still held, 0 if unusable
+    uint64_t am_enc_ns;
+
     struct ggml_cgraph * gf;
 
     // the callback given to the thread pool
@@ -1016,6 +1025,8 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev, bool prefetch) {
         res->use_concurrency = props_dev->has_unified_memory
             ? TOSH_ENV("GGML_METAL_CONCURRENCY_DISABLE") == nil
             : TOSH_ENV("GGML_METAL_CONCURRENCY_ENABLE")  != nil;
+
+        res->adapt_n_main = !props_dev->has_unified_memory && TOSH_ENV("TOSH_N_MAIN_FIXED") == nil;
 
         {
             const char * val = TOSH_ENV("GGML_METAL_GRAPH_DEBUG");
@@ -3953,6 +3964,57 @@ bool ggml_metal_exchange_reduce(ggml_metal_t ctx_self, ggml_metal_t ctx_peer,
 // command buffer for each collective plus one for each subgraph that follows it. With this on,
 // the collective leaves its buffer open and the next subgraph encodes into it instead of
 // submitting its own, which halves the command buffers a split token creates.
+// The other thread must finish encoding before the GPU drains the main thread's share, so
+// enc*(n - m) <= gpu*m with both per node, measured on the share itself; never below the default.
+static int ggml_metal_adapt_n_main(ggml_metal_t ctx, int n_nodes, int n_main) {
+    const int prev = ctx->am_prev;
+    ctx->am_prev = 0;
+
+    if (prev > 0 && ctx->n_nodes_0 > 0 && ctx->n_nodes_1 > 0 && ctx->am_enc_ns > 0) {
+        id<MTLCommandBuffer> cb0 = ctx->cmd_bufs[ctx->n_cb].obj;
+        const float enc = 1e-9f*(float) ctx->am_enc_ns/ctx->n_nodes_0;
+        // a graph that compiled pipelines while encoding says nothing about the next one
+        if (cb0 != nil && [cb0 status] == MTLCommandBufferStatusCompleted && enc < 20e-6f) {
+            const float g0  = ([cb0 GPUEndTime] - [cb0 GPUStartTime])/ctx->n_nodes_0;
+
+            int slot = -1;
+            for (int i = 0; i < 4 && slot < 0; ++i) {
+                if (ctx->am_nodes[i] == prev) slot = i;
+            }
+            if (slot < 0) {
+                // a new size takes the first entry; the oldest one falls off the end
+                int n_keep = 3;
+                for (int i = 0; i < 4; ++i) {
+                    if (ctx->am_nodes[i] == 0) { n_keep = i; break; }
+                }
+                memmove(&ctx->am_nodes[1], &ctx->am_nodes[0], (size_t) n_keep*sizeof(int));
+                memmove(&ctx->am_main[1],  &ctx->am_main[0],  (size_t) n_keep*sizeof(int));
+                memmove(&ctx->am_enc[1],   &ctx->am_enc[0],   (size_t) n_keep*sizeof(float));
+                memmove(&ctx->am_gpu[1],   &ctx->am_gpu[0],   (size_t) n_keep*sizeof(float));
+                slot = 0;
+                ctx->am_nodes[0] = prev;
+                ctx->am_enc[0]   = enc;
+                ctx->am_gpu[0]   = g0;
+            }
+            ctx->am_enc[slot] += 0.125f*(enc - ctx->am_enc[slot]);
+            ctx->am_gpu[slot] += 0.125f*(g0  - ctx->am_gpu[slot]);
+
+            const float e = ctx->am_enc[slot];
+            const float g = ctx->am_gpu[slot];
+            const int   m = e > 0.0f && g > 0.0f ? (int) ceilf(prev*e/(e + g)) : 0;
+            // one node stays on the other thread, or the next graph would have nothing to measure
+            ctx->am_main[slot] = MIN(m, prev - 1);
+        }
+    }
+
+    for (int i = 0; i < 4; ++i) {
+        if (ctx->am_nodes[i] == n_nodes && ctx->am_main[i] > n_main) {
+            return ctx->am_main[i];
+        }
+    }
+    return n_main;
+}
+
 static bool ggml_metal_merge_graph(void) {
     static int v = -1;
     if (v < 0) {
@@ -4023,10 +4085,14 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         const char * v = TOSH_ENV("TOSH_N_MAIN");
         n_main_env = v ? atoi(v) : -1;
     }
-    const int n_main = n_main_env >= 0 ? n_main_env : MAX(64, 0.1*gf->n_nodes);
+    int n_main = n_main_env >= 0 ? n_main_env : MAX(64, 0.1*gf->n_nodes);
 
     // number of threads in addition to the main thread
     const int n_cb = ctx->n_cb;
+
+    if (n_main_env < 0 && ctx->adapt_n_main) {
+        n_main = ggml_metal_adapt_n_main(ctx, gf->n_nodes, n_main);
+    }
 
     // keep the memory wired
     ggml_metal_device_rsets_keep_alive(ctx->dev);
@@ -4111,12 +4177,15 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
 
         // the main thread commits the first few commands immediately
         // cmd_buf[n_cb]
+        bool am_measure = ctx->adapt_n_main;
         {
             // continue the collective's buffer when it left one open, otherwise start a new one
             id<MTLCommandBuffer> cmd_buf = nil;
             if (ggml_metal_merge_graph() && ctx->cmd_buf_hold != nil) {
                 cmd_buf = ctx->cmd_buf_hold;
                 ctx->cmd_buf_hold = nil;
+                // this buffer also carries the collective, so its time says nothing about the graph
+                am_measure = false;
                 // the collective is already encoded in here; anything that queued a wait since
                 // then has to land between it and this subgraph, not be dropped
                 if (tosh_mgpu_trace()) {
@@ -4143,7 +4212,12 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
             [cmd_buf enqueue];
 
             ggml_metal_fb_residual_before(ctx, cmd_buf, ctx->gf, ctx->n_nodes_0);
+            const uint64_t t_enc = am_measure ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
             ctx->encode_async(n_cb);
+            if (am_measure) {
+                ctx->am_enc_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t_enc;
+                ctx->am_prev   = ctx->gf->n_nodes;
+            }
         }
 
         // remember the command buffer for the next iteration
