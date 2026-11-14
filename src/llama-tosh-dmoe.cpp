@@ -84,9 +84,11 @@ struct host_bank {
     // activation the graph registered for this layer: -1 none yet, 0 silu, 1 swiglu_oai, 2 gelu
     std::atomic<int> act{-1};
     float alpha = 0.0f, limit = 0.0f;
+    // the router as floats, kept only when a bounded cache reads experts ahead of the layer
+    std::vector<float> router, router_b;
     host_bank() = default;
     host_bank(const host_bank & o) : gate(o.gate), up(o.up), down(o.down), fused(o.fused), gate_b(o.gate_b), up_b(o.up_b),
-        act(o.act.load()), alpha(o.alpha), limit(o.limit) {}
+        act(o.act.load()), alpha(o.alpha), limit(o.limit), router(o.router), router_b(o.router_b) {}
 };
 
 // A layer's gate bank holds gate and up together when the model fuses them.
@@ -446,6 +448,43 @@ struct executor {
     std::vector<uint8_t> wide_seen;
     int wide_first_il = 1 << 30;
 
+    // the next layer's input differs from this one's by this layer's update alone, so its router
+    // applied here picks most of the experts it will ask for: read the ones neither VRAM nor RAM holds
+    std::vector<float> ahead_score;
+    std::vector<int>   ahead_order;
+    uint64_t n_ahead = 0;
+    void read_ahead(int nl) {
+        const host_bank & nb = banks[nl];
+        size_t tb_bytes = 0;
+        int tb_layers = 0, tb_expert = 0;
+        const int32_t * tb = tosh_dmoe_tables(&tb_bytes, &tb_layers, &tb_expert);
+        const int ne = nb.router.empty() ? 0 : (int) (nb.router.size()/n_embd);
+        if (tb == nullptr || ne == 0 || ne != tb_expert) return;
+        const int32_t * vram = tb + ((size_t) tosh_dmoe_published_version()*TOSH_DMOE_MAX_LAYERS + nl)*ne;
+        const int k = std::min(ne, n_used + n_used/2);
+        ahead_score.resize(ne);
+        ahead_order.resize(ne);
+        for (int e = 0; e < ne; ++e) {
+            const float * w = nb.router.data() + (size_t) e*n_embd;
+            float acc[8] = {};
+            int i = 0;
+            for (; i + 8 <= n_embd; i += 8) for (int l = 0; l < 8; ++l) acc[l] += w[i + l]*act[i + l];
+            float sum = 0.0f;
+            for (; i < n_embd; ++i) sum += w[i]*act[i];
+            for (int l = 0; l < 8; ++l) sum += acc[l];
+            ahead_score[e] = nb.router_b.empty() ? sum : 1.0f/(1.0f + expf(-sum)) + nb.router_b[e];
+            ahead_order[e] = e;
+        }
+        std::partial_sort(ahead_order.begin(), ahead_order.begin() + k, ahead_order.end(),
+                          [this](int a, int b) { return ahead_score[a] > ahead_score[b]; });
+        for (int j = 0; j < k; ++j) {
+            if (vram[ahead_order[j]] < 0) {
+                tosh_hostcache_prefetch(nl, ahead_order[j]);
+                n_ahead++;
+            }
+        }
+    }
+
     // one layer: find the non-resident experts, compute them, answer the GPU
     bool job(int il, const tosh_dmoe_job & jb) {
         const clk::time_point t0 = clk::now();
@@ -528,8 +567,12 @@ struct executor {
             next1.store(0, std::memory_order_relaxed);
             next2.store(0, std::memory_order_relaxed);
             kick();
+            // the workers start on this layer's experts while the leader looks one layer ahead
+            if (il + 1 < (int) banks.size()) read_ahead(il + 1);
             run(0);
             unpin_misses();
+        } else if (il + 1 < (int) banks.size()) {
+            read_ahead(il + 1);
         }
 
         n_jobs++;
@@ -644,9 +687,9 @@ struct executor {
             return;
         }
         const uint64_t m = n_miss.load();
-        fprintf(stderr, "tosh_dmoe: jobs %llu, routed %llu, host %llu, hit rate %.2f%%\n",
+        fprintf(stderr, "tosh_dmoe: jobs %llu, routed %llu, host %llu, hit rate %.2f%%, read ahead %llu\n",
                 (unsigned long long) n_jobs.load(), (unsigned long long) routed, (unsigned long long) m,
-                100.0*(double) (routed - m)/(double) routed);
+                100.0*(double) (routed - m)/(double) routed, (unsigned long long) n_ahead);
         fprintf(stderr, "tosh_dmoe: host time per job %.1f us (quantize %.1f, gate/up %.1f, down %.1f)\n",
                 (double) us_job.load()/n_jobs.load(), (double) us_quant.load()/n_jobs.load(),
                 (double) us_p1.load()/n_jobs.load(), (double) us_p2.load()/n_jobs.load());
@@ -1859,6 +1902,22 @@ static void dmoe_init(std::vector<llama_layer> & layers, const llama_hparams & h
         ex->n_ff   = (int) (hb.fused ? hb.gate->ne[1]/2 : hb.gate->ne[1]);
         if (hb.fused && L.ffn_gate_up_exps_b != nullptr) {
             throw std::runtime_error("TOSH_DMOE_CACHE_MIB: biases on a fused gate/up bank are not supported");
+        }
+        // with experts read from disk (TOSH_AUTO_DISK_EXPERTS) decode reads the next layer ahead; TOSH_HC_DECODE_AHEAD=0 turns it off
+        static const bool decode_ahead = getenv("TOSH_AUTO_DISK_EXPERTS") != nullptr && atoi(getenv("TOSH_AUTO_DISK_EXPERTS")) != 0 &&
+                                         (getenv("TOSH_HC_DECODE_AHEAD") == nullptr || atoi(getenv("TOSH_HC_DECODE_AHEAD")) != 0);
+        const ggml_tensor * rt = L.ffn_gate_inp;
+        if (decode_ahead && tosh_hostcache_on() && rt != nullptr && rt->ne[1] == n_expert && ggml_get_type_traits(rt->type)->to_float) {
+            std::vector<uint8_t> raw(ggml_nbytes(rt));
+            ggml_backend_tensor_get(rt, raw.data(), 0, raw.size());
+            hb.router.resize((size_t) rt->ne[0]*rt->ne[1]);
+            for (int64_t e = 0; e < rt->ne[1]; ++e) {
+                ggml_get_type_traits(rt->type)->to_float(raw.data() + e*rt->nb[1], hb.router.data() + e*rt->ne[0], rt->ne[0]);
+            }
+            if (L.ffn_exp_probs_b != nullptr && L.ffn_exp_probs_b->type == GGML_TYPE_F32) {
+                hb.router_b.resize(n_expert);
+                ggml_backend_tensor_get(L.ffn_exp_probs_b, hb.router_b.data(), 0, sizeof(float)*n_expert);
+            }
         }
         for (auto [b, dst] : { std::pair{ L.ffn_gate_exps_b, &hb.gate_b }, { L.ffn_up_exps_b, &hb.up_b } }) {
             if (b == nullptr) {

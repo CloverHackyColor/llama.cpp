@@ -29,6 +29,13 @@ namespace {
 
 enum slot_state : uint8_t { EMPTY, LOADING, RESIDENT };
 
+// TOSH_HC_LOOKAHEAD=1 / TOSH_HC_PROMPT_LAST=1: prompt lookahead and prompt-first eviction, off by default
+static bool env_on(const char * name) {
+    const char * v = getenv(name);
+    return v != nullptr && strcmp(v, "0") != 0;
+}
+static constexpr int LOOKAHEAD_LAYERS = 2;
+
 struct file_tensor {
     size_t   nbytes;
     uint64_t file_off;
@@ -80,6 +87,14 @@ struct cache {
     uint64_t reuse_n[3] = {}, reuse_bytes[3] = {}, loaded_n[3] = {}, loaded_bytes[3] = {};
     std::vector<int32_t>    key_of, ref, prev, next;
     std::vector<uint8_t>    state;
+    // a slot only a prompt has used goes first on eviction, ahead of the experts decode keeps using
+    std::vector<uint8_t>    prompt_only;
+    // prompt lookahead: the experts each layer pinned in its latest chunk, read ahead for the next one
+    std::vector<std::vector<int32_t>> pf_set;
+    std::vector<uint32_t>   pf_chunk_of;
+    uint32_t pf_chunk = 0;
+    int      pf_il = -1;
+    uint64_t ahead_queued = 0;
 
     std::string error;
 
@@ -376,6 +391,9 @@ bool tosh_hostcache_start(int n_layer, int n_expert) {
     g.bg_unused.assign(g.n_slots, 0);
     g.origin.assign(g.n_slots, 0);
     g.reused.assign(g.n_slots, 0);
+    g.prompt_only.assign(g.n_slots, 0);
+    g.pf_set.assign(n_layer, {});
+    g.pf_chunk_of.assign(n_layer, UINT32_MAX);
     g.pool_of_slot.assign(g.n_slots, 0);
     for (int k = 0; k < (int) g.pools.size(); ++k) {
         auto & pl = g.pools[k];
@@ -599,12 +617,39 @@ bool tosh_mlock_paced(void * addr, size_t bytes, char * err, size_t err_len) {
     return mlock_paced(addr, bytes, err, err_len);
 }
 
+static int readback_slot(int il, int e);
+
 bool tosh_hostcache_acquire(int il, const int32_t * ids, int n, int kind) {
     const double t0 = now_us();
     std::unique_lock<std::mutex> lock(g.m);
     std::vector<int> wait;
     std::vector<uint8_t> wait_cls;     // 0 own read, 1 another demand, 2 a read-back
     bool queued = false;
+    const bool prompt = kind == TOSH_HC_PREFILL || kind == TOSH_HC_WIDE;
+    if (prompt && g.base != nullptr) {
+        static const bool lookahead = env_on("TOSH_HC_LOOKAHEAD");
+        // a chunk walks the layers in order; host rows may trail the uploads by a layer
+        if (il + 2 < g.pf_il) { g.pf_chunk++; g.pf_il = il; } else g.pf_il = std::max(g.pf_il, il);
+        if (g.pf_chunk_of[il] != g.pf_chunk) {
+            g.pf_chunk_of[il] = g.pf_chunk;
+            g.pf_set[il].clear();
+            // the next layers still hold the last chunk's experts: their reads go behind the demands
+            for (int d = 1; d <= LOOKAHEAD_LAYERS && lookahead && il + d < g.n_layer; ++d) {
+                auto & set = g.pf_set[il + d];
+                std::sort(set.begin(), set.end());
+                set.erase(std::unique(set.begin(), set.end()), set.end());
+                for (int32_t e : set) {
+                    const int sl = readback_slot(il + d, e);
+                    if (sl < 0) continue;
+                    g.prompt_only[sl] = 1;
+                    g.queue.push_back(sl);
+                    g.ahead_queued++;
+                    queued = true;
+                }
+            }
+        }
+        g.pf_set[il].insert(g.pf_set[il].end(), ids, ids + n);
+    }
     for (int i = 0; i < n; ++i) {
         const int e = ids[i];
         if (e < 0 || e >= g.n_expert) continue;
@@ -612,6 +657,7 @@ bool tosh_hostcache_acquire(int il, const int32_t * ids, int n, int kind) {
         g.req[kind]++;
         int s = g.slot_of[key];
         if (s >= 0) {
+            if (!prompt) g.prompt_only[s] = 0;
             if (g.ref[s]++ == 0 && g.in_lru(s)) g.lru_unlink(s);
             if (g.bg_unused[s]) {
                 g.bg_unused[s] = 0;
@@ -651,6 +697,7 @@ bool tosh_hostcache_acquire(int il, const int32_t * ids, int n, int kind) {
         g.slot_of[key] = s;
         g.state[s] = LOADING;
         g.ref[s] = 1;
+        g.prompt_only[s] = prompt;
         g.cold[kind]++;
         g.cold_total++;
         g.reloads += g.ever[key];
@@ -692,7 +739,10 @@ void tosh_hostcache_release(int il, const int32_t * ids, int n) {
         const int e = ids[i];
         if (e < 0 || e >= g.n_expert) continue;
         const int s = g.slot_of[il*g.n_expert + e];
-        if (s >= 0 && --g.ref[s] == 0) g.lru_push(s);
+        if (s >= 0 && --g.ref[s] == 0) {
+            static const bool prompt_last = env_on("TOSH_HC_PROMPT_LAST");
+            if (prompt_last && g.prompt_only[s]) g.lru_push_tail(s); else g.lru_push(s);
+        }
     }
 }
 
@@ -732,6 +782,7 @@ static int readback_slot(int il, int e) {
     g.bg_unused[s] = 1;
     g.origin[s] = g.ready ? 0 : 1;
     g.reused[s] = 0;
+    g.prompt_only[s] = 0;
     return s;
 }
 
@@ -854,6 +905,7 @@ void tosh_hostcache_report(void) {
     fprintf(stderr, "tosh_hostcache: read-backs used %llu (%llu while loading), evicted unused %llu, dropped unused %llu, still unused %llu\n",
             (unsigned long long) g.bg_used, (unsigned long long) g.bg_used_loading, (unsigned long long) g.bg_wasted,
             (unsigned long long) g.bg_dropped_unused, (unsigned long long) bg_left);
+    fprintf(stderr, "tosh_hostcache: prompt lookahead queued %llu reads\n", (unsigned long long) g.ahead_queued);
     fprintf(stderr, "tosh_hostcache: file reads: first touch %llu, capacity miss %llu, read-back %llu\n",
             (unsigned long long) (g.rd_n[0] > g.reloads ? g.rd_n[0] - g.reloads : 0), (unsigned long long) g.reloads, (unsigned long long) g.rd_n[1]);
     fprintf(stderr, "tosh_hostcache: read-backs moved ahead for a waiting demand %llu | promoted copies kept %llu, refreshed on eviction %llu\n",
