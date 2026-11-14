@@ -3,6 +3,14 @@
 constant short FC_gated_delta_net_ne20 [[function_constant(FC_GATED_DELTA_NET + 0)]];
 constant short FC_gated_delta_net_ne30 [[function_constant(FC_GATED_DELTA_NET + 1)]];
 constant short FC_gated_delta_net_K    [[function_constant(FC_GATED_DELTA_NET + 2)]];
+static inline float gdn_sum32(float v) {
+    v += simd_shuffle_xor(v, 16);
+    v += simd_shuffle_xor(v,  8);
+    v += simd_shuffle_xor(v,  4);
+    v += simd_shuffle_xor(v,  2);
+    v += simd_shuffle_xor(v,  1);
+    return v;
+}
 
 #if 1
 template<short NSG>

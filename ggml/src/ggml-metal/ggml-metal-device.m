@@ -1994,7 +1994,8 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                    (op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_F32) &&
                    op->src[1]->type == GGML_TYPE_F32;
         case GGML_OP_SUM:
-            return has_simdgroup_reduction && ggml_is_contiguous(op->src[0]);
+            // wave64: nsg and shmem are sized by the real width, so the reduction is width-agnostic.
+            return (has_simdgroup_reduction || wave64_decode) && ggml_is_contiguous(op->src[0]);
         case GGML_OP_TRI:
             return ggml_is_contiguous_rows(op->src[0]);
         case GGML_OP_SOFT_MAX:
@@ -2008,12 +2009,13 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             // wave64: width-agnostic kernels (real-width shmem and lane indexing).
             return (has_simdgroup_reduction || wave64_decode) && ggml_is_contiguous_rows(op->src[0]);
         case GGML_OP_COUNT_EQUAL:
-            return has_simdgroup_reduction &&
+            return (has_simdgroup_reduction || wave64_decode) &&
                 op->src[0]->type == GGML_TYPE_I32 &&
                 op->src[1]->type == GGML_TYPE_I32 &&
                 op->type == GGML_TYPE_I64;
         case GGML_OP_ARGMAX:
-            return has_simdgroup_reduction;
+            // wave64: shmem is sized and split by the real width instead of N_SIMDWIDTH.
+            return has_simdgroup_reduction || wave64_decode;
         case GGML_OP_NORM:
         case GGML_OP_RMS_NORM:
             // wave64: norm/rms_norm kernels are width-agnostic (simd_sum + shmem sized by
@@ -2186,7 +2188,8 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 ggml_is_contiguous_rows(op->src[2]) &&
                 (op->src[3] == NULL || ggml_is_contiguous_rows(op->src[3]));
         case GGML_OP_SSM_SCAN:
-            return has_simdgroup_reduction;
+            // wave64: NW, nsg and the shmem layout follow the real width.
+            return has_simdgroup_reduction || wave64_decode;
         case GGML_OP_SSM_CONV:
             // wave64: per-thread serial dot, no simdgroup reduction needed.
             return has_simdgroup_reduction || wave64_decode;
@@ -2244,6 +2247,8 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                  op->src[0]->type == GGML_TYPE_Q4_0 ||
                  op->src[0]->type == GGML_TYPE_Q4_1 ||
                  op->src[0]->type == GGML_TYPE_Q5_0 ||
+                 op->src[0]->type == GGML_TYPE_Q5_1 ||
+                 op->src[0]->type == GGML_TYPE_Q1_0 ||
             return prefill || decode;
         }
         case GGML_OP_MUL_MAT_ID: {
@@ -2280,6 +2285,8 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                  op->src[0]->type == GGML_TYPE_Q4_0 ||
                  op->src[0]->type == GGML_TYPE_Q4_1 ||
                  op->src[0]->type == GGML_TYPE_Q5_0 ||
+                 op->src[0]->type == GGML_TYPE_Q5_1 ||
+                 op->src[0]->type == GGML_TYPE_Q1_0 ||
         case GGML_OP_SET:
         case GGML_OP_CPY:
         case GGML_OP_DUP:

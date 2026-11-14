@@ -9,6 +9,7 @@ kernel void kernel_argmax_f32(
         uint  tpitg[[thread_position_in_threadgroup]],
         uint  sgitg[[simdgroup_index_in_threadgroup]],
         uint  tiisg[[thread_index_in_simdgroup]],
+        uint  sgptg[[threads_per_simdgroup]],
         uint    ntg[[threads_per_threadgroup]]) {
     device const float * x_row = (device const float *) ((device const char *) src0 + tgpig * args.nb01);
 
@@ -29,9 +30,9 @@ kernel void kernel_argmax_f32(
     device int32_t * dst_i32 = (device int32_t *) dst;
 
     threadgroup   float * shared_maxval = (threadgroup   float *) shmem;
-    threadgroup int32_t * shared_argmax = (threadgroup int32_t *) shmem + N_SIMDWIDTH;
+    threadgroup int32_t * shared_argmax = (threadgroup int32_t *) shmem + sgptg;
 
-    if (ntg > N_SIMDWIDTH) {
+    if (ntg > sgptg) {
         if (sgitg == 0) {
             shared_maxval[tiisg] = -INFINITY;
             shared_argmax[tiisg] = -1;
@@ -405,7 +406,7 @@ template [[host_name("kernel_snake_f16")]]  kernel void kernel_snake<half>(const
 template [[host_name("kernel_snake_bf16")]] kernel void kernel_snake<bfloat>(constant ggml_metal_kargs_snake &, device const bfloat *, device const float *, device const float *, device bfloat *, uint, uint, uint);
 #endif
 
-template<int N, typename src_t>
+template<int N, typename src_t, int NW = N_SIMDWIDTH>
 kernel void kernel_fwht(
         constant ggml_metal_kargs_fwht & args,
         device const src_t * src,

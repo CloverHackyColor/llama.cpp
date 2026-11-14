@@ -611,6 +611,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv_decode(
 
     return res;
 }
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv_batched(
         ggml_metal_library_t lib, const ggml_tensor * op, int ssm_conv_bs, int32_t nc, bool use_silu) {
     GGML_ASSERT(op->src[0]->type == GGML_TYPE_F32);
@@ -652,7 +653,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_scan(ggml_me
     char base[256];
     char name[256];
 
-    const int nsg = (ne00 + 31)/32;
+    const int nw  = ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->simd_width;
+    const int nsg = (ne00 + nw - 1)/nw;
 
     snprintf(base, 256, "kernel_ssm_scan_%s%s", ggml_type_name(op->src[0]->type), tail ? "_tail" : "");
     snprintf(name, 256, "%s_nsg=%d", base, nsg);
@@ -666,8 +668,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_scan(ggml_me
     // - sgptg * NW floats for partial sums (nsg * 32)
     // - sgptg floats for shared_x_dt (nsg)
     // - sgptg floats for shared_dA (nsg)
-    // Total: nsg * (32 + 2) floats
-    res.smem = GGML_PAD((32 + 2)*sizeof(float)*nsg, 16);
+    // Total: nsg * (NW + 2) floats
+    // per simdgroup: NW floats of partial sums plus one x_dt and one dA
+    res.smem = GGML_PAD((nw + 2)*sizeof(float)*nsg, 16);
 
     return res;
 }
@@ -829,6 +832,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ext(ggml_
         snprintf(tname, sizeof(tname), "%s_hdr", ggml_type_name(tsrc0));
     } else {
     static const bool w64_disable = TOSH_ENV("TOSH_EXT_W64_DISABLE") != nullptr;
+    // q8_0 reads its quads as halves on 64 lanes only: the same read is slower on 32
+    const bool is_w64_q8  = !w64_disable && tsrc0 == GGML_TYPE_Q8_0 && simd_width_lds == 64 && nr0 == 1;
+    if (is_w64_q6k || is_w64_q8) {
         snprintf(base, 256, "kernel_mul_mv_ext_%s_%s_r1_%d_nr0_%d", tname, ggml_type_name(tsrc1), r1ptg, nr0);
     } else {
         snprintf(base, 256, "kernel_mul_mv_ext_%s_%s_r1_%d", tname, ggml_type_name(tsrc1), r1ptg);
@@ -1027,6 +1033,10 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
             case GGML_TYPE_Q2_K:
             case GGML_TYPE_Q3_K:
             case GGML_TYPE_Q4_K:
+            case GGML_TYPE_IQ1_M:
+            case GGML_TYPE_IQ2_XXS:
+            case GGML_TYPE_IQ2_XS:
+            case GGML_TYPE_IQ3_XXS:
                 wide = op->ne[0] >= wide_ext_floor && TOSH_ENV("TOSH_MM_WIDE_EXT_DISABLE") == nullptr; break;
             default: wide = TOSH_ENV("TOSH_MM_WIDE_ALL") != nullptr && op->ne[0] >= wide_ext_floor; break;
         }
@@ -1034,6 +1044,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
 
     // attention matmuls read a permuted KV cache view and can exceed half range in the packed
     // accumulator; bfloat has no native arithmetic here, so float is faster for it too
+    const bool acc_f32 = use_mm_manual && (!ggml_is_contiguous(op->src[0]) || tsrc0 == GGML_TYPE_BF16) &&
                          TOSH_ENV("TOSH_MM_ACC_F32_DISABLE") == nullptr;
 
         const char * s = TOSH_ENV("TOSH_MM_W64_FLOOR");
@@ -1283,6 +1294,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                 if (nb32 < 32 && (32 % nb32) == 0) {
                     nr0 = N_R0_IQ2_S_SPLIT;
                     split = true;
+                smem = 1024*8;
                 if (simd_width == 64 && TOSH_ENV("TOSH_MV_W64_DISABLE") == nullptr) {
                 }
             } break;
@@ -1295,6 +1307,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                 if (nb32 < 32 && (32 % nb32) == 0) {
                     nr0 = N_R0_IQ1_S_SPLIT;
                     split = true;
+                smem = 2048*4;
                 if (simd_width == 64 && TOSH_ENV("TOSH_MV_W64_DISABLE") == nullptr) {
                 }
             } break;
@@ -1307,6 +1320,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                 if (nb32 < 32 && (32 % nb32) == 0) {
                     nr0 = N_R0_IQ1_M_SPLIT;
                     split = true;
+                smem = 2048*4;
                 if (simd_width == 64 && TOSH_ENV("TOSH_MV_W64_DISABLE") == nullptr) {
                 }
             } break;
@@ -1356,6 +1370,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                                     tsrc0 == GGML_TYPE_Q2_K || tsrc0 == GGML_TYPE_Q3_K ||
                                     tsrc0 == GGML_TYPE_Q4_0 || tsrc0 == GGML_TYPE_Q4_1 ||
                                     tsrc0 == GGML_TYPE_Q5_0 || tsrc0 == GGML_TYPE_Q5_1 ||
+                                    tsrc0 == GGML_TYPE_Q1_0 || tsrc0 == GGML_TYPE_Q2_0 ||
                                     tsrc0 == GGML_TYPE_IQ2_XXS || tsrc0 == GGML_TYPE_IQ2_XS ||
                                     tsrc0 == GGML_TYPE_IQ3_XXS || tsrc0 == GGML_TYPE_IQ3_S ||
                                     tsrc0 == GGML_TYPE_IQ2_S || tsrc0 == GGML_TYPE_IQ1_S ||
@@ -1372,9 +1387,19 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             smem = (size_t) nw*sizeof(float);
         }
     }
+
+    // q6_K's 210-byte block leaves the compiler assuming byte alignment, so it reads its quant
+    // arrays a byte at a time; an even stride lets the kernel read them two bytes at a time
+    const bool row4 = (op->src[0]->nb[1] % 2 == 0) && (op->src[0]->nb[2] % 2 == 0) &&
                       TOSH_ENV("TOSH_MV_ROW4_DISABLE") == nullptr;
 
+    // A stride that is a multiple of four lets the quant arrays be read a word at a time.
+    // The two widths are decided apart: 64 lanes have no last-level cache to hide the extra
+    // loads and every type gains, while 32 lanes only measured a gain on q8_0.
+    const bool row8_aligned = row4 && (op->src[0]->nb[1] % 4 == 0) && (op->src[0]->nb[2] % 4 == 0);
+    const bool row8_width   = nw == 64 || (nw == 32 && tsrc0 == GGML_TYPE_Q8_0);
     const bool row8 = row8_aligned && row8_width && TOSH_ENV("TOSH_MV_ROW8_DISABLE") == nullptr;
+
         const char * st = TOSH_ENV("TOSH_SWEEP_TYPE");
             const char * snr = TOSH_ENV("TOSH_SWEEP_NR0");
             const char * sns = TOSH_ENV("TOSH_SWEEP_NSG");
@@ -1389,8 +1414,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
         ggml_metal_cv_set_int16(cv, (int16_t) ne12, FC_MUL_MV + 2);
         ggml_metal_cv_set_int16(cv, r2,             FC_MUL_MV + 3);
         ggml_metal_cv_set_int16(cv, r3,             FC_MUL_MV + 4);
-        ggml_metal_cv_set_bool (cv, split,          FC_MUL_MV + 5);
         ggml_metal_cv_set_int16(cv, nw,             FC_MUL_MV + 5);
+        ggml_metal_cv_set_bool (cv, row4,           FC_MUL_MV + 6);
+        ggml_metal_cv_set_bool (cv, row8,           FC_MUL_MV + 7);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 
@@ -1479,6 +1505,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id(ggml_m
     const bool wide_width_ok = simd_width != 64 || TOSH_ENV("TOSH_MMID_WIDE_W64_ENABLE") != nullptr;
 
                 tpe >= wide_floor && TOSH_ENV("TOSH_MMID_WIDE_DISABLE") == nullptr;
+            case GGML_TYPE_IQ4_XS:
+            case GGML_TYPE_IQ1_M:
+            case GGML_TYPE_IQ2_XXS:
+            case GGML_TYPE_IQ2_XS:
+            case GGML_TYPE_IQ3_XXS: break;
                      TOSH_ENV("TOSH_MMID_W64_DISABLE") == nullptr;
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
@@ -1653,34 +1684,19 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
             {
                 nsg = N_SG_IQ2_S;
                 nr0 = N_R0_IQ2_S;
-
-                const int nb32 = ne00/32;
-                if (nb32 < 32 && (32 % nb32) == 0) {
-                    nr0 = N_R0_IQ2_S_SPLIT;
-                    split = true;
-                }
+                smem = 1024*8;
             } break;
         case GGML_TYPE_IQ1_S:
             {
                 nsg = N_SG_IQ1_S;
                 nr0 = N_R0_IQ1_S;
-
-                const int nb32 = ne00/32;
-                if (nb32 < 32 && (32 % nb32) == 0) {
-                    nr0 = N_R0_IQ1_S_SPLIT;
-                    split = true;
-                }
+                smem = 2048*4;
             } break;
         case GGML_TYPE_IQ1_M:
             {
                 nsg = N_SG_IQ1_M;
                 nr0 = N_R0_IQ1_M;
-
-                const int nb32 = ne00/32;
-                if (nb32 < 32 && (32 % nb32) == 0) {
-                    nr0 = N_R0_IQ1_M_SPLIT;
-                    split = true;
-                }
+                smem = 2048*4;
             } break;
         case GGML_TYPE_IQ4_NL:
             {
@@ -1720,6 +1736,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
                              tsrc0 == GGML_TYPE_Q2_K || tsrc0 == GGML_TYPE_Q3_K ||
                              tsrc0 == GGML_TYPE_Q4_0 || tsrc0 == GGML_TYPE_Q4_1 ||
                              tsrc0 == GGML_TYPE_Q5_0 || tsrc0 == GGML_TYPE_Q5_1 ||
+                             tsrc0 == GGML_TYPE_Q1_0 || tsrc0 == GGML_TYPE_Q2_0 ||
                              tsrc0 == GGML_TYPE_IQ2_XXS || tsrc0 == GGML_TYPE_IQ2_XS ||
                              tsrc0 == GGML_TYPE_IQ3_XXS || tsrc0 == GGML_TYPE_IQ3_S ||
                              tsrc0 == GGML_TYPE_IQ2_S || tsrc0 == GGML_TYPE_IQ1_S ||
@@ -1729,6 +1746,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
         else if (sr) { nw = (int16_t) props_id->simd_width; }
         else if (lut) { nw = (int16_t) props_id->simd_width; smem = (size_t) nw*sizeof(float); }
     }
+
+    const bool row4 = (op->src[0]->nb[1] % 2 == 0) && (op->src[0]->nb[2] % 2 == 0) &&
                       TOSH_ENV("TOSH_MV_ROW4_DISABLE") == nullptr;
 
                       TOSH_ENV("TOSH_MV_ROW8_DISABLE") == nullptr;
@@ -1742,6 +1761,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
         ggml_metal_cv_set_int16(cv, 1,   FC_MUL_MV + 3);
         ggml_metal_cv_set_int16(cv, 1,   FC_MUL_MV + 4);
         ggml_metal_cv_set_int16(cv, nw,  FC_MUL_MV + 5);
+        ggml_metal_cv_set_bool (cv, row4, FC_MUL_MV + 6);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 
@@ -1771,6 +1791,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argmax(ggml_meta
     if (!res.pipeline) {
         res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
     }
+
+    res.smem = (size_t) ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->simd_width*(sizeof(float) + sizeof(int32_t));
 
     return res;
 }
@@ -2947,8 +2969,13 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_count_equal(ggml
     char base[256];
     char name[256];
 
+    const int nw = ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->simd_width;
+
+    // the final reduction is a single simdgroup reading one entry per subgroup
+    const int nsg_max = std::min(nw, 1024/nw);
+
     int nsg = 1;
-    while (32*nsg < ne00 && nsg < 32) {
+    while (nw*nsg < ne00 && nsg < nsg_max) {
         nsg *= 2;
     }
 
@@ -2966,7 +2993,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_count_equal(ggml
         ggml_metal_cv_free(cv);
     }
 
-    res.smem = 32 * sizeof(int32_t);
+    res.smem = (size_t) nsg * sizeof(int32_t);
     res.nsg  = nsg;
 
     return res;

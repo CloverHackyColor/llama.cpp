@@ -12,6 +12,7 @@ kernel void kernel_soft_max(
         uint3 tpitg[[thread_position_in_threadgroup]],
         uint  sgitg[[simdgroup_index_in_threadgroup]],
         uint  tiisg[[thread_index_in_simdgroup]],
+        uint sgptg[[threads_per_simdgroup]],
         uint3  tptg[[threads_per_threadgroup]]) {
     const int32_t i03 = tgpig.z;
     const int32_t i02 = tgpig.y;
@@ -47,7 +48,7 @@ kernel void kernel_soft_max(
 
     // find the max value in the block
     float max_val = simd_max(lmax);
-    if (tptg.x > N_SIMDWIDTH) {
+    if (tptg.x > sgptg) {
         if (sgitg == 0) {
             buf[tiisg] = -INFINITY;
         }
@@ -78,7 +79,7 @@ kernel void kernel_soft_max(
 
     float sum = simd_sum(lsum);
 
-    if (tptg.x > N_SIMDWIDTH) {
+    if (tptg.x > sgptg) {
         if (sgitg == 0) {
             buf[tiisg] = 0.0f;
         }
@@ -118,6 +119,7 @@ kernel void kernel_soft_max_4(
         uint3 tpitg[[thread_position_in_threadgroup]],
         uint  sgitg[[simdgroup_index_in_threadgroup]],
         uint  tiisg[[thread_index_in_simdgroup]],
+        uint sgptg[[threads_per_simdgroup]],
         uint3  tptg[[threads_per_threadgroup]]) {
     const int32_t i03 = tgpig.z;
     const int32_t i02 = tgpig.y;
@@ -153,7 +155,7 @@ kernel void kernel_soft_max_4(
     const float lmax = MAX(MAX(lmax4[0], lmax4[1]), MAX(lmax4[2], lmax4[3]));
 
     float max_val = simd_max(lmax);
-    if (tptg.x > N_SIMDWIDTH) {
+    if (tptg.x > sgptg) {
         if (sgitg == 0) {
             buf[tiisg] = -INFINITY;
         }
@@ -186,7 +188,7 @@ kernel void kernel_soft_max_4(
 
     float sum = simd_sum(lsum);
 
-    if (tptg.x > N_SIMDWIDTH) {
+    if (tptg.x > sgptg) {
         if (sgitg == 0) {
             buf[tiisg] = 0.0f;
         }
@@ -221,3 +223,5 @@ template [[host_name("kernel_soft_max_f16")]]   kernel kernel_soft_max_t   kerne
 template [[host_name("kernel_soft_max_f32")]]   kernel kernel_soft_max_t   kernel_soft_max<float>;
 template [[host_name("kernel_soft_max_f16_4")]] kernel kernel_soft_max_4_t kernel_soft_max_4<half4>;
 template [[host_name("kernel_soft_max_f32_4")]] kernel kernel_soft_max_4_t kernel_soft_max_4<float4>;
+
+kernel void kernel_tosh_topk_moe_f32(

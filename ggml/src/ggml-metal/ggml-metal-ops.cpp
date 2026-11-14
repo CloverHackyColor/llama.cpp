@@ -997,7 +997,9 @@ int ggml_metal_op_sum(ggml_metal_op_t ctx, int idx) {
 
     auto pipeline = ggml_metal_library_get_pipeline_sum(lib, op);
 
-    int nth = 32; // SIMD width
+    const int nw = ggml_metal_device_get_props(ctx->dev)->simd_width;
+
+    int nth = nw;
 
     while (nth < (int) n && nth < ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {
         nth *= 2;
@@ -1006,14 +1008,14 @@ int ggml_metal_op_sum(ggml_metal_op_t ctx, int idx) {
     nth = std::min(nth, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
     nth = std::min(nth, (int) n);
 
-    const int nsg = (nth + 31) / 32;
+    const int nsg = (nth + nw - 1) / nw;
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         2);
 
-    ggml_metal_encoder_set_threadgroup_memory_size(enc, GGML_PAD(nsg * sizeof(float), 16), 0);
+    ggml_metal_encoder_set_threadgroup_memory_size(enc, nsg * sizeof(float), 0);
 
     ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, nth, 1, 1);
 
@@ -2375,7 +2377,9 @@ int ggml_metal_op_fwht(ggml_metal_op_t ctx, int idx) {
         /*.nrows = */ (int32_t) nrows,
     };
 
-    auto pipeline = ggml_metal_library_get_pipeline_fwht(lib, n, src1->type);
+    const int simd_size = ggml_metal_device_get_props(ctx->dev)->simd_width;
+
+    auto pipeline = ggml_metal_library_get_pipeline_fwht(lib, n, src1->type, simd_size == 64);
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
@@ -2397,7 +2401,7 @@ int ggml_metal_op_fwht(ggml_metal_op_t ctx, int idx) {
     sg_per_tg = std::max(sg_per_tg, 1);
 
     const int64_t n_tg = (nrows + sg_per_tg - 1) / sg_per_tg;
-    ggml_metal_encoder_dispatch_threadgroups(enc, n_tg, 1, 1, 32*sg_per_tg, 1, 1);
+    ggml_metal_encoder_dispatch_threadgroups(enc, n_tg, 1, 1, simd_size*sg_per_tg, 1, 1);
 
     return 1;
 }
@@ -2628,6 +2632,8 @@ static int ggml_metal_op_mul_mat_mv(ggml_metal_op_t ctx, int idx) {
          op->src[0]->type == GGML_TYPE_Q4_0 ||
          op->src[0]->type == GGML_TYPE_Q4_1 ||
          op->src[0]->type == GGML_TYPE_Q5_0 ||
+         op->src[0]->type == GGML_TYPE_Q5_1 ||
+         op->src[0]->type == GGML_TYPE_Q1_0 ||
         nth = props_dev->simd_width;
     }
 
@@ -2646,6 +2652,7 @@ static int ggml_metal_op_mul_mat_mv(ggml_metal_op_t ctx, int idx) {
     static const bool disabled = TOSH_ENV("TOSH_QKV_FUSION_DISABLE") != nullptr;
 
     const bool qvk_w64 = props_dev->simd_width == 64 && TOSH_ENV("TOSH_QVK_W64_DISABLE") == nullptr;
+    } else if (tq == GGML_TYPE_Q2_K && tv == GGML_TYPE_Q4_K && tk == GGML_TYPE_Q2_K) {
         const char * s = TOSH_ENV("TOSH_EXT_KQ_FLOOR");
         const char * s = TOSH_ENV("TOSH_EXT_MAX");
         return s ? atoi(s) : 0;
@@ -2727,18 +2734,33 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         const int nsg    = 1;                 // num simdgroups per threadgroup
 
         // num threads along row per simdgroup
+        // the thresholds below split a 32-lane simdgroup; TOSH_EXT_NXPSG overrides them so the
+        // split can be swept on a 64-lane one, where the row/column balance is not the same
+        static const int nxpsg_env = []() {
             const char * s = TOSH_ENV("TOSH_EXT_NXPSG");
             return s ? atoi(s) : 0;
         }();
+
         int16_t nxpsg = 0;
-        if (ne00 % 256 == 0 && ne11 < 3) {
-            nxpsg = 16;
-        } else if (ne00 % 128 == 0) {
-            nxpsg = 8;
+        if (nxpsg_env) {
+            nxpsg = (int16_t) nxpsg_env;
         } else {
-            nxpsg = 4;
+            if (ne00 % 256 == 0 && ne11 < 3) {
+                nxpsg = 16;
+            } else if (ne00 % 128 == 0) {
+                nxpsg = 8;
+            } else {
+                nxpsg = 4;
+            }
+            // a 64-lane simdgroup wants twice the reduction width: +9.0% with four requests.
+            // TOSH_EXT_NXPSG_X2 tries it on 32 lanes, so that width can be A/B'd before the gate goes
+            // only where the contracted dimension is wide enough to keep four-wide loads per thread:
+            // at ne00 128 the doubled split leaves too few elements and the result goes wrong
+            if (ne00 % 256 == 0 &&
                 (props_dev->simd_width == 64 || TOSH_ENV("TOSH_EXT_NXPSG_X2") != nullptr) &&
                 TOSH_ENV("TOSH_EXT_NXPSG_X2_DISABLE") == nullptr) {
+                nxpsg = std::min<int16_t>(16, nxpsg*2);
+            }
         }
 
         const int16_t nypsg  = 32/nxpsg;          // num threads along col per simdgroup (i.e. a simdgroup processes that many src0 rows at a time)
@@ -2774,6 +2796,9 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
             const char * s = TOSH_ENV("TOSH_EXT_NR0");
             return s ? atoi(s) : 0;
         }();
+
+        // only the K-quants have a two-row variant; forcing the override on the rest asks the
+        // library for a kernel that was never instantiated
         // Four rows per thread doubles what a threadgroup covers, so a weight with few
         // rows stops filling the grid. The threshold is per row count, not per quant type.
         static const int64_t nr0_min_rows = []() {
@@ -3139,6 +3164,8 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
              op->src[0]->type == GGML_TYPE_Q4_0 ||
              op->src[0]->type == GGML_TYPE_Q4_1 ||
              op->src[0]->type == GGML_TYPE_Q5_0 ||
+             op->src[0]->type == GGML_TYPE_Q5_1 ||
+             op->src[0]->type == GGML_TYPE_Q1_0 ||
             id_nth = props_dev->simd_width;
         }
 
@@ -5768,7 +5795,7 @@ int ggml_metal_op_argmax(ggml_metal_op_t ctx, int idx) {
 
     const int64_t nrows = ggml_nrows(op->src[0]);
 
-    int nth = 32; // SIMD width
+    int nth = ggml_metal_device_get_props(ctx->dev)->simd_width;
     while (nth < ne00 && nth*ne01*ne02*ne03 < 256) {
         nth *= 2;
     }
@@ -5786,6 +5813,8 @@ int ggml_metal_op_argmax(ggml_metal_op_t ctx, int idx) {
 
     return 1;
 }
+
+
 
 int ggml_metal_op_argsort(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
@@ -6345,7 +6374,7 @@ int ggml_metal_op_count_equal(ggml_metal_op_t ctx, int idx) {
 
         const size_t smem = pipeline.smem;
 
-        const int nth = 32*pipeline.nsg;
+        const int nth = ggml_metal_device_get_props(ctx->dev)->simd_width*pipeline.nsg;
 
         GGML_ASSERT(nth <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
 
