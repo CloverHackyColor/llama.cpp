@@ -1225,6 +1225,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
         // it needs 64 accumulators, so only where the dequant leaves the registers
         switch (tsrc0) {
             case GGML_TYPE_F16:
+            case GGML_TYPE_BF16:
             case GGML_TYPE_Q8_0:
             case GGML_TYPE_Q5_0:
             case GGML_TYPE_Q5_1:
@@ -1253,15 +1254,17 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
                 // third floor, for the types whose dequant leaves less room: it was picked
                 // against the 32-lane tile too, so TOSH_MM_WIDE_EXT_FLOOR opens it for sweeping
                 wide = op->ne[0] >= wide_ext_floor && TOSH_ENV("TOSH_MM_WIDE_EXT_DISABLE") == nullptr; break;
-            // f32 and bf16 have never been through this gate; the override opens them so the
-            // exclusion can be measured instead of inherited
+            // f32 has never been through this gate; the override opens it so the exclusion can
+            // be measured instead of inherited
             default: wide = TOSH_ENV("TOSH_MM_WIDE_ALL") != nullptr && op->ne[0] >= wide_ext_floor; break;
         }
     }
 
     // attention matmuls read a permuted KV cache view and can exceed half range in the packed
-    // accumulator; bfloat has no native arithmetic here, so float is faster for it too
-    const bool acc_f32 = use_mm_manual && (!ggml_is_contiguous(op->src[0]) || tsrc0 == GGML_TYPE_BF16) &&
+    // accumulator. bf16 weights already reach the tile as half, so they sum like f16.
+    const bool acc_f32 = use_mm_manual &&
+                         (!ggml_is_contiguous(op->src[0]) ||
+                          (tsrc0 == GGML_TYPE_BF16 && TOSH_ENV("TOSH_MM_BF16_ACC_F32") != nullptr)) &&
                          TOSH_ENV("TOSH_MM_ACC_F32_DISABLE") == nullptr;
 
     // the 64-lane GEMM lives in mul_mm_w64.metal: one wave is one tile there, so it needs the
@@ -2189,7 +2192,14 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id(ggml_m
     const bool w64 = simd_width_id == 64 && use_mm_manual && !amax &&
                      TOSH_ENV("TOSH_MMID_W64_DISABLE") == nullptr;
 
-    snprintf(base, 256, "kernel_mul_mm_id_%s_%s%s%s", ggml_metal_tname_pair(lib, tsrc0, tsrc1), ggml_type_name(tsrc1), wide ? "_w" : "", w64 ? "_w64" : "");
+    // the narrow mxfp4 kernel is bfloat when the device has the type, and the manual path keeps
+    // its packed sums in that type; the wide and 64-lane variants are already half, and so is the
+    // narrow one without bfloat
+    const bool half_id = use_mm_manual && !wide && !w64 && tsrc0 == GGML_TYPE_MXFP4 && tsrc1 == GGML_TYPE_F32 &&
+                         ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->has_bfloat &&
+                         TOSH_ENV("TOSH_MMID_HALF_DISABLE") == nullptr;
+
+    snprintf(base, 256, "kernel_mul_mm_id_%s_%s%s%s%s", ggml_metal_tname_pair(lib, tsrc0, tsrc1), ggml_type_name(tsrc1), wide ? "_w" : "", w64 ? "_w64" : "", half_id ? "_h" : "");
     snprintf(name, 256, "%s_bci=%d_mm=%d_af=%d_amax=%d", base, bc_inp, use_mm_manual, acc_f32, amax);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
