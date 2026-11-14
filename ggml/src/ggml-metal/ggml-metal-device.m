@@ -24,6 +24,12 @@
 #import <CommonCrypto/CommonDigest.h>
 #import <CoreFoundation/CoreFoundation.h>
 
+// Upload ring depth: one staging buffer plus its blit command buffer per slot. The blit
+// shares the compute queue, so a slot may only be reused once its blit has finished, and
+// at four slots a decode token's uploads wrap the ring several times: every wrap waits for
+// the GPU to drain up to that point. Deep enough for a whole token, a slot is always free.
+#define GGML_METAL_STAGE_SLOTS 16
+
 // The driver's own VRAM counters for this device: free, and in use by every process. Metal only
 // reports this process's allocations and a working-set ceiling that host mappings also fill.
 static bool ggml_metal_vram_stats(id<MTLDevice> d, int64_t * vfree, int64_t * vused) {
@@ -1079,12 +1085,239 @@ struct ggml_metal_pipeline_with_params ggml_metal_device_pipeline_add3_rms_mul(g
     return res;
 }
 
+// ---------------------------------------------------------------- TOSH_OPGPU: per-dispatch GPU clock
+#define TOSH_SMP_MAX 8192
+#define TOSH_SMP_NB     8
+
+extern int g_tosh_sample_op;    // set by ggml-metal-ops.cpp to the op being encoded
+extern int g_tosh_sample_shape[3];  // src0 ne0, dst ne0, dst ne1 of that dispatch
+
+static bool tosh_opgpu_on(void) {
+    static int v = -1;
+    if (v < 0) { const char * s = getenv("TOSH_OPGPU"); v = (s && s[0] == '1') ? 1 : 0; }
+    return v == 1;
+}
+
+struct tosh_bk {
+    int      key;               // node count of the graphs collected here
+    int      graphs;
+    uint64_t acc[GGML_OP_COUNT];
+    uint64_t cnt[GGML_OP_COUNT];
+};
+
+struct tosh_row { uint64_t ts; int op; int k, m, n; };
+
+// one entry per distinct (op, K, rows, cols): for MUL_MAT that is the shape which decides
+// whether the kernel is limited by flops or by the weight stream
+struct tosh_sh { int op, k, m, n; uint64_t acc, cnt; };
+#define TOSH_SH_MAX 192
+static struct tosh_sh g_sh[TOSH_SH_MAX];
+static int             g_nsh     = 0;
+static uint64_t        g_sh_rest = 0;
+static int             g_smp_sh[TOSH_SMP_MAX][3];
+
+static void tosh_sh_add(int op, int k, int mm, int nn, uint64_t d) {
+    for (int i = 0; i < g_nsh; i++) {
+        if (g_sh[i].op == op && g_sh[i].k == k && g_sh[i].m == mm && g_sh[i].n == nn) {
+            g_sh[i].acc += d;
+            g_sh[i].cnt++;
+            return;
+        }
+    }
+    if (g_nsh < TOSH_SH_MAX) {
+        g_sh[g_nsh].op  = op;
+        g_sh[g_nsh].k   = k;
+        g_sh[g_nsh].m   = mm;
+        g_sh[g_nsh].n   = nn;
+        g_sh[g_nsh].acc = d;
+        g_sh[g_nsh].cnt = 1;
+        g_nsh++;
+        return;
+    }
+    g_sh_rest += d;
+}
+
+static int tosh_sh_cmp(const void * a, const void * b) {
+    const struct tosh_sh * x = (const struct tosh_sh *) a;
+    const struct tosh_sh * y = (const struct tosh_sh *) b;
+    return x->acc < y->acc ? 1 : x->acc > y->acc ? -1 : 0;
+}
+
+static id<MTLCounterSampleBuffer> g_smp_sb  = nil;
+static id<MTLBuffer>              g_smp_dst = nil;
+static id<MTLCommandQueue>        g_smp_q   = nil;
+static _Atomic int                g_smp_n   = 0;
+static int                        g_smp_op[TOSH_SMP_MAX];
+static int                        g_smp_key = 0;        // node count of the graph being encoded
+static struct tosh_bk             g_bk[TOSH_SMP_NB];
+static int                        g_nbk     = 0;
+
+static int tosh_row_cmp(const void * a, const void * b) {
+    const struct tosh_row * x = (const struct tosh_row *) a;
+    const struct tosh_row * y = (const struct tosh_row *) b;
+    return x->ts < y->ts ? -1 : x->ts > y->ts ? 1 : 0;
+}
+
+static struct tosh_bk * tosh_bk_get(int key) {
+    for (int i = 0; i < g_nbk; i++) {
+        if (g_bk[i].key == key) { return &g_bk[i]; }
+    }
+    if (g_nbk < TOSH_SMP_NB) {
+        memset(&g_bk[g_nbk], 0, sizeof g_bk[0]);
+        g_bk[g_nbk].key = key;
+        return &g_bk[g_nbk++];
+    }
+    return &g_bk[TOSH_SMP_NB - 1];
+}
+
+// resolve the samples of the graph that just finished and fold them into their bucket
+static void tosh_smp_flush(void) {
+    if (g_smp_sb == nil || g_smp_q == nil) { return; }
+    int n = atomic_load(&g_smp_n);
+    atomic_store(&g_smp_n, 0);
+    if (n > TOSH_SMP_MAX) { n = TOSH_SMP_MAX; }
+    if (n < 2) { return; }
+
+    id<MTLCommandBuffer> cb = [g_smp_q commandBuffer];
+    id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
+    [bl resolveCounters:g_smp_sb inRange:NSMakeRange(0, (NSUInteger) n)
+        destinationBuffer:g_smp_dst destinationOffset:0];
+    [bl endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+    if (cb.status == MTLCommandBufferStatusError) {
+        fprintf(stderr, "TOSH_OPGPU: resolve failed: %s\n", [[cb.error description] UTF8String]);
+        return;
+    }
+
+    struct tosh_row * rows = (struct tosh_row *) malloc((size_t) n * sizeof (struct tosh_row));
+    const MTLCounterResultTimestamp * res = (const MTLCounterResultTimestamp *) [g_smp_dst contents];
+    int m = 0, bad = 0;
+    for (int i = 0; i < n; i++) {
+        const uint64_t t = (uint64_t) res[i].timestamp;
+        if (t == 0 || t == MTLCounterErrorValue) { bad++; continue; }
+        rows[m].ts = t;
+        rows[m].op = g_smp_op[i];
+        rows[m].k  = g_smp_sh[i][0];
+        rows[m].m  = g_smp_sh[i][1];
+        rows[m].n  = g_smp_sh[i][2];
+        m++;
+    }
+    qsort(rows, (size_t) m, sizeof (struct tosh_row), tosh_row_cmp);
+    struct tosh_bk * b = tosh_bk_get(g_smp_key);
+    b->graphs++;
+    for (int i = 0; i + 1 < m; i++) {
+        const uint64_t d = rows[i + 1].ts - rows[i].ts;
+        const int op = rows[i].op;
+        if (op < 0 || op >= GGML_OP_COUNT) { continue; }
+        b->acc[op] += d;
+        b->cnt[op]++;
+        tosh_sh_add(op, rows[i].k, rows[i].m, rows[i].n, d);
+    }
+    free(rows);
+    if (bad) { fprintf(stderr, "TOSH_OPGPU: %d of %d samples unusable\n", bad, n); }
+}
+
+static void tosh_smp_dump(void) {
+    if (!tosh_opgpu_on()) { return; }
+    tosh_smp_flush();
+    for (int k = 0; k < g_nbk; k++) {
+        struct tosh_bk * b = &g_bk[k];
+        uint64_t total = 0, disp = 0;
+        for (int i = 0; i < GGML_OP_COUNT; i++) { total += b->acc[i]; disp += b->cnt[i]; }
+        if (disp == 0) { continue; }
+        fprintf(stderr, "TOSH_OPGPU  === graph-nodes %d, %d graph(s), %llu dispatches, %.1f ms total\n",
+                b->key, b->graphs, (unsigned long long) disp, total/1e6);
+        fprintf(stderr, "TOSH_OPGPU  %-22s %8s %12s %10s %7s\n", "op", "disps", "gpu_ms", "us/disp", "share");
+        for (int i = 0; i < GGML_OP_COUNT; i++) {
+            if (b->cnt[i] == 0) { continue; }
+            fprintf(stderr, "TOSH_OPGPU  %-22s %8llu %12.1f %10.2f %6.1f%%\n", ggml_op_name((enum ggml_op) i),
+                    (unsigned long long) b->cnt[i], b->acc[i]/1e6,
+                    (double) b->acc[i]/b->cnt[i]/1e3,
+                    100.0*(double) b->acc[i]/(double) total);
+        }
+        fprintf(stderr, "TOSH_OPGPU  %-22s %8llu %12.1f\n", "SUM", (unsigned long long) disp, total/1e6);
+    }
+    if (g_nsh > 0) {
+        struct tosh_sh * s = (struct tosh_sh *) malloc(sizeof (struct tosh_sh) * (size_t) g_nsh);
+        memcpy(s, g_sh, sizeof (struct tosh_sh) * (size_t) g_nsh);
+        qsort(s, (size_t) g_nsh, sizeof (struct tosh_sh), tosh_sh_cmp);
+        uint64_t tot = g_sh_rest;
+        for (int i = 0; i < g_nsh; i++) { tot += s[i].acc; }
+        fprintf(stderr, "TOSH_OPGPU  --- by shape, all graphs (TF/s is dispatch flops over its own span)\n");
+        fprintf(stderr, "TOSH_OPGPU  %-20s %7s %7s %7s %7s %11s %10s %7s %7s\n",
+                "op", "k", "rows", "cols", "disps", "gpu_ms", "us/disp", "share", "TF/s");
+        for (int i = 0; i < g_nsh && i < 48; i++) {
+            const double fl = 2.0*(double) s[i].k*(double) s[i].m*(double) s[i].n*(double) s[i].cnt;
+            fprintf(stderr, "TOSH_OPGPU  %-20s %7d %7d %7d %7llu %11.1f %10.2f %6.1f%% %7.2f\n",
+                    ggml_op_name((enum ggml_op) s[i].op), s[i].k, s[i].m, s[i].n,
+                    (unsigned long long) s[i].cnt, s[i].acc/1e6,
+                    (double) s[i].acc/s[i].cnt/1e3, 100.0*(double) s[i].acc/(double) tot,
+                    s[i].op == GGML_OP_MUL_MAT && s[i].acc ? fl/((double) s[i].acc/1e9) : 0.0);
+        }
+        free(s);
+    }
+    // the sample buffer keeps the command queue alive and the engine teardown then never returns:
+    // once the numbers are out, leave immediately rather than hang the next run's server slot
+    fflush(NULL);
+    _Exit(0);
+}
+
+static void tosh_smp_init(id<MTLDevice> dev, id<MTLCommandQueue> q) {
+    g_smp_q = q;        // remembered even if the counter set is missing, so flush() can bail cleanly
+    MTLCounterSampleBufferDescriptor * d = [[MTLCounterSampleBufferDescriptor alloc] init];
+    for (id<MTLCounterSet> s in [dev counterSets]) {
+        if ([[s name] isEqualToString:@"timestamp"]) {
+            d.counterSet = s;
+            break;
+        }
+    }
+    if (d.counterSet == nil) {
+        fprintf(stderr, "TOSH_OPGPU: this device has no timestamp counter set\n");
+        g_smp_q = nil;
+        return;
+    }
+    d.sampleCount = TOSH_SMP_MAX;
+    d.storageMode = MTLStorageModeShared;
+    NSError * err = nil;
+    g_smp_sb = [dev newCounterSampleBufferWithDescriptor:d error:&err];
+    if (g_smp_sb == nil) {
+        fprintf(stderr, "TOSH_OPGPU: %s\n", [[err description] UTF8String]);
+        g_smp_q = nil;
+        return;
+    }
+    g_smp_dst = [dev newBufferWithLength:TOSH_SMP_MAX*sizeof(MTLCounterResultTimestamp)
+                                 options:MTLResourceStorageModeShared];
+    atexit(tosh_smp_dump);
+    fprintf(stderr, "TOSH_OPGPU: %d timestamp samples per graph\n", TOSH_SMP_MAX);
+}
+
+void ggml_metal_opgpu_reset(int n_nodes) {
+    if (!tosh_opgpu_on()) { return; }
+    tosh_smp_flush();       // the previous graph is complete: bill it, then start over
+    g_smp_key = n_nodes;
+}
+
+static void tosh_smp(ggml_metal_encoder_t enc) {
+    const int i = atomic_fetch_add(&g_smp_n, 1);
+    if (i >= TOSH_SMP_MAX) { return; }
+    g_smp_op[i] = g_tosh_sample_op;
+    g_smp_sh[i][0] = g_tosh_sample_shape[0];
+    g_smp_sh[i][1] = g_tosh_sample_shape[1];
+    g_smp_sh[i][2] = g_tosh_sample_shape[2];
+    [enc->obj sampleCountersInBuffer:g_smp_sb atSampleIndex:(NSUInteger) i withBarrier:YES];
+}
+
 ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, bool concurrent) {
     ggml_metal_encoder_t res = calloc(1, sizeof(struct ggml_metal_encoder));
 
     id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) cmd_buf_raw;
 
     res->concurrent = concurrent;
+
+    if (tosh_opgpu_on() && g_smp_sb == nil) {
+        tosh_smp_init([cmd_buf device], [cmd_buf commandQueue]);
+    }
 
     if (concurrent) {
         res->obj = [cmd_buf computeCommandEncoderWithDispatchType: MTLDispatchTypeConcurrent];
@@ -1129,11 +1362,26 @@ void ggml_metal_encoder_set_threadgroup_memory_size(ggml_metal_encoder_t encoder
 }
 
 void ggml_metal_encoder_dispatch_threadgroups(ggml_metal_encoder_t encoder, int tg0, int tg1, int tg2, int tptg0, int tptg1, int tptg2) {
+    if (g_smp_sb != nil) { tosh_smp(encoder); }
     [encoder->obj dispatchThreadgroups:MTLSizeMake(tg0, tg1, tg2) threadsPerThreadgroup:MTLSizeMake(tptg0, tptg1, tptg2)];
 }
 
 void ggml_metal_encoder_memory_barrier(ggml_metal_encoder_t encoder) {
     [encoder->obj memoryBarrierWithScope:MTLBarrierScopeBuffers];
+}
+
+void ggml_metal_encoder_restart(ggml_metal_encoder_t encoder, ggml_metal_cmd_buf_t cmd_buf_raw) {
+    id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) cmd_buf_raw;
+
+    [encoder->obj endEncoding];
+    [encoder->obj release];
+
+    if (encoder->concurrent) {
+        encoder->obj = [cmd_buf computeCommandEncoderWithDispatchType: MTLDispatchTypeConcurrent];
+    } else {
+        encoder->obj = [cmd_buf computeCommandEncoder];
+    }
+    [encoder->obj retain];
 }
 
 void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder) {
@@ -1188,8 +1436,8 @@ struct ggml_metal_device {
     id<MTLBuffer> stage_buf;
     NSRecursiveLock * stage_lock;   // recursive: a read batch holds it across stage_get calls
     // upload ring: the blit shares the compute queue, so the only wait is slot reuse
-    id<MTLBuffer>        stage_set_bufs[4];
-    id<MTLCommandBuffer> stage_set_cmds[4];
+    id<MTLBuffer>        stage_set_bufs[GGML_METAL_STAGE_SLOTS];
+    id<MTLCommandBuffer> stage_set_cmds[GGML_METAL_STAGE_SLOTS];
     int                  stage_set_cur;
     // open read batch: blits accumulate into one command buffer, one wait at end
     bool                       stage_batch_open;
@@ -2205,7 +2453,7 @@ void ggml_metal_device_free(ggml_metal_device_t dev) {
         }
 
         ggml_metal_device_upload_drain(dev);
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < GGML_METAL_STAGE_SLOTS; i++) {
             [dev->stage_set_bufs[i] release];
             dev->stage_set_bufs[i] = nil;
         }
@@ -3011,7 +3259,9 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             // 128-element group WHT rotation; head_dim must be a multiple of 128.
             return op->src[0]->type == GGML_TYPE_F32 && op->src[0]->ne[0] % 128 == 0;
         case GGML_OP_SOLVE_TRI:
-            return has_simdgroup_reduction && op->src[0]->type == GGML_TYPE_F32;
+            // wave64: the kernel pads each row to the real width, stages 256/nw groups
+            // and reduces with simd_sum, so it is width-agnostic like norm/rms_norm.
+            return (has_simdgroup_reduction || wave64_decode) && op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_MUL_MAT: {
             // the FWHT kernels read an F16 source directly; every other F16 src1 path
             // still goes through ggml_metal_supports_mul_mat_op
@@ -3768,8 +4018,37 @@ static id<MTLBuffer> ggml_metal_device_stage_buf(ggml_metal_device_t dev) {
 }
 
 // waits out and releases every in-flight upload; caller must hold stage_lock
+// dladdr names the caller below; the device file does not pull it in otherwise
+#include <dlfcn.h>
+// TOSH_STAGE_TRACE=1: who asks for each staged upload, how big, how often
+static struct { void * ra; size_t size; long n; } g_stage_trace[32];
+static int  g_stage_ntrace;
+static int  g_stage_trace_on = -1;
+static void g_stage_dump(void) {
+    for (int i = 0; i < g_stage_ntrace; i++) {
+        Dl_info di;
+        const char * nm = "?";
+        if (dladdr(g_stage_trace[i].ra, &di) && di.dli_sname) nm = di.dli_sname;
+        fprintf(stderr, "[stage] %-46s %9zu B x %ld\n", nm, g_stage_trace[i].size, g_stage_trace[i].n);
+    }
+}
+static void g_stage_note(void * ra, size_t size) {
+    for (int i = 0; i < g_stage_ntrace; i++) {
+        if (g_stage_trace[i].ra == ra && g_stage_trace[i].size == size) {
+            g_stage_trace[i].n++;
+            return;
+        }
+    }
+    if (g_stage_ntrace < 32) {
+        g_stage_trace[g_stage_ntrace].ra   = ra;
+        g_stage_trace[g_stage_ntrace].size = size;
+        g_stage_trace[g_stage_ntrace].n    = 1;
+        g_stage_ntrace++;
+    }
+}
+
 static void ggml_metal_device_stage_set_drain(ggml_metal_device_t dev) {
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < GGML_METAL_STAGE_SLOTS; i++) {
         if (dev->stage_set_cmds[i]) {
             [dev->stage_set_cmds[i] waitUntilCompleted];
             [dev->stage_set_cmds[i] release];
@@ -3794,10 +4073,16 @@ bool ggml_metal_device_stage_set(ggml_metal_device_t dev, struct ggml_metal_buff
 
     const uint64_t t0 = tosh_prof_on() ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
 
+    if (g_stage_trace_on < 0) {
+        g_stage_trace_on = TOSH_ENV("TOSH_STAGE_TRACE") != NULL;
+        if (g_stage_trace_on) atexit(g_stage_dump);
+    }
+    if (g_stage_trace_on) g_stage_note(__builtin_return_address(0), size);
+
     [dev->stage_lock lock];
 
     const int slot = dev->stage_set_cur;
-    dev->stage_set_cur = (slot + 1) % 4;
+    dev->stage_set_cur = (slot + 1) % GGML_METAL_STAGE_SLOTS;
 
     if (dev->stage_set_cmds[slot]) {
         [dev->stage_set_cmds[slot] waitUntilCompleted];
@@ -3872,7 +4157,7 @@ bool ggml_metal_device_stage_set_2d(ggml_metal_device_t dev, struct ggml_metal_b
         const size_t need = k*size;
 
         const int slot = dev->stage_set_cur;
-        dev->stage_set_cur = (slot + 1) % 4;
+        dev->stage_set_cur = (slot + 1) % GGML_METAL_STAGE_SLOTS;
 
         if (dev->stage_set_cmds[slot]) {
             [dev->stage_set_cmds[slot] waitUntilCompleted];

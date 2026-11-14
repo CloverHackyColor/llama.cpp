@@ -228,7 +228,16 @@ static bool ggml_metal_op_concurrency_reset(ggml_metal_op_t ctx) {
         return true;
     }
 
-    ggml_metal_encoder_memory_barrier(ctx->enc);
+    static int tosh_hard_barrier = -1;
+    if (tosh_hard_barrier < 0) {
+        const char * e = TOSH_ENV("TOSH_MTL_BARRIER");
+        tosh_hard_barrier = (e != NULL && e[0] == 'e') ? 1 : 0;
+    }
+    if (tosh_hard_barrier) {
+        ggml_metal_encoder_restart(ctx->enc, ctx->cmd_buf);
+    } else {
+        ggml_metal_encoder_memory_barrier(ctx->enc);
+    }
 
     ggml_mem_ranges_reset(ctx->mem_ranges);
 
@@ -254,6 +263,7 @@ static bool ggml_metal_op_concurrency_add(ggml_metal_op_t ctx, const ggml_tensor
 static int32_t ggml_metal_use_count(const ggml_cgraph * gf, const ggml_tensor * t);
 static const ggml_tensor * ggml_metal_unwrap_reshape(const ggml_cgraph * gf, const ggml_tensor * t);
 static int ggml_metal_op_rms_norm_fwht(ggml_metal_op_t ctx, int idx);
+static int ggml_metal_op_norm_mv      (ggml_metal_op_t ctx, int idx);
 static bool ggml_metal_ranges_overlap(const ggml_tensor * a, const ggml_tensor * b);
 static bool ggml_metal_gdn_state_fusion_on(ggml_metal_op_t ctx);
 static bool ggml_metal_gdn_state_skip(ggml_metal_op_t ctx, int idx);
@@ -396,6 +406,11 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
     }
 
     if ((node->op == GGML_OP_RMS_NORM || node->op == GGML_OP_ADD) && ctx->use_fusion() && !ctx->use_concurrency) {
+        const int n_mv = ggml_metal_op_norm_mv(ctx, idx);
+        if (n_mv > 0) {
+            return n_mv;
+        }
+
         const int n = ggml_metal_op_rms_norm_fwht(ctx, idx);
         if (n > 0) {
             return n;
@@ -745,7 +760,57 @@ static void tosh_opprof_dump(void) {
     }
 }
 
+static int  g_stub_state = 0;
+static bool g_stub[GGML_OP_COUNT];
+
+static bool tosh_stub(enum ggml_op op) {
+    if (g_stub_state == 0) {
+        g_stub_state = 1;
+        const char * e = TOSH_ENV("TOSH_STUB");
+        if (e != NULL && e[0] != 0) {
+            char buf[512];
+            snprintf(buf, sizeof (buf), "%s", e);
+            const bool keep = strchr(buf, '!') != NULL;
+            if (keep) {
+                for (int i = 0; i < GGML_OP_COUNT; i++) { g_stub[i] = true; }
+            }
+            for (char * t = strtok(buf, ","); t != NULL; t = strtok(NULL, ",")) {
+                while (*t == ' ') { t++; }
+                if (*t == '!') { t++; }
+                bool hit = false;
+                for (int i = 0; i < GGML_OP_COUNT; i++) {
+                    if (strcmp(ggml_op_name((enum ggml_op) i), t) == 0) {
+                        g_stub[i] = !keep;
+                        hit = true;
+                    }
+                }
+                if (!hit) {
+                    GGML_LOG_WARN("%s: TOSH_STUB: unknown op '%s'\n", __func__, t);
+                } else {
+                    g_stub_state = 2;
+                }
+            }
+        }
+    }
+    return g_stub_state > 1 && op < GGML_OP_COUNT && g_stub[op];
+}
+
+// TOSH_CUT=N: encode nodes [0, N) only. Returning 0 ends the calling loop for this command
+// buffer, so the graph's prefix runs and the rest is never dispatched.
+static int tosh_cut(void) {
+    static int v = -1;
+    if (v < 0) { const char * e = TOSH_ENV("TOSH_CUT"); v = e ? atoi(e) : 0; }
+    return v;
+}
+
+int g_tosh_sample_op = -1;      // TOSH_OPGPU: the op whose dispatch is being sampled
+int g_tosh_sample_shape[3] = {0, 0, 0};
+
 int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx) {
+    const int cut = tosh_cut();
+    if (cut > 0 && idx >= cut) {
+        return 0;
+    }
     if (ctx->use_capture) {
         ggml_metal_encoder_debug_group_push(ctx->enc, ggml_op_desc(ctx->node(idx)));
     }
@@ -753,7 +818,15 @@ int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx) {
     static bool reg = false;
     if (!reg && tosh_opprof_on()) { reg = true; atexit(tosh_opprof_dump); }
     const enum ggml_op prof_op = ctx->node(idx)->op;
+    g_tosh_sample_op = (int) prof_op;
+    g_tosh_sample_shape[0] = ctx->node(idx)->src[0] ? (int) ctx->node(idx)->src[0]->ne[0] : 0;
+    g_tosh_sample_shape[1] = (int) ctx->node(idx)->ne[0];
+    g_tosh_sample_shape[2] = (int) ctx->node(idx)->ne[1];
     const uint64_t prof_t0 = tosh_opprof_on() ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
+
+    if (tosh_stub(prof_op)) {
+        return 1;
+    }
 
     int res = ggml_metal_op_encode_impl(ctx, idx);
 
@@ -3576,6 +3649,219 @@ static int ggml_metal_op_mul_mat_mma(ggml_metal_op_t ctx, int idx) {
 }
 
 // the generic mat-vec kernel, or its 2-row Q4_0 variant if nc
+// rms_norm -> mat-vec of one token, with the residual add in front of the norm folded in when
+// nothing else reads its result: the kernel forms the product from the un-normalized activation,
+// so the norm leaves a scale on the finished row sums and one sum of squares over the same pass.
+// The MLP's gate and up share that pass, so their swiglu follows in the same kernel.
+static int ggml_metal_op_norm_mv(ggml_metal_op_t ctx, int idx) {
+    static const bool disabled = TOSH_ENV("TOSH_NORM_MV_FUSION_DISABLE") != nullptr;
+    static const bool dbg_enter = TOSH_ENV("TOSH_NORM_MV_DEBUG") != nullptr;
+    if (dbg_enter) {
+        fprintf(stderr, "[nmv] enter idx=%d op=%s\n", idx, ggml_op_name(ctx->node(idx)->op));
+    }
+    if (disabled || !ctx->use_fusion() || ctx->use_concurrency) {
+        return 0;
+    }
+
+    const ggml_cgraph * gf = ctx->graph();
+
+    // TOSH_NORM_MV_DEBUG dumps the op window this hook is looking at, one line per candidate
+    if (TOSH_ENV("TOSH_NORM_MV_DEBUG") != nullptr) {
+        const int nn = ctx->n_nodes();
+        char line[512] = {0};
+        size_t o = 0;
+        for (int k = 0; k < 8 && idx + k < nn && o + 64 < sizeof(line); ++k) {
+            o += (size_t) snprintf(line + o, sizeof(line) - o, " %s[%d]",
+                                   ggml_op_name(ctx->node(idx + k)->op), ggml_metal_use_count(gf, ctx->node(idx + k)));
+        }
+        fprintf(stderr, "[nmv] idx=%5d:%s\n", idx, line);
+        fflush(stderr);
+    }
+
+    // the residual add is the node the encoder sees first, so a decline here still lets the
+    // norm at the next node fuse without it
+    const ggml_tensor * add = ctx->node(idx)->op == GGML_OP_ADD ? ctx->node(idx) : nullptr;
+    const bool fold_add = add != nullptr;
+    if (add) {
+        const bool fold =
+            ggml_metal_use_count(gf, add) == 1 && !(add->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+            add->type == GGML_TYPE_F32 && add->src[0] && add->src[1] &&
+            add->src[0]->type == GGML_TYPE_F32 && add->src[1]->type == GGML_TYPE_F32 &&
+            ggml_are_same_shape(add->src[0], add) && ggml_are_same_shape(add->src[1], add) &&
+            ggml_is_contiguous(add->src[0]) && ggml_is_contiguous(add->src[1]);
+        if (!fold) {
+            return 0;
+        }
+    }
+
+    int i = idx + (add ? 1 : 0);
+    if (i + 2 >= ctx->n_nodes()) {
+        return 0;
+    }
+
+    const ggml_tensor * nrm = ctx->node(i);
+    if (nrm->op != GGML_OP_RMS_NORM || (add && nrm->src[0] != add)) {
+        return 0;
+    }
+    i++;
+
+    // the norm's weight is the node the engine already folds into the norm's own dispatch, and
+    // the fused kernel applies it where the mat-vec reads the activation. Two mat-vecs read it
+    // when the MLP's gate and up follow, which is the usual case in this model
+    const ggml_tensor * mul = nullptr;
+    if (ctx->node(i)->op == GGML_OP_MUL && nrm->src[1] == nullptr &&
+        (ctx->node(i)->src[0] == nrm || ctx->node(i)->src[1] == nrm)) {
+        mul = ctx->node(i);
+        i++;
+    }
+
+    if (i + 1 >= ctx->n_nodes()) {
+        return 0;
+    }
+
+    const ggml_tensor * mv = ctx->node(i);
+    const ggml_tensor * y  = mul ? mul : nrm;
+    const ggml_tensor * wn = mul ? (mul->src[0] == nrm ? mul->src[1] : mul->src[0]) : nrm->src[1];
+    const ggml_tensor * x  = nrm->src[0];
+    if (mv->op != GGML_OP_MUL_MAT || mv->src[0] == nullptr || wn == nullptr ||
+        ggml_get_op_params_i32(mv, 1) != 0 || ggml_metal_unwrap_reshape(gf, mv->src[1]) != y) {
+        return 0;
+    }
+    const ggml_tensor * w = mv->src[0];
+
+    const int64_t ne00 = x->ne[0];
+    const float   eps  = ggml_get_op_params_f32(nrm, 0);
+
+    const bool ok =
+        x->type == GGML_TYPE_F32 && ggml_is_contiguous(x) &&
+        x->ne[1] == 1 && x->ne[2] == 1 && x->ne[3] == 1 && ne00 >= 2048 && ne00 % 256 == 0 &&
+        ggml_are_same_shape(nrm, x) && nrm->type == GGML_TYPE_F32 && ggml_is_contiguous(nrm) &&
+        wn->type == GGML_TYPE_F32 && ggml_is_contiguous(wn) && ggml_nelements(wn) == ne00 &&
+        w->type == GGML_TYPE_Q4_K && ggml_is_contiguous(w) && w->ne[0] == ne00 &&
+        w->ne[2] == 1 && w->ne[3] == 1 &&
+        mv->type == GGML_TYPE_F32 && ggml_is_contiguous(mv) && ggml_nelements(mv) == w->ne[1] &&
+        ggml_metal_use_count(gf, nrm) == 1 && !(nrm->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+        eps > 0.0f &&
+        !ggml_metal_ranges_overlap(mv, w) && !ggml_metal_ranges_overlap(mv, wn) &&
+        !ggml_metal_ranges_overlap(mv, x) &&
+        (!add || (!ggml_metal_ranges_overlap(mv, add->src[0]) && !ggml_metal_ranges_overlap(mv, add->src[1])));
+    if (!ok) {
+        return 0;
+    }
+
+    // the MLP's gate and up: their swiglu is in the same dispatch as the mat-vecs
+    const ggml_tensor * mv2 = nullptr;
+    const ggml_tensor * glu = nullptr;
+    const ggml_tensor * wu  = nullptr;
+    const ggml_tensor * dst = mv;
+    int n_fused = (i - idx) + 1;
+
+    if (i + 2 < ctx->n_nodes()) {
+        mv2 = ctx->node(i + 1);
+        glu = ctx->node(i + 2);
+    }
+    // the gate/up variant carries the norm too, but it measured slower than the two dispatches
+    // it replaces on this card (more state per lane), so it stays behind a switch
+    static const bool swiglu_on = TOSH_ENV("TOSH_NORM_MV_SWIGLU") != nullptr;
+    if (swiglu_on && mv2 && glu && mv2->op == GGML_OP_MUL_MAT && glu->op == GGML_OP_GLU &&
+        ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU && ggml_get_op_params_i32(glu, 1) == 0 &&
+        glu->src[0] == mv && glu->src[1] == mv2 && mv2->src[1] == mv->src[1] && mv2->src[0] &&
+        mv2->src[0]->type == GGML_TYPE_Q4_K && ggml_is_contiguous(mv2->src[0]) &&
+        ggml_are_same_shape(mv2->src[0], w) && mv2->src[0]->nb[1] == w->nb[1] &&
+        ggml_get_op_params_i32(mv2, 1) == 0 &&
+        ggml_metal_use_count(gf, mv) == 1 && ggml_metal_use_count(gf, mv2) == 1 &&
+        !(mv->flags & GGML_TENSOR_FLAG_OUTPUT) && !(mv2->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+        glu->type == GGML_TYPE_F32 && ggml_is_contiguous(glu) && ggml_nelements(glu) == w->ne[1] &&
+        !ggml_metal_ranges_overlap(glu, w) && !ggml_metal_ranges_overlap(glu, wn) &&
+        !ggml_metal_ranges_overlap(glu, x) &&
+        !ggml_metal_ranges_overlap(glu, mv2->src[0])) {
+        wu = mv2->src[0];
+        dst = glu;
+        n_fused = (i - idx) + 3;
+    }
+
+    // the normalized activation is skipped, so nothing beyond the mat-vecs may read it
+    if (mul && ggml_metal_use_count(gf, mul) != (wu ? 2 : 1)) {
+        return 0;
+    }
+
+    // a pipeline that will not build would be retried on every token, so it is latched once
+    static bool compile_failed = false;
+    if (compile_failed) {
+        return 0;
+    }
+
+    const int mode = (wu ? 4 : 2) + (fold_add ? 1 : 0);
+
+    auto pipeline = ggml_metal_library_get_pipeline_mul_mv(ctx->lib, mv, mode);
+    if (!pipeline.pipeline) {
+        if (pipeline.nsg < 0) {
+            return 0;
+        }
+        compile_failed = true;
+        GGML_LOG_WARN("%s: fused q4_K norm mat-vec kernel unavailable, keeping the walk\n", __func__);
+        return 0;
+    }
+
+    ggml_metal_kargs_mul_mv args = {
+        /*.ne00 =*/ (int32_t) w->ne[0],
+        /*.ne01 =*/ (int32_t) w->ne[1],
+        /*.ne02 =*/ 1,
+        /*.nb00 =*/ w->nb[0],
+        /*.nb01 =*/ w->nb[1],
+        /*.nb02 =*/ w->nb[2],
+        /*.nb03 =*/ w->nb[3],
+        /*.ne10 =*/ (int32_t) x->ne[0],
+        /*.ne11 =*/ 1,
+        /*.ne12 =*/ 1,
+        /*.nb10 =*/ x->nb[0],
+        /*.nb11 =*/ x->nb[1],
+        /*.nb12 =*/ x->nb[2],
+        /*.nb13 =*/ x->nb[3],
+        /*.ne0  =*/ (int32_t) w->ne[1],
+        /*.ne1  =*/ 1,
+        /*.nr0  =*/ pipeline.nr0,
+        /*.r2   =*/ 1,
+        /*.r3   =*/ 1,
+        /*.eps  =*/ eps,
+    };
+
+    // the activation is one vector, or the two the add was given
+    const ggml_tensor * a0 = fold_add ? add->src[0] : x;
+    const ggml_tensor * a1 = fold_add ? add->src[1] : x;
+
+    ggml_metal_encoder_t enc = ctx->enc;
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(w),   1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(a0),  2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(dst), 3);
+    if (wu) {
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(wu), 4);
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(a1), 5);
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(wn), 6);
+    } else {
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(a1), 4);
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(wn), 5);
+    }
+
+    const int nr0 = pipeline.nr0;
+    const int nsg = pipeline.nsg;
+
+    // same threadgroup the generic mat-vec would have dispatched this kernel with
+    const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx->dev);
+    const int nth = props_dev->wave64_decode ? props_dev->simd_width : 32;
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, (int) ((w->ne[1] + nr0*nsg - 1)/(nr0*nsg)), 1, 1, nth, nsg, 1);
+
+    if (TOSH_ENV("TOSH_NORM_MV_DEBUG") != nullptr) {
+        fprintf(stderr, "[nmv] fused %s mode=%d skip=%d\n", ggml_get_name(dst), mode, n_fused);
+        fflush(stderr);
+    }
+
+    return n_fused;
+}
+
 static int ggml_metal_op_mul_mat_mv(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -3591,7 +3877,7 @@ static int ggml_metal_op_mul_mat_mv(ggml_metal_op_t ctx, int idx) {
     const int16_t r2 = ne12/ne02;
     const int16_t r3 = ne13/ne03;
 
-    auto pipeline = ggml_metal_library_get_pipeline_mul_mv(lib, op);
+    auto pipeline = ggml_metal_library_get_pipeline_mul_mv(lib, op, 0);
 
     const int nr0 = pipeline.nr0;
     const int nr1 = pipeline.nr1;
@@ -4001,6 +4287,149 @@ static int ggml_metal_op_mul_mat_swiglu(ggml_metal_op_t ctx, int idx) {
     return 3;
 }
 
+// q4_K gate and up mat-vecs of one token with their swiglu: one kernel reads both weight
+// streams over a single pass of the activations and writes the swiglu result, replacing two
+// mat-vec dispatches and the GLU with one. The adjacency argument is the pq2 fusion's above.
+static int ggml_metal_op_mul_mat_swiglu_mv(ggml_metal_op_t ctx, int idx) {
+    static const bool disabled = TOSH_ENV("TOSH_SWIGLU_FUSION_DISABLE") != nullptr;
+    if (disabled || !ctx->use_fusion() || idx + 2 >= ctx->n_nodes()) {
+        return 0;
+    }
+
+    const ggml_tensor * a   = ctx->node(idx);
+    const ggml_tensor * b   = ctx->node(idx + 1);
+    const ggml_tensor * glu = ctx->node(idx + 2);
+
+    if (a->op != GGML_OP_MUL_MAT || b->op != GGML_OP_MUL_MAT || glu->op != GGML_OP_GLU ||
+        ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || ggml_get_op_params_i32(glu, 1) != 0 || !glu->src[1]) {
+        return 0;
+    }
+
+    // the kernel takes the first mat-vec as the gate, so only this order fits it
+    const ggml_tensor * gate = glu->src[0];
+    const ggml_tensor * up   = glu->src[1];
+    if (gate != a || up != b) {
+        return 0;
+    }
+
+    const ggml_tensor * wg = gate->src[0];
+    const ggml_tensor * wu = up->src[0];
+    const ggml_tensor * x  = gate->src[1];
+
+    const ggml_cgraph * gf = ctx->graph();
+
+    const bool ok =
+        wg->type == GGML_TYPE_Q4_K && wu->type == GGML_TYPE_Q4_K && ggml_are_same_shape(wg, wu) &&
+        wg->nb[1] == wu->nb[1] && wg->nb[2] == wu->nb[2] && wg->nb[3] == wu->nb[3] &&
+        ggml_is_contiguous(wg) && ggml_is_contiguous(wu) &&
+        wg->ne[2] == 1 && wg->ne[3] == 1 && wg->ne[0] % 256 == 0 &&
+        up->src[1] == x && x->type == GGML_TYPE_F32 && ggml_is_contiguous(x) &&
+        x->ne[1] == 1 && x->ne[2] == 1 && x->ne[3] == 1 &&
+        ggml_get_op_params_i32(gate, 1) == 0 && ggml_get_op_params_i32(up, 1) == 0 &&
+        glu->type == GGML_TYPE_F32 && ggml_is_contiguous(glu) && ggml_nelements(glu) == gate->ne[0] &&
+        ggml_metal_use_count(gf, gate) == 1 && ggml_metal_use_count(gf, up) == 1 &&
+        !(gate->flags & GGML_TENSOR_FLAG_OUTPUT) && !(up->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+        !ggml_metal_ranges_overlap(glu, x);
+    if (!ok) {
+        return 0;
+    }
+
+    // a pipeline that will not build would be retried on every token, so it is latched once
+    static bool compile_failed = false;
+    if (compile_failed) {
+        return 0;
+    }
+
+    auto pipeline = ggml_metal_library_get_pipeline_mul_mv(ctx->lib, gate, 1);
+    if (!pipeline.pipeline) {
+        if (pipeline.nsg < 0) {
+            return 0;
+        }
+        compile_failed = true;
+        GGML_LOG_WARN("%s: fused q4_K swiglu kernel unavailable, keeping the three-node path\n", __func__);
+        return 0;
+    }
+
+    ggml_metal_kargs_mul_mv args = {
+        /*.ne00 =*/ (int32_t) wg->ne[0],
+        /*.ne01 =*/ (int32_t) wg->ne[1],
+        /*.ne02 =*/ 1,
+        /*.nb00 =*/ wg->nb[0],
+        /*.nb01 =*/ wg->nb[1],
+        /*.nb02 =*/ wg->nb[2],
+        /*.nb03 =*/ wg->nb[3],
+        /*.ne10 =*/ (int32_t) x->ne[0],
+        /*.ne11 =*/ 1,
+        /*.ne12 =*/ 1,
+        /*.nb10 =*/ x->nb[0],
+        /*.nb11 =*/ x->nb[1],
+        /*.nb12 =*/ x->nb[2],
+        /*.nb13 =*/ x->nb[3],
+        /*.ne0  =*/ (int32_t) gate->ne[0],
+        /*.ne1  =*/ 1,
+        /*.nr0  =*/ pipeline.nr0,
+        /*.r2   =*/ 1,
+        /*.r3   =*/ 1,
+    };
+
+    ggml_metal_encoder_t enc = ctx->enc;
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(wg),  1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(x),   2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(glu), 3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(wu),  4);
+
+    const int nr0 = pipeline.nr0;
+    const int nsg = pipeline.nsg;
+
+    // same threadgroup the generic mat-vec would have dispatched this kernel with
+    const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx->dev);
+    const int nth = props_dev->wave64_decode ? props_dev->simd_width : 32;
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, (wg->ne[1] + nr0*nsg - 1)/(nr0*nsg), 1, 1, nth, nsg, 1);
+
+    return 3;
+}
+
+// TOSH_MM_SKIP=k:rows[,k:rows...] drops the mul_mat dispatch for a matching shape. Subtracting
+// that run's prefill from a baseline run bills the bucket from the wall clock alone: no sampler
+// in the graph, and the kernel's reads and writes go with the dispatch.
+static bool tosh_mm_skip(int64_t k, int64_t rows) {
+    static const char * env = TOSH_ENV("TOSH_MM_SKIP");
+    static int p[32][2];
+    static int n = -1;
+    if (n < 0) {
+        n = 0;
+        if (env) {
+            const char * s = env;
+            while (*s && n < 32) {
+                p[n][0] = atoi(s);
+                while (*s && *s != ':') s++;
+                if (*s) s++;
+                p[n][1] = atoi(s);
+                while (*s && *s != ',') s++;
+                if (*s) s++;
+                n++;
+            }
+        }
+    }
+    for (int i = 0; i < n; i++) {
+        if (p[i][0] == k && p[i][1] == rows) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int tosh_mm_log(void) {
+    static int v = -1;
+    if (v < 0) {
+        v = TOSH_ENV("TOSH_MM_LOG") != NULL;
+    }
+    return v;
+}
+
 int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -4018,10 +4447,23 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     }
 
     if (const int n_fuse = ggml_metal_op_mul_mat_qvk(ctx, idx)) {
+        if (tosh_mm_log()) fprintf(stderr, "[mm] qvk  ne00=%d ne01=%d ne11=%d w=%s\n",
+                (int) op->src[0]->ne[0], (int) op->src[0]->ne[1], (int) op->src[1]->ne[1],
+                ggml_type_name(op->src[0]->type));
         return n_fuse;
     }
 
     if (const int n_fuse = ggml_metal_op_mul_mat_swiglu(ctx, idx)) {
+        if (tosh_mm_log()) fprintf(stderr, "[mm] swig ne00=%d ne01=%d ne11=%d w=%s\n",
+                (int) op->src[0]->ne[0], (int) op->src[0]->ne[1], (int) op->src[1]->ne[1],
+                ggml_type_name(op->src[0]->type));
+        return n_fuse;
+    }
+
+    if (const int n_fuse = ggml_metal_op_mul_mat_swiglu_mv(ctx, idx)) {
+        if (tosh_mm_log()) fprintf(stderr, "[mm] swmv ne00=%d ne01=%d ne11=%d w=%s\n",
+                (int) op->src[0]->ne[0], (int) op->src[0]->ne[1], (int) op->src[1]->ne[1],
+                ggml_type_name(op->src[0]->type));
         return n_fuse;
     }
 
@@ -4275,6 +4717,8 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         const int16_t r0ptg = ext_w64_q6k ? (r1ptg == 8 ? 2 : 4)*nsg : nypsg*nsg*nr0; // num src0 rows per threadgroup
 
         auto pipeline = ggml_metal_library_get_pipeline_mul_mv_ext(lib, op, nsg, nxpsg, r1ptg, nr0);
+        if (tosh_mm_log()) fprintf(stderr, "[mm] ext  ne00=%d ne01=%d ne11=%d w=%s nr0=%d r1ptg=%d\n",
+                ne00, ne01, ne11, ggml_type_name(op->src[0]->type), nr0, r1ptg);
 
         ggml_metal_kargs_mul_mv_ext args = {
             /*.ne00  =*/ ne00,
@@ -4318,6 +4762,10 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         //}
 
         auto pipeline = ggml_metal_library_get_pipeline_mul_mm(lib, op);
+        if (tosh_mm_log()) fprintf(stderr, "[mm] mm   ne00=%d ne01=%d ne11=%d ne12=%d ne13=%d r2=%d r3=%d nb01=%llu nb11=%llu w=%s nr0=%d nr1=%d nsg=%d smem=%d\n",
+                ne00, ne01, ne11, ne12, ne13, (int) r2, (int) r3,
+                (unsigned long long) nb01, (unsigned long long) nb11,
+                ggml_type_name(op->src[0]->type), pipeline.nr0, pipeline.nr1, pipeline.nsg, (int) pipeline.smem);
 
         ggml_metal_kargs_mul_mm args = {
             /*.ne00 =*/ ne00,
@@ -4352,8 +4800,12 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
 
         const int sgw = pipeline.sgw ? pipeline.sgw : 32;
 
+        // TOSH_MM_SKIP: not dispatched at all, so the drop is this bucket's cost
+        if (tosh_mm_skip(ne00, ne01)) { return 1; }
         ggml_metal_encoder_dispatch_threadgroups(enc, ((ne11 + nr1 - 1) / nr1), ((ne01 + nr0 - 1) / nr0), ne12 * ne13, sgw, nsg, 1);
     } else {
+        if (tosh_mm_log()) fprintf(stderr, "[mm] mv   ne00=%d ne01=%d ne11=%d w=%s\n",
+                ne00, ne01, ne11, ggml_type_name(op->src[0]->type));
         return ggml_metal_op_mul_mat_mv(ctx, idx);
     }
 

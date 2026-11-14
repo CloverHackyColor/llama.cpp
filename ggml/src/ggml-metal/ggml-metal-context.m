@@ -31,6 +31,27 @@
 #include <stdatomic.h>
 #include <time.h>
 
+// TOSH_SEQ=1: one line per graph submission and per synchronize, in order, so the
+// drain pattern of a decode step can be read off directly.
+static _Atomic int g_tosh_seq_n = 0;
+// milliseconds since the first trace line, so the gaps between submissions and syncs show up
+static double tosh_seq_ms(void) {
+    static int64_t t0 = 0;
+    const int64_t now = (int64_t) clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    if (t0 == 0) {
+        t0 = now;
+    }
+    return (double) (now - t0) / 1e6;
+}
+static int tosh_seq_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char * e = TOSH_ENV("TOSH_SEQ");
+        v = (e && e[0] == '1') ? 1 : 0;
+    }
+    return v;
+}
+
 // TOSH_CB_PROFILE=1: per-command-buffer GPU accounting, bucketed by graph size.
 // Off by default, and it attaches no completion handler when off.
 #define TOSH_CBP_MAX_BUCKETS 24
@@ -1198,6 +1219,9 @@ uint64_t ggml_metal_peer_group_id(ggml_metal_t ctx) {
 }
 
 void ggml_metal_synchronize(ggml_metal_t ctx) {
+    if (tosh_seq_on()) {
+        fprintf(stderr, "[seq] %6d S %10.3f\n", atomic_fetch_add(&g_tosh_seq_n, 1), tosh_seq_ms());
+    }
     // nothing completes while a command buffer is still held open
     ggml_metal_cmd_buf_hold_flush(ctx);
 
@@ -4035,6 +4059,12 @@ static bool ggml_metal_merge_graph(void) {
 }
 
 enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph * gf) {
+    ggml_metal_opgpu_reset(gf->n_nodes);   // TOSH_OPGPU: samples describe this graph only
+    if (tosh_seq_on()) {
+        fprintf(stderr, "[seq] %6d G %10.3f nodes=%d last=%s\n", atomic_fetch_add(&g_tosh_seq_n, 1), tosh_seq_ms(),
+                gf->n_nodes, gf->n_nodes > 0 ? gf->nodes[gf->n_nodes - 1]->name : "-");
+        fflush(stderr);
+    }
     if (tosh_mgpu_trace()) { atomic_fetch_add(&g_tr_graphs, 1); }
     // command buffers run in commit order, so a held one has to go in before this graph
     if (!ggml_metal_merge_graph()) {
@@ -4127,8 +4157,18 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
     }
     int n_main = n_main_env >= 0 ? n_main_env : MAX(64, 0.1*gf->n_nodes);
 
-    // number of threads in addition to the main thread
-    const int n_cb = ctx->n_cb;
+    // number of threads in addition to the main thread.
+    // TOSH_N_CB overrides the split: with n_cb > 0 the calling thread commits the first chunk
+    // before encoding the rest, so the card works during the encode instead of after it.
+    static int tosh_n_cb = -2;
+    if (tosh_n_cb == -2) {
+        const char * v_ncb = TOSH_ENV("TOSH_N_CB");
+        tosh_n_cb = v_ncb ? MIN(atoi(v_ncb), GGML_METAL_MAX_COMMAND_BUFFERS) : -1;
+        if (tosh_n_cb > 2) {
+            GGML_LOG_WARN("%s: TOSH_N_CB = %d, values above 2 are not recommended\n", __func__, tosh_n_cb);
+        }
+    }
+    const int n_cb = tosh_n_cb >= 0 ? tosh_n_cb : ctx->n_cb;
 
     if (n_main_env < 0 && ctx->adapt_n_main) {
         n_main = ggml_metal_adapt_n_main(ctx, gf->n_nodes, n_main);
@@ -4470,6 +4510,24 @@ ggml_metal_event_t ggml_metal_get_ev_cpy(ggml_metal_t ctx) {
     return ctx->ev_cpy;
 }
 
+// TOSH_ENC_PROF=1: CPU time per op inside the encode loop. The counters are shared by the
+// encoding threads, so they are updated with atomics and read only at exit.
+static uint64_t g_enc_us[GGML_OP_COUNT];
+static uint64_t g_enc_n [GGML_OP_COUNT];
+static int      g_enc_prof = -1;
+static void g_enc_dump(void) {
+    for (int i = 0; i < GGML_OP_COUNT; i++) {
+        if (g_enc_n[i] == 0) {
+            continue;
+        }
+        fprintf(stderr, "[enc] %-22s %8llu %9.2f us/op %9.1f ms\n",
+                ggml_op_name((enum ggml_op) i),
+                (unsigned long long) g_enc_n[i],
+                (double) g_enc_us[i] / g_enc_n[i],
+                (double) g_enc_us[i] / 1000.0);
+    }
+}
+
 void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
     // when fusion stats are collected the graph must be encoded by a single thread so the
     // counters are race-free; override whatever the caller requested
@@ -4522,8 +4580,20 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
         const bool cbp_on = tosh_cbp_on();
         const uint64_t cbp_t0 = cbp_on ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
 
+        if (g_enc_prof < 0) {
+            g_enc_prof = TOSH_ENV("TOSH_ENC_PROF") != NULL;
+            if (g_enc_prof) atexit(g_enc_dump);
+        }
+        const bool enc_prof = g_enc_prof > 0;
+
         for (int idx = 0; idx < ggml_metal_op_n_nodes(ctx_op); ++idx) {
+            const uint64_t enc_t0 = enc_prof ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
             const int res = ggml_metal_op_encode(ctx_op, idx);
+            if (enc_prof) {
+                const enum ggml_op op = ctx->gf->nodes[idx]->op;
+                __sync_fetch_and_add(&g_enc_us[op], clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - enc_t0);
+                __sync_fetch_and_add(&g_enc_n[op], 1);
+            }
             if (res == 0) {
                 break;
             }

@@ -597,6 +597,8 @@ typedef struct {
     int32_t  nr0;
     int16_t  r2;
     int16_t  r3;
+    // the fused norm in front of the mat-vec carries its own epsilon
+    float    eps;
 } ggml_metal_kargs_mul_mv;
 
 // Three independent decode projections sharing the same activation. The Metal

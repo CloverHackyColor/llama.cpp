@@ -279,7 +279,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_concat(ggml_meta
     const bool align = props->needs_aligned_loads &&
         (tsrc == GGML_TYPE_Q4_0 || tsrc == GGML_TYPE_Q5_0 || tsrc == GGML_TYPE_Q8_0);
 
-    snprintf(base, 256, "kernel_concat_%s%s", ggml_type_name(tsrc), align ? "_al" : "");
+    // f32 concat in these hybrid layers is the SSM conv-input transpose, and the generic
+    // element walk costs 5.9 ms a dispatch for it: see kernel_concat_f32_t in quantize.metal,
+    // which is the same op through an LDS tile at 0.63 ms
+    const char * tiled = tsrc == GGML_TYPE_F32 ? "_t" : "";
+    snprintf(base, 256, "kernel_concat_%s%s%s", ggml_type_name(tsrc), align ? "_al" : "", tiled);
     snprintf(name, 256, "%s", base);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
@@ -1342,12 +1346,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     }
 
     // attention matmuls read a permuted KV cache view and can exceed half range in the packed
-    // accumulator. bf16 weights already reach the tile as half, so they sum like f16.
-    const bool acc_f32 = use_mm_manual &&
-                         (!ggml_is_contiguous(op->src[0]) ||
-                          ggml_get_op_params_i32(op, 1) == GGML_HINT_GRADIENT ||
-                          (tsrc0 == GGML_TYPE_BF16 && TOSH_ENV("TOSH_MM_BF16_ACC_F32") != nullptr)) &&
-                         TOSH_ENV("TOSH_MM_ACC_F32_DISABLE") == nullptr;
+    // accumulator; bfloat has no native arithmetic here, so float is faster for it too.
+    // gfx803 has no packed half arithmetic at all, so the half accumulator was costing a pair of
+    // converts around every product: float is now the default here (11.3 -> 10.3 s prefill at
+    // 1156 tokens) and TOSH_MM_ACC_F32_DISABLE keeps the half path reachable for comparison.
+    const bool acc_f32 = use_mm_manual && TOSH_ENV("TOSH_MM_ACC_F32_DISABLE") == nullptr;
 
     // the 64-lane GEMM lives in mul_mm_w64.metal: one wave is one tile there, so it needs the
     // dispatch to hand it whole waves instead of the 32-thread groups the shared kernel expects
@@ -1360,9 +1363,35 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     const int w64_floor = w64_floor_env ? w64_floor_env :
                           (tsrc0 == GGML_TYPE_IQ4_NL ? 384 : 0);
 
+    // with float accumulators the 64-lane tile's extra registers cost more than its wider LDS
+    // reuse buys: 544 tokens 96.7 -> 104.0, 1156 112.1 -> 116.1, 2312 96.8 -> 100.7, 272 ties.
+    // The half path keeps the old tile, and TOSH_MM_W64_ENABLE reaches it either way.
     const bool w64 = simd_width == 64 && use_mm_manual && !has_tensor &&
                      op->ne[1] >= w64_floor &&
+                     (!acc_f32 || TOSH_ENV("TOSH_MM_W64_ENABLE") != nullptr) &&
                      TOSH_ENV("TOSH_MM_W64_DISABLE") == nullptr;
+
+    // q4_K x f32 prefill tile in mul_mm_w64.metal (kernel_mul_mm_mw): one wave per 64x64 tile,
+    // 8 rows and 8 columns per lane, the next panel staged into registers before the fma loop
+    // that consumes the current one. Standalone at 12288x1088x4096: 2970 GFLOPS against 2236
+    // for the same tile with the loads left behind the barrier and 2030 for the current path.
+    // It needs 64 float accumulators plus a staged panel, so it only takes shapes the wide tile
+    // already handles. q4_K and q6_K are 96% of the prefill GEMM bytes on a Q4_K_M file.
+    // The row floor above belongs to the wide tile, not to this one: it exists because halving the
+    // simdgroups per threadgroup needs enough rows to keep the GPU busy, which a kernel that is
+    // one wave per tile does not do. Keeping it there sent the GQA k/v pair (1024 x 4096) and the
+    // two 256-row SSM projections to the base 32-lane kernel, at 0.07 to 0.97 TF/s in the 10.7
+    // profile against 0.55 to 1.51 for this tile at the same shapes. Only the row floor is
+    // dropped; the token floor, the type gates and the byte gates below all still apply.
+    const bool mw_rows = use_mm_manual && !has_tensor && !wide && op->ne[0] >= 32 &&
+                         op->ne[1] >= wide_floor && !bc_inp &&
+                         TOSH_ENV("TOSH_MM_MW_ROWS_DISABLE") == nullptr;
+    const bool mw = simd_width == 64 && use_mm_manual && !has_tensor && (wide || mw_rows) && !w64 &&
+                    (tsrc0 == GGML_TYPE_Q4_K || tsrc0 == GGML_TYPE_Q6_K) &&
+                    tsrc1 == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                    !bc_inp && op->src[0]->ne[0] % 256 == 0 &&
+                    (tsrc0 != GGML_TYPE_Q4_K || op->src[0]->nb[1] % 16 == 0) &&
+                    TOSH_ENV("TOSH_MM_MW_DISABLE") == nullptr;
 
     // a gradient can pass the half range: its f32 operand goes through the bfloat tile instead
     const bool grad_bf16 = acc_f32 && !w64 && ggml_get_op_params_i32(op, 1) == GGML_HINT_GRADIENT &&
@@ -1371,8 +1400,12 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
                            !(wide && tsrc0 == GGML_TYPE_F32) &&
                            TOSH_ENV("TOSH_MM_GRAD_BF16_DISABLE") == nullptr;
 
-    snprintf(base, 256, "kernel_mul_mm_%s_%s%s%s%s", ggml_metal_tname_pair(lib, tsrc0, tsrc1), ggml_type_name(tsrc1),
-             grad_bf16 ? "_gb" : "", wide ? "_w" : "", w64 ? "_w64" : "");
+        if (mw) {
+        snprintf(base, 256, tsrc0 == GGML_TYPE_Q4_K ? "kernel_mul_mm_mw" : "kernel_mul_mm_mw6");
+    } else {
+        snprintf(base, 256, "kernel_mul_mm_%s_%s%s%s%s", ggml_metal_tname_pair(lib, tsrc0, tsrc1), ggml_type_name(tsrc1),
+                 grad_bf16 ? "_gb" : "", wide ? "_w" : "", w64 ? "_w64" : "");
+    }
     // measured on 32 lanes only; the 64-lane tile lives in its own kernel
     const bool uniform_scale = (tsrc0 == GGML_TYPE_Q4_K || tsrc0 == GGML_TYPE_Q5_K) && wide && !w64 &&
                                use_mm_manual && !has_tensor && simd_width == 32 &&
@@ -1382,6 +1415,13 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
              base, bc_inp, bc_out, ne12, ne13, r2, r3, use_mm_manual + 2*narrow, use_mm_double_buffer, acc_f32, uniform_scale);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline && mw) {
+        // kernel_mul_mm_mw takes no function constants: its tile, staging and accumulation
+        // widths are fixed at the source
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+        ggml_metal_cv_free(cv);
+    }
     if (!res.pipeline) {
         ggml_metal_cv_t cv = ggml_metal_cv_init();
 
@@ -1408,6 +1448,15 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
 
         const size_t smem_a = NRA * N_MM_NK_TOTAL * sizeof(ggml_fp16_t);
         res.smem = smem_a;
+    } else if (mw) {
+        // one wave per tile: 64 rows, 64 columns, MW_BUF floats of staged operands
+        res.nr0  = 64;
+        res.nr1  = 64;
+        res.smem = 8192;
+        res.sgw  = 64;
+        res.nsg  = 1;
+
+        return res;
     } else {
         res.nr0 = 64;
         res.nr1 = use_mm_manual ? (narrow ? 32 : 64) : 32;
@@ -1564,6 +1613,26 @@ int ggml_metal_mv_nc2_rows(ggml_type type, int simd_width, int ne11, int ne01, i
             return 0;
         }
         if (w64) {
+            // q5_K only ever had a two-column shared-dequant kernel on 64 lanes, so a three-column
+            // batch fell back to ext. TOSH_MV_Q5K_C3=R selects the c3_rR instantiation for measuring.
+            if (type == GGML_TYPE_Q5_K) {
+                // measured +6.3% at three columns (10.19), so it is the default now; TOSH_MV_Q5K_C3=R
+                // re-tries another row width and =0 puts the old batched kernel back
+                static const int r = TOSH_ENV("TOSH_MV_Q5K_C3") ? atoi(TOSH_ENV("TOSH_MV_Q5K_C3")) : 4;
+                if (r == 2 || r == 4 || r == 8) {
+                    return r;
+                }
+                return 0;
+            }
+            // q4_K is the bulk of the shipped checkpoint and had only a two-column instantiation,
+            // so its three-column batch fell through to ext exactly where q5_K did
+            if (type == GGML_TYPE_Q4_K) {
+                static const int r = TOSH_ENV("TOSH_MV_Q4K_C3") ? atoi(TOSH_ENV("TOSH_MV_Q4K_C3")) : 0;
+                if (r == 2 || r == 4 || r == 8) {
+                    return r;
+                }
+                return 0;
+            }
             // q8_0 on 64 lanes: few rows want more groups, a short row stays on the batched kernel
             if (type == GGML_TYPE_Q8_0) {
                 return ne01 < 2048 ? 2 : (ne00 >= 2048 || ne01 >= 8192 ? 8 : 0);
@@ -1596,9 +1665,46 @@ int ggml_metal_mv_nc2_rows(ggml_type type, int simd_width, int ne11, int ne01, i
     }
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_metal_library_t lib, const ggml_tensor * op) {
+// The mat-vec pipeline is chosen from a formatted name: two snprintf calls, a type-name helper,
+// the library lock and a string-hash map probe. A decode token issues a few hundred mat-vecs
+// over roughly a dozen distinct shapes, so nearly every one of those is a repeat lookup.
+// Remember the resolved pipeline per shape tuple; only the first dispatch of a shape pays.
+struct mul_mv_cache_ent {
+    ggml_type t0;
+    ggml_type t1;
+    int32_t   ne00, ne01, ne02, ne03;
+    int32_t   ne11, ne12, ne13;
+    uint32_t  al;
+    uint32_t  mode;
+    ggml_metal_pipeline_with_params res;
+};
+
+static thread_local mul_mv_cache_ent g_mul_mv_cache[64];
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_metal_library_t lib, const ggml_tensor * op, int mode) {
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
+
+    const ggml_type cache_t0 = op->src[0]->type;
+    const ggml_type cache_t1 = op->src[1]->type;
+
+    // every name decision below reads these four byte strides and nothing else about the layout
+    const uint32_t cache_al = (uint32_t) ((op->src[0]->nb[1] & 1) | ((op->src[0]->nb[1] & 3) == 0 ? 2 : 0) |
+                                          ((op->src[0]->nb[2] & 1) == 0 ? 4 : 0) | ((op->src[0]->nb[2] & 3) == 0 ? 8 : 0));
+
+    const uint32_t cache_h = (uint32_t) cache_t0*7u + (uint32_t) cache_t1*13u + (uint32_t) ne00*3u +
+                             (uint32_t) ne01*5u + (uint32_t) ne02*11u + (uint32_t) ne03*23u +
+                             (uint32_t) ne11*17u + (uint32_t) ne12*19u + (uint32_t) ne13*29u + cache_al*31u +
+                             (uint32_t) mode*37u;
+
+    mul_mv_cache_ent & cache_e = g_mul_mv_cache[cache_h & 63];
+    if (cache_e.res.pipeline &&
+        cache_e.t0 == cache_t0 && cache_e.t1 == cache_t1 &&
+        cache_e.ne00 == ne00 && cache_e.ne01 == ne01 && cache_e.ne02 == ne02 && cache_e.ne03 == ne03 &&
+        cache_e.ne11 == ne11 && cache_e.ne12 == ne12 && cache_e.ne13 == ne13 && cache_e.al == cache_al &&
+        cache_e.mode == mode) {
+        return cache_e.res;
+    }
 
     char base[256];
     char name[256];
@@ -1842,8 +1948,15 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                 // with the inherited rows loses, so the win lives in the crossing of the two.
                 if (simd_width == 64 && !q4k_small && TOSH_ENV("TOSH_MV_Q4K_W64_DISABLE") == nullptr) {
                     nsg    = 1;
-                    nr0    = 4;
-                    suffix = "_L16r4";
+                    // eight rows per threadgroup halves the activation re-reads; +8.5% of
+                    // the 12288x4096 matvec bandwidth and +25% at 49152 rows (bmv, warm)
+                    if (TOSH_ENV("TOSH_MV_Q4K_R8") != nullptr && TOSH_ENV("TOSH_MV_Q4K_R8_DISABLE") == nullptr) {
+                        nr0    = 8;
+                        suffix = "_L16r8";
+                    } else {
+                        nr0    = 4;
+                        suffix = "_L16r4";
+                    }
                     w64    = true;
                     break;
                 }
@@ -1885,8 +1998,27 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                 // 64 lanes want four rows in one group (+16.3% tg); 32 keep the shipped pair
                 if ((simd_width == 64 || TOSH_ENV("TOSH_MV_R8") != nullptr) && TOSH_ENV("TOSH_MV_R8_DISABLE") == nullptr) {
                     nsg = 1;
-                    nr0 = 4;
-                    suffix = "_r4";
+                    // same story as q4_K: eight rows beat four by 8% at 12288 rows and 14%
+                    // at the 248320-row output layer, which is the widest matvec in decode
+                    // L8 packs eight lanes per block instead of sixteen, so one 64-lane group
+                    // covers twice as many blocks at a time. Isolated, that is worth 78% at the
+                    // 248320-row output layer (193 vs 108 GB/s) and 17% at 12288 columns.
+                    const char * l8 = TOSH_ENV("TOSH_MV_Q6K_L8");
+                    if (l8 != nullptr && TOSH_ENV("TOSH_MV_Q6K_L8_DISABLE") == nullptr) {
+                        nr0    = atoi(l8) == 4 ? 4 : 8;
+                        suffix = atoi(l8) == 4 ? "_L8r4" : "_L8r8";
+                    } else if (TOSH_ENV("TOSH_MV_Q6K_R4") == nullptr) {
+                        // Eight rows per group reuses every y value over twice as many rows.
+                        // Sustained over 3000 dispatches that is 121-124 GB/s at all three decode
+                        // shapes against 108-112 for four rows, and in-engine 21.3 against 20.9
+                        // tok/s with a byte-identical reply. TOSH_MV_Q6K_R4=1 restores the old
+                        // kernel.
+                        nr0    = 8;
+                        suffix = "_r8";
+                    } else {
+                        nr0 = 4;
+                        suffix = "_r4";
+                    }
                 } else {
                     nsg = N_SG_Q6_K;
                     nr0 = N_R0_Q6_K;
@@ -2149,7 +2281,28 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
         suffix = sfx;
     }
 
-    snprintf(base, 256, "kernel_mul_mv_%s_%s%s", ggml_metal_tname_pair(lib, tsrc0, tsrc1), ggml_type_name(tsrc1), suffix);
+    // the fused variants are entry points of their own, so a shape that would not land on one
+    // declines instead of compiling a name that does not exist
+    char sfx2[32] = {0};
+    if (mode != 0) {
+        static const char * const fused[6] = {
+            "", "_swiglu", "_norm", "_normadd", "_swiglu_norm", "_swiglu_normadd",
+        };
+        // the fused entry points exist for both row widths now, so the wide q4_K kernel keeps
+        // its fusions instead of quietly losing 32 dispatches per decode token
+        const std::string fsfx = suffix;
+        if (mode < 0 || mode > 5 ||
+            !w64 || tsrc0 != GGML_TYPE_Q4_K || tsrc1 != GGML_TYPE_F32 ||
+            (fsfx != "_L16r4_w64" && fsfx != "_L16r8_w64")) {
+            // nsg < 0 is "no fused kernel for this shape", which is not a failed compile
+            ggml_metal_pipeline_with_params none = {};
+            none.nsg = -1;
+            return none;
+        }
+        snprintf(sfx2, sizeof(sfx2), "%s", fused[mode]);
+    }
+
+    snprintf(base, 256, "kernel_mul_mv_%s_%s%s%s", ggml_metal_tname_pair(lib, tsrc0, tsrc1), ggml_type_name(tsrc1), suffix, sfx2);
     snprintf(name, 256, "%s_nsg=%d_ne12=%d_r2=%d_r3=%d_nw=%d_a4=%d_a8=%d_al=%d", base, nsg, ne12, r2, r3, nw, row4, row8, align);
 
     if (TOSH_ENV("TOSH_SWEEP_DEBUG") != nullptr) {
@@ -2186,6 +2339,19 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
         static const int ntg_env = TOSH_ENV("TOSH_MV_NTG") ? atoi(TOSH_ENV("TOSH_MV_NTG")) : -1;
         res.ntg = ntg_env >= 0 ? ntg_env : (smem >= 2048 && tsrc0 != GGML_TYPE_IQ2_XXS ? 640 : 0);
     }
+
+    cache_e.t0   = cache_t0;
+    cache_e.t1   = cache_t1;
+    cache_e.ne00 = ne00;
+    cache_e.ne01 = ne01;
+    cache_e.ne02 = ne02;
+    cache_e.ne03 = ne03;
+    cache_e.ne11 = ne11;
+    cache_e.ne12 = ne12;
+    cache_e.ne13 = ne13;
+    cache_e.al   = cache_al;
+    cache_e.mode = (uint32_t) mode;
+    cache_e.res  = res;
 
     return res;
 }

@@ -1590,6 +1590,23 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         ggml_backend_sched_print_assignments(sched, graph);
     }
 
+    if (getenv("GGML_SPLIT_DBG")) {
+        for (int s = 0; s < sched->n_splits; s++) {
+            struct ggml_backend_sched_split * sp = &sched->splits[s];
+            char sb[2048]; int off = 0; sb[0] = 0;
+            for (int i = sp->i_start; i < sp->i_end; i++) {
+                struct ggml_tensor * nd = graph->nodes[i];
+                if (ggml_is_view_op(nd->op)) continue;
+                off += snprintf(sb + off, sizeof(sb) - off, " %s", ggml_op_name(nd->op));
+                if (off > (int) sizeof(sb) - 64) break;
+            }
+            fprintf(stderr, "[split] %2d %-14s %5d..%-5d in %2d:%s\n", s,
+                ggml_backend_name(sched->backends[sp->backend_id]),
+                sp->i_start, sp->i_end, sp->n_inputs, sb);
+        }
+        fflush(stderr);
+    }
+
     // pass 6: collect all input tensors into graph_inputs
     //         this includes inputs not consumed by any node (e.g. the embeddings input of a text-only batch) so that
     //         the graph composition does not depend on which inputs are used, which would otherwise cause graph
@@ -2267,6 +2284,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             read_batch_backend->iface.read_batch_end(read_batch_backend);
         }
 
+        if (getenv("GGML_SPLIT_DBG2")) {
+            char sb[512]; int off = 0; sb[0] = 0;
+            for (int j = 0; j < split->graph.n_nodes && off < 380; j++) {
+                struct ggml_tensor * nd = split->graph.nodes[j];
+                off += snprintf(sb + off, sizeof(sb) - off, " %s(%s)", ggml_op_name(nd->op), nd->name);
+            }
+            fprintf(stderr, "[sched] split=%d %-10s nodes=%-5d cb=%s%s\n", split_id,
+                    ggml_backend_name(split_backend), split->graph.n_nodes,
+                    sched->callback_eval ? "yes" : "no", sb);
+            fflush(stderr);
+        }
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (split_prefetch_slot != -1) {

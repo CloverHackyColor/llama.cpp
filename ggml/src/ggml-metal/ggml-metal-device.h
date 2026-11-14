@@ -106,8 +106,12 @@ void ggml_metal_encoder_dispatch_threadgroups(ggml_metal_encoder_t encoder, int 
 void ggml_metal_encoder_event(ggml_metal_encoder_t encoder, ggml_metal_cmd_buf_t cmd_buf, void * ev, uint64_t value, bool signal);
 
 void ggml_metal_encoder_memory_barrier(ggml_metal_encoder_t encoder);
+// closes the current encoder and opens a fresh one of the same dispatch type: the only ordering
+// between two concurrent dispatch groups this driver actually enforces
+void ggml_metal_encoder_restart(ggml_metal_encoder_t encoder, ggml_metal_cmd_buf_t cmd_buf);
 
 void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder);
+void ggml_metal_opgpu_reset(int n_nodes);   // TOSH_OPGPU: bill the finished graph, start a fresh sample buffer
 
 //
 // MTLLibrary wrapper
@@ -167,7 +171,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ex
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_mma        (ggml_metal_library_t lib, const struct ggml_tensor * op, int nsg, int nt, int rt, bool add);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_mma_auto   (ggml_metal_library_t lib, const struct ggml_tensor * op, bool add);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm            (ggml_metal_library_t lib, const struct ggml_tensor * op);
-struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv            (ggml_metal_library_t lib, const struct ggml_tensor * op);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv            (ggml_metal_library_t lib, const struct ggml_tensor * op, int mode);
 
 // rows per simdgroup of the few-column mat-vec for this type, lane width and column count,
 // 0 if the batch does not take it

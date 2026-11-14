@@ -574,14 +574,31 @@ void kernel_mul_mv_q4_K_f32_w64_impl(
     thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
 
     for (int ib = ix; ib < nb; ib += NG) {
-        float4 sumy = {0.f, 0.f, 0.f, 0.f};
+        // eight aligned 16-byte reads for the thirty-two activations, the same substitution
+        // ACO makes for the Vulkan shader's vec4 operands
+        const float4 ya0 = *(device const float4 *) (y4 +   0);
+        const float4 ya1 = *(device const float4 *) (y4 +   4);
+        const float4 ya2 = *(device const float4 *) (y4 +  32);
+        const float4 ya3 = *(device const float4 *) (y4 +  36);
+        const float4 yb0 = *(device const float4 *) (y4 + 128);
+        const float4 yb1 = *(device const float4 *) (y4 + 132);
+        const float4 yb2 = *(device const float4 *) (y4 + 160);
+        const float4 yb3 = *(device const float4 *) (y4 + 164);
 
-        for (short i = 0; i < 8; ++i) {
-            yl[i+0] = y4[i+  0]; sumy[0] += yl[i+0];
-            yl[i+8] = y4[i+ 32]; sumy[1] += yl[i+8];
-            yh[i+0] = y4[i+128]; sumy[2] += yh[i+0];
-            yh[i+8] = y4[i+160]; sumy[3] += yh[i+8];
-        }
+        yl[ 0] = ya0.x; yl[ 1] = ya0.y; yl[ 2] = ya0.z; yl[ 3] = ya0.w;
+        yl[ 4] = ya1.x; yl[ 5] = ya1.y; yl[ 6] = ya1.z; yl[ 7] = ya1.w;
+        yl[ 8] = ya2.x; yl[ 9] = ya2.y; yl[10] = ya2.z; yl[11] = ya2.w;
+        yl[12] = ya3.x; yl[13] = ya3.y; yl[14] = ya3.z; yl[15] = ya3.w;
+        yh[ 0] = yb0.x; yh[ 1] = yb0.y; yh[ 2] = yb0.z; yh[ 3] = yb0.w;
+        yh[ 4] = yb1.x; yh[ 5] = yb1.y; yh[ 6] = yb1.z; yh[ 7] = yb1.w;
+        yh[ 8] = yb2.x; yh[ 9] = yb2.y; yh[10] = yb2.z; yh[11] = yb2.w;
+        yh[12] = yb3.x; yh[13] = yb3.y; yh[14] = yb3.z; yh[15] = yb3.w;
+
+        const float4 sumy = {
+            ya0.x + ya0.y + ya0.z + ya0.w + ya1.x + ya1.y + ya1.z + ya1.w,
+            ya2.x + ya2.y + ya2.z + ya2.w + ya3.x + ya3.y + ya3.z + ya3.w,
+            yb0.x + yb0.y + yb0.z + yb0.w + yb1.x + yb1.y + yb1.z + yb1.w,
+            yb2.x + yb2.y + yb2.z + yb2.w + yb3.x + yb3.y + yb3.z + yb3.w };
 
         device const uint4 * hp = (device const uint4 *) &x[ib];
         device const uint16_t * q1 = (device const uint16_t *)x[ib].qs + (16 * (int) iq + 4 * (int) ir);
@@ -822,14 +839,20 @@ void kernel_mul_mv_q4_K_f32_L16_w64_impl(
     thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
 
     for (int ib = ix; ib < nb; ib += NG) {
-        float4 sumy = {0.f, 0.f, 0.f, 0.f};
+        // four aligned 16-byte reads carry the sixteen activations, as ACO does for the
+        // Vulkan shader; the partial sums fall out of the same four vectors
+        const float4 ya = *(device const float4 *) (y4 +   0);
+        const float4 yb = *(device const float4 *) (y4 +  32);
+        const float4 yc = *(device const float4 *) (y4 + 128);
+        const float4 yd = *(device const float4 *) (y4 + 160);
 
-        for (short i = 0; i < 4; ++i) {
-            yl[i+0] = y4[i+  0]; sumy[0] += yl[i+0];
-            yl[i+4] = y4[i+ 32]; sumy[1] += yl[i+4];
-            yh[i+0] = y4[i+128]; sumy[2] += yh[i+0];
-            yh[i+4] = y4[i+160]; sumy[3] += yh[i+4];
-        }
+        yl[0] = ya.x; yl[1] = ya.y; yl[2] = ya.z; yl[3] = ya.w;
+        yl[4] = yb.x; yl[5] = yb.y; yl[6] = yb.z; yl[7] = yb.w;
+        yh[0] = yc.x; yh[1] = yc.y; yh[2] = yc.z; yh[3] = yc.w;
+        yh[4] = yd.x; yh[5] = yd.y; yh[6] = yd.z; yh[7] = yd.w;
+
+        const float4 sumy = { ya.x + ya.y + ya.z + ya.w, yb.x + yb.y + yb.z + yb.w,
+                              yc.x + yc.y + yc.z + yc.w, yd.x + yd.y + yd.z + yd.w };
 
         device const uint4 * hp = (device const uint4 *) &x[ib];
         device const uint16_t * q1 = (device const uint16_t *)x[ib].qs + (16 * (int) iq + 2 * (int) ir);
@@ -886,6 +909,535 @@ void kernel_mul_mv_q4_K_f32_L16_w64_impl(
         float sum_all = simd_sum(sumf[row]);
         if (tiisg == 0) {
             dst_f32[first_row + row] = sum_all;
+        }
+    }
+}
+
+// The rms_norm in front of a decode mat-vec, and the residual add in front of the norm, fold
+// into the mat-vec. The product is formed from the un-normalized activation, so the norm leaves
+// only a scale on the finished row sums, and its sum of squares comes out of the same pass.
+// NADD says the graph's add is folded here, which is why the activation is a pair of vectors.
+template<bool NADD>
+inline void mv_norm_y(device const float * y4, device const float * h4, device const float * w4,
+                      thread float4 & ya, thread float4 & yb, thread float4 & yc, thread float4 & yd,
+                      thread float & ssq) {
+    ya = *(device const float4 *) (y4 +   0);
+    yb = *(device const float4 *) (y4 +  32);
+    yc = *(device const float4 *) (y4 + 128);
+    yd = *(device const float4 *) (y4 + 160);
+
+    if (NADD) {
+        ya += *(device const float4 *) (h4 +   0);
+        yb += *(device const float4 *) (h4 +  32);
+        yc += *(device const float4 *) (h4 + 128);
+        yd += *(device const float4 *) (h4 + 160);
+    }
+
+    ssq += dot(ya, ya) + dot(yb, yb) + dot(yc, yc) + dot(yd, yd);
+
+    ya *= *(device const float4 *) (w4 +   0);
+    yb *= *(device const float4 *) (w4 +  32);
+    yc *= *(device const float4 *) (w4 + 128);
+    yd *= *(device const float4 *) (w4 + 160);
+}
+
+// every lane covered its own slice of every block, so the simdgroup holds the whole row
+inline float mv_norm_scale(float ssq, int ne00, float eps) {
+    return rsqrt(simd_sum(ssq)/float(ne00) + eps);
+}
+
+// one weight stream: the activation is the residual add when NADD, and the norm's weight rides
+// on it before the quants see it. Only the norm's own rsqrt factor is left for the row sums.
+template<short nr0, bool NADD>
+void kernel_mul_mv_q4_K_f32_L16_norm_w64_impl(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        device const char * src2,
+        device const char * src3,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+
+    constexpr uint16_t kmask1 = 0x3f3f;
+    constexpr uint16_t kmask2 = 0x0f0f;
+    constexpr uint16_t kmask3 = 0xc0c0;
+
+    const short NG = FC_mul_mv_nw/16;
+    const short ix = tiisg/16;
+    const short it = tiisg%16;
+    const short iq = it/8;
+    const short ir = it%8;
+
+    const int nb = args.ne00/QK_K;
+
+    const int r0 = tgpig.x;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+
+    const int first_row = (r0 * NSG + sgitg) * nr0;
+
+    const uint i12 = im%FC_mul_mv_ne12;
+    const uint i13 = im/FC_mul_mv_ne12;
+
+    const uint64_t offset0 = first_row*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
+    const uint64_t offset1 =        r1*args.nb11 + (i12        )*args.nb12 + (i13        )*args.nb13;
+
+    device const block_q4_K * x = (device const block_q4_K *) (src0 + offset0);
+    device const float     * y  = (device const float      *) (src1 + offset1);
+    device const float     * h  = (device const float      *) (src2 + offset1);
+    device const float     * wn = (device const float      *) src3;
+
+    float yl[8];
+    float yh[8];
+
+    float sumf[nr0]={0.f};
+    float ssq = 0.f;
+
+    const int off = ix * QK_K + 64 * iq + 4 * ir;
+
+    device const float * y4 = y  + off;
+    device const float * h4 = h  + off;
+    device const float * w4 = wn + off;
+
+    uint16_t sc16[4];
+    thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
+
+    for (int ib = ix; ib < nb; ib += NG) {
+        float4 ya;
+        float4 yb;
+        float4 yc;
+        float4 yd;
+
+        mv_norm_y<NADD>(y4, h4, w4, ya, yb, yc, yd, ssq);
+
+        yl[0] = ya.x; yl[1] = ya.y; yl[2] = ya.z; yl[3] = ya.w;
+        yl[4] = yb.x; yl[5] = yb.y; yl[6] = yb.z; yl[7] = yb.w;
+        yh[0] = yc.x; yh[1] = yc.y; yh[2] = yc.z; yh[3] = yc.w;
+        yh[4] = yd.x; yh[5] = yd.y; yh[6] = yd.z; yh[7] = yd.w;
+
+        const float4 sumy = { ya.x + ya.y + ya.z + ya.w, yb.x + yb.y + yb.z + yb.w,
+                              yc.x + yc.y + yc.z + yc.w, yd.x + yd.y + yd.z + yd.w };
+
+        device const uint4 * hp = (device const uint4 *) &x[ib];
+        device const uint16_t * q1 = (device const uint16_t *)x[ib].qs + (16 * (int) iq + 2 * (int) ir);
+
+        const ushort shs = 16*iq;
+
+                for (short row = 0; row < nr0; row++) {
+            const uint4  hdr = *hp;
+            const half2  dm  = as_type<half2>(hdr.x);
+
+            const uint16_t s0 = (uint16_t) (hdr.y >> shs);
+            const uint16_t s2 = (uint16_t) (hdr.z >> shs);
+            const uint16_t s4 = (uint16_t) (hdr.w >> shs);
+
+            sc16[0] = s0 & kmask1;
+            sc16[1] = s2 & kmask1;
+            sc16[2] = ((s4 >> 0) & kmask2) | ((s0 & kmask3) >> 2);
+            sc16[3] = ((s4 >> 4) & kmask2) | ((s2 & kmask3) >> 2);
+
+            float4 acc1 = {0.f, 0.f, 0.f, 0.f};
+            float4 acc2 = {0.f, 0.f, 0.f, 0.f};
+
+            const ushort2 qv1 = *(device const ushort2 *)(q1);
+            const ushort2 qv2 = *(device const ushort2 *)(q1 + 32);
+
+            FOR_UNROLL (short i = 0; i < 2; ++i) {
+                acc1[0] += yl[2*i + 0] * (qv1[i] & 0x000F);
+                acc1[1] += yl[2*i + 1] * (qv1[i] & 0x0F00);
+                acc1[2] += yl[2*i + 4] * (qv1[i] & 0x00F0);
+                acc1[3] += yl[2*i + 5] * (qv1[i] & 0xF000);
+                acc2[0] += yh[2*i + 0] * (qv2[i] & 0x000F);
+                acc2[1] += yh[2*i + 1] * (qv2[i] & 0x0F00);
+                acc2[2] += yh[2*i + 4] * (qv2[i] & 0x00F0);
+                acc2[3] += yh[2*i + 5] * (qv2[i] & 0xF000);
+            }
+
+            sumf[row] += dm[0] * ((acc1[0] + 1.f/256.f * acc1[1]) * sc8[0] +
+                                  (acc1[2] + 1.f/256.f * acc1[3]) * sc8[1] * 1.f/16.f +
+                                  (acc2[0] + 1.f/256.f * acc2[1]) * sc8[4] +
+                                  (acc2[2] + 1.f/256.f * acc2[3]) * sc8[5] * 1.f/16.f) -
+                         dm[1] * (sumy[0] * sc8[2] + sumy[1] * sc8[3] + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
+
+            q1 += args.nb01/2;
+            hp  = (device const uint4 *) ((device const char *) hp + args.nb01);
+        }
+
+        y4 += NG * QK_K;
+        h4 += NG * QK_K;
+        w4 += NG * QK_K;
+    }
+
+    const float scale = mv_norm_scale(ssq, args.ne00, args.eps);
+
+    device float * dst_f32 = (device float *) dst + (int64_t)im*args.ne0*args.ne1 + (int64_t)r1*args.ne0;
+
+    for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
+        const float sum_all = simd_sum(sumf[row]);
+        if (tiisg == 0) {
+            dst_f32[first_row + row] = sum_all*scale;
+        }
+    }
+}
+
+// the MLP's gate and up: one pass over the activation feeds both weight streams, and the swiglu
+// takes the scale on both sums, because it is not linear in them
+template<short nr0, bool NADD>
+void kernel_mul_mv_q4_K_f32_L16_swiglu_norm_w64_impl(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        device const char * src2,
+        device const char * src3,
+        device const char * src4,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+
+    constexpr uint16_t kmask1 = 0x3f3f;
+    constexpr uint16_t kmask2 = 0x0f0f;
+    constexpr uint16_t kmask3 = 0xc0c0;
+
+    const short NG = FC_mul_mv_nw/16;
+    const short ix = tiisg/16;
+    const short it = tiisg%16;
+    const short iq = it/8;
+    const short ir = it%8;
+
+    const int nb = args.ne00/QK_K;
+
+    const int r0 = tgpig.x;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+
+    const int first_row = (r0 * NSG + sgitg) * nr0;
+
+    const uint i12 = im%FC_mul_mv_ne12;
+    const uint i13 = im/FC_mul_mv_ne12;
+
+    const uint64_t offset0 = first_row*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
+    const uint64_t offset1 =        r1*args.nb11 + (i12        )*args.nb12 + (i13        )*args.nb13;
+
+    device const block_q4_K * xg = (device const block_q4_K *) (src0 + offset0);
+    device const block_q4_K * xu = (device const block_q4_K *) (src2 + offset0);
+    device const float     * y  = (device const float      *) (src1 + offset1);
+    device const float     * h  = (device const float      *) (src3 + offset1);
+    device const float     * wn = (device const float      *) src4;
+
+    float yl[8];
+    float yh[8];
+
+    float sumg[nr0]={0.f};
+    float sumu[nr0]={0.f};
+    float ssq = 0.f;
+
+    const int off = ix * QK_K + 64 * iq + 4 * ir;
+
+    device const float * y4 = y  + off;
+    device const float * h4 = h  + off;
+    device const float * w4 = wn + off;
+
+    uint16_t sc16[4];
+    thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
+
+    for (int ib = ix; ib < nb; ib += NG) {
+        float4 ya;
+        float4 yb;
+        float4 yc;
+        float4 yd;
+
+        mv_norm_y<NADD>(y4, h4, w4, ya, yb, yc, yd, ssq);
+
+        yl[0] = ya.x; yl[1] = ya.y; yl[2] = ya.z; yl[3] = ya.w;
+        yl[4] = yb.x; yl[5] = yb.y; yl[6] = yb.z; yl[7] = yb.w;
+        yh[0] = yc.x; yh[1] = yc.y; yh[2] = yc.z; yh[3] = yc.w;
+        yh[4] = yd.x; yh[5] = yd.y; yh[6] = yd.z; yh[7] = yd.w;
+
+        const float4 sumy = { ya.x + ya.y + ya.z + ya.w, yb.x + yb.y + yb.z + yb.w,
+                              yc.x + yc.y + yc.z + yc.w, yd.x + yd.y + yd.z + yd.w };
+
+        device const uint4 * hpg = (device const uint4 *) &xg[ib];
+        device const uint4 * hpu = (device const uint4 *) &xu[ib];
+        device const uint16_t * qg = (device const uint16_t *)xg[ib].qs + (16 * (int) iq + 2 * (int) ir);
+        device const uint16_t * qu = (device const uint16_t *)xu[ib].qs + (16 * (int) iq + 2 * (int) ir);
+
+        const ushort shs = 16*iq;
+
+                for (short row = 0; row < nr0; row++) {
+            // gate
+            {
+                const uint4  hdr = *hpg;
+                const half2  dm  = as_type<half2>(hdr.x);
+
+                const uint16_t s0 = (uint16_t) (hdr.y >> shs);
+                const uint16_t s2 = (uint16_t) (hdr.z >> shs);
+                const uint16_t s4 = (uint16_t) (hdr.w >> shs);
+
+                sc16[0] = s0 & kmask1;
+                sc16[1] = s2 & kmask1;
+                sc16[2] = ((s4 >> 0) & kmask2) | ((s0 & kmask3) >> 2);
+                sc16[3] = ((s4 >> 4) & kmask2) | ((s2 & kmask3) >> 2);
+
+                float4 acc1 = {0.f, 0.f, 0.f, 0.f};
+                float4 acc2 = {0.f, 0.f, 0.f, 0.f};
+
+                const ushort2 qv1 = *(device const ushort2 *)(qg);
+                const ushort2 qv2 = *(device const ushort2 *)(qg + 32);
+
+                FOR_UNROLL (short i = 0; i < 2; ++i) {
+                    acc1[0] += yl[2*i + 0] * (qv1[i] & 0x000F);
+                    acc1[1] += yl[2*i + 1] * (qv1[i] & 0x0F00);
+                    acc1[2] += yl[2*i + 4] * (qv1[i] & 0x00F0);
+                    acc1[3] += yl[2*i + 5] * (qv1[i] & 0xF000);
+                    acc2[0] += yh[2*i + 0] * (qv2[i] & 0x000F);
+                    acc2[1] += yh[2*i + 1] * (qv2[i] & 0x0F00);
+                    acc2[2] += yh[2*i + 4] * (qv2[i] & 0x00F0);
+                    acc2[3] += yh[2*i + 5] * (qv2[i] & 0xF000);
+                }
+
+                sumg[row] += dm[0] * ((acc1[0] + 1.f/256.f * acc1[1]) * sc8[0] +
+                                      (acc1[2] + 1.f/256.f * acc1[3]) * sc8[1] * 1.f/16.f +
+                                      (acc2[0] + 1.f/256.f * acc2[1]) * sc8[4] +
+                                      (acc2[2] + 1.f/256.f * acc2[3]) * sc8[5] * 1.f/16.f) -
+                             dm[1] * (sumy[0] * sc8[2] + sumy[1] * sc8[3] + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
+            }
+
+            // up: the same arithmetic on the second stream, which is why the two blocks are a copy
+            {
+                const uint4  hdr = *hpu;
+                const half2  dm  = as_type<half2>(hdr.x);
+
+                const uint16_t s0 = (uint16_t) (hdr.y >> shs);
+                const uint16_t s2 = (uint16_t) (hdr.z >> shs);
+                const uint16_t s4 = (uint16_t) (hdr.w >> shs);
+
+                sc16[0] = s0 & kmask1;
+                sc16[1] = s2 & kmask1;
+                sc16[2] = ((s4 >> 0) & kmask2) | ((s0 & kmask3) >> 2);
+                sc16[3] = ((s4 >> 4) & kmask2) | ((s2 & kmask3) >> 2);
+
+                float4 acc1 = {0.f, 0.f, 0.f, 0.f};
+                float4 acc2 = {0.f, 0.f, 0.f, 0.f};
+
+                const ushort2 qv1 = *(device const ushort2 *)(qu);
+                const ushort2 qv2 = *(device const ushort2 *)(qu + 32);
+
+                FOR_UNROLL (short i = 0; i < 2; ++i) {
+                    acc1[0] += yl[2*i + 0] * (qv1[i] & 0x000F);
+                    acc1[1] += yl[2*i + 1] * (qv1[i] & 0x0F00);
+                    acc1[2] += yl[2*i + 4] * (qv1[i] & 0x00F0);
+                    acc1[3] += yl[2*i + 5] * (qv1[i] & 0xF000);
+                    acc2[0] += yh[2*i + 0] * (qv2[i] & 0x000F);
+                    acc2[1] += yh[2*i + 1] * (qv2[i] & 0x0F00);
+                    acc2[2] += yh[2*i + 4] * (qv2[i] & 0x00F0);
+                    acc2[3] += yh[2*i + 5] * (qv2[i] & 0xF000);
+                }
+
+                sumu[row] += dm[0] * ((acc1[0] + 1.f/256.f * acc1[1]) * sc8[0] +
+                                      (acc1[2] + 1.f/256.f * acc1[3]) * sc8[1] * 1.f/16.f +
+                                      (acc2[0] + 1.f/256.f * acc2[1]) * sc8[4] +
+                                      (acc2[2] + 1.f/256.f * acc2[3]) * sc8[5] * 1.f/16.f) -
+                             dm[1] * (sumy[0] * sc8[2] + sumy[1] * sc8[3] + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
+            }
+
+            qg += args.nb01/2;
+            qu += args.nb01/2;
+            hpg = (device const uint4 *) ((device const char *) hpg + args.nb01);
+            hpu = (device const uint4 *) ((device const char *) hpu + args.nb01);
+        }
+
+        y4 += NG * QK_K;
+        h4 += NG * QK_K;
+        w4 += NG * QK_K;
+    }
+
+    const float scale = mv_norm_scale(ssq, args.ne00, args.eps);
+
+    device float * dst_f32 = (device float *) dst + (int64_t)im*args.ne0*args.ne1 + (int64_t)r1*args.ne0;
+
+    for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
+        const float g = simd_sum(sumg[row])*scale;
+        const float u = simd_sum(sumu[row])*scale;
+        if (tiisg == 0) {
+            dst_f32[first_row + row] = (g / (1.0f + exp(-g))) * u;
+        }
+    }
+}
+
+
+// The gate and up projections of one token share one pass over the activations, and the swiglu
+// that would have been a third dispatch folds into the write. Both weight streams have the same
+// shape and strides, so one block index and one set of yl/yh/sumy feed the two of them.
+template<short nr0, typename args_t>
+void kernel_mul_mv_q4_K_f32_L16_swiglu_w64_impl(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        device const char * src2,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+
+    constexpr uint16_t kmask1 = 0x3f3f;
+    constexpr uint16_t kmask2 = 0x0f0f;
+    constexpr uint16_t kmask3 = 0xc0c0;
+
+    const short NG = FC_mul_mv_nw/16;
+    const short ix = tiisg/16;
+    const short it = tiisg%16;
+    const short iq = it/8;
+    const short ir = it%8;
+
+    const int nb = args.ne00/QK_K;
+
+    const int r0 = tgpig.x;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+
+    const int first_row = (r0 * NSG + sgitg) * nr0;
+
+    const uint i12 = im%FC_mul_mv_ne12;
+    const uint i13 = im/FC_mul_mv_ne12;
+
+    const uint64_t offset0 = first_row*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
+    const uint64_t offset1 =        r1*args.nb11 + (i12        )*args.nb12 + (i13        )*args.nb13;
+
+    device const block_q4_K * xg = (device const block_q4_K *) (src0 + offset0);
+    device const block_q4_K * xu = (device const block_q4_K *) (src2 + offset0);
+    device const float     * y  = (device const float      *) (src1 + offset1);
+
+    float yl[8];
+    float yh[8];
+
+    float sumg[nr0]={0.f};
+    float sumu[nr0]={0.f};
+
+    device const float * y4 = y + ix * QK_K + 64 * iq + 4 * ir;
+
+    uint16_t sc16[4];
+    thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
+
+    for (int ib = ix; ib < nb; ib += NG) {
+        const float4 ya = *(device const float4 *) (y4 +   0);
+        const float4 yb = *(device const float4 *) (y4 +  32);
+        const float4 yc = *(device const float4 *) (y4 + 128);
+        const float4 yd = *(device const float4 *) (y4 + 160);
+
+        yl[0] = ya.x; yl[1] = ya.y; yl[2] = ya.z; yl[3] = ya.w;
+        yl[4] = yb.x; yl[5] = yb.y; yl[6] = yb.z; yl[7] = yb.w;
+        yh[0] = yc.x; yh[1] = yc.y; yh[2] = yc.z; yh[3] = yc.w;
+        yh[4] = yd.x; yh[5] = yd.y; yh[6] = yd.z; yh[7] = yd.w;
+
+        const float4 sumy = { ya.x + ya.y + ya.z + ya.w, yb.x + yb.y + yb.z + yb.w,
+                              yc.x + yc.y + yc.z + yc.w, yd.x + yd.y + yd.z + yd.w };
+
+        device const uint4 * hpg = (device const uint4 *) &xg[ib];
+        device const uint4 * hpu = (device const uint4 *) &xu[ib];
+        device const uint16_t * qg = (device const uint16_t *)xg[ib].qs + (16 * (int) iq + 2 * (int) ir);
+        device const uint16_t * qu = (device const uint16_t *)xu[ib].qs + (16 * (int) iq + 2 * (int) ir);
+
+        const ushort shs = 16*iq;
+
+        for (short row = 0; row < nr0; row++) {
+            // gate
+            {
+                const uint4  hdr = *hpg;
+                const half2  dm  = as_type<half2>(hdr.x);
+
+                const uint16_t s0 = (uint16_t) (hdr.y >> shs);
+                const uint16_t s2 = (uint16_t) (hdr.z >> shs);
+                const uint16_t s4 = (uint16_t) (hdr.w >> shs);
+
+                sc16[0] = s0 & kmask1;
+                sc16[1] = s2 & kmask1;
+                sc16[2] = ((s4 >> 0) & kmask2) | ((s0 & kmask3) >> 2);
+                sc16[3] = ((s4 >> 4) & kmask2) | ((s2 & kmask3) >> 2);
+
+                float4 acc1 = {0.f, 0.f, 0.f, 0.f};
+                float4 acc2 = {0.f, 0.f, 0.f, 0.f};
+
+                const ushort2 qv1 = *(device const ushort2 *)(qg);
+                const ushort2 qv2 = *(device const ushort2 *)(qg + 32);
+
+                FOR_UNROLL (short i = 0; i < 2; ++i) {
+                    acc1[0] += yl[2*i + 0] * (qv1[i] & 0x000F);
+                    acc1[1] += yl[2*i + 1] * (qv1[i] & 0x0F00);
+                    acc1[2] += yl[2*i + 4] * (qv1[i] & 0x00F0);
+                    acc1[3] += yl[2*i + 5] * (qv1[i] & 0xF000);
+                    acc2[0] += yh[2*i + 0] * (qv2[i] & 0x000F);
+                    acc2[1] += yh[2*i + 1] * (qv2[i] & 0x0F00);
+                    acc2[2] += yh[2*i + 4] * (qv2[i] & 0x00F0);
+                    acc2[3] += yh[2*i + 5] * (qv2[i] & 0xF000);
+                }
+
+                sumg[row] += dm[0] * ((acc1[0] + 1.f/256.f * acc1[1]) * sc8[0] +
+                                      (acc1[2] + 1.f/256.f * acc1[3]) * sc8[1] * 1.f/16.f +
+                                      (acc2[0] + 1.f/256.f * acc2[1]) * sc8[4] +
+                                      (acc2[2] + 1.f/256.f * acc2[3]) * sc8[5] * 1.f/16.f) -
+                             dm[1] * (sumy[0] * sc8[2] + sumy[1] * sc8[3] + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
+            }
+
+            // up: the same arithmetic on the second stream, which is why the two blocks are a copy
+            {
+                const uint4  hdr = *hpu;
+                const half2  dm  = as_type<half2>(hdr.x);
+
+                const uint16_t s0 = (uint16_t) (hdr.y >> shs);
+                const uint16_t s2 = (uint16_t) (hdr.z >> shs);
+                const uint16_t s4 = (uint16_t) (hdr.w >> shs);
+
+                sc16[0] = s0 & kmask1;
+                sc16[1] = s2 & kmask1;
+                sc16[2] = ((s4 >> 0) & kmask2) | ((s0 & kmask3) >> 2);
+                sc16[3] = ((s4 >> 4) & kmask2) | ((s2 & kmask3) >> 2);
+
+                float4 acc1 = {0.f, 0.f, 0.f, 0.f};
+                float4 acc2 = {0.f, 0.f, 0.f, 0.f};
+
+                const ushort2 qv1 = *(device const ushort2 *)(qu);
+                const ushort2 qv2 = *(device const ushort2 *)(qu + 32);
+
+                FOR_UNROLL (short i = 0; i < 2; ++i) {
+                    acc1[0] += yl[2*i + 0] * (qv1[i] & 0x000F);
+                    acc1[1] += yl[2*i + 1] * (qv1[i] & 0x0F00);
+                    acc1[2] += yl[2*i + 4] * (qv1[i] & 0x00F0);
+                    acc1[3] += yl[2*i + 5] * (qv1[i] & 0xF000);
+                    acc2[0] += yh[2*i + 0] * (qv2[i] & 0x000F);
+                    acc2[1] += yh[2*i + 1] * (qv2[i] & 0x0F00);
+                    acc2[2] += yh[2*i + 4] * (qv2[i] & 0x00F0);
+                    acc2[3] += yh[2*i + 5] * (qv2[i] & 0xF000);
+                }
+
+                sumu[row] += dm[0] * ((acc1[0] + 1.f/256.f * acc1[1]) * sc8[0] +
+                                      (acc1[2] + 1.f/256.f * acc1[3]) * sc8[1] * 1.f/16.f +
+                                      (acc2[0] + 1.f/256.f * acc2[1]) * sc8[4] +
+                                      (acc2[2] + 1.f/256.f * acc2[3]) * sc8[5] * 1.f/16.f) -
+                             dm[1] * (sumy[0] * sc8[2] + sumy[1] * sc8[3] + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
+            }
+
+            qg += args.nb01/2;
+            qu += args.nb01/2;
+            hpg = (device const uint4 *) ((device const char *) hpg + args.nb01);
+            hpu = (device const uint4 *) ((device const char *) hpu + args.nb01);
+        }
+
+        y4 += NG * QK_K;
+    }
+
+    device float * dst_f32 = (device float *) dst + (int64_t)im*args.ne0*args.ne1 + (int64_t)r1*args.ne0;
+
+    for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
+        const float g = simd_sum(sumg[row]);
+        const float u = simd_sum(sumu[row]);
+        if (tiisg == 0) {
+            dst_f32[first_row + row] = (g / (1.0f + exp(-g))) * u;
         }
     }
 }
@@ -1038,6 +1590,12 @@ kernel void kernel_mul_mv_q4_K_f32_c##NC##_r##NR0##_w64( \
 }
 
 Q4_K_MV_NC_W64(8, 2)
+// three columns in one pass: without these the q4_K batch falls through to ext and
+// reads and unpacks each block once per column, which is 10.19's 1.83x against 1.16x
+Q4_K_MV_NC_W64(8, 3)
+// three columns in one pass: without these the q4_K batch falls through to ext and
+// reads and unpacks each block once per column, which is 10.19's 1.83x against 1.16x
+Q4_K_MV_NC_W64(4, 3)
 
 // q5_K with a few columns: the one-column 64-lane decomposition, each row's weights decoded
 // once per block and applied to every column
@@ -1195,6 +1753,12 @@ kernel void kernel_mul_mv_##T##_f32_c##NC##_r##NR0##_w64( \
 QK_MV_NC_W64(q5_K, 2, 2)
 QK_MV_NC_W64(q5_K, 4, 2)
 QK_MV_NC_W64(q5_K, 8, 2)
+// three columns sharing one unpack, for the MTP verify batch. Two and four rows per thread only:
+// the column count multiplies the accumulator set as the row count does, so eight rows x three
+// columns is the register cliff that the two-row ext variant already documents on 64 lanes.
+QK_MV_NC_W64(q5_K, 2, 3)
+QK_MV_NC_W64(q5_K, 4, 3)
+QK_MV_NC_W64(q5_K, 8, 3)
 
 [[host_name("kernel_mul_mv_q4_K_f32_w64")]]
 kernel void kernel_mul_mv_q4_K_f32_w64(
@@ -1789,11 +2353,18 @@ void kernel_mul_mv_q6_K_f32_w64_impl(
 
         device const float * y = yy + i * QK_K + y_offset;
 
-        for (short l = 0; l < 4; ++l) {
-            yl[4*l + 0] = y[l +  0];
-            yl[4*l + 1] = y[l + 32];
-            yl[4*l + 2] = y[l + 64];
-            yl[4*l + 3] = y[l + 96];
+        // the sixteen activations per lane arrive as four aligned 16-byte reads rather
+        // than sixteen scalar ones: the shape ACO emits for the Vulkan q6_K shader's vec4
+        // reads (buffer_load_dwordx4), same traffic, a quarter of the memory instructions
+        {
+            const float4 vy0 = *(device const float4 *) (y +  0);
+            const float4 vy1 = *(device const float4 *) (y + 32);
+            const float4 vy2 = *(device const float4 *) (y + 64);
+            const float4 vy3 = *(device const float4 *) (y + 96);
+            yl[ 0] = vy0.x; yl[ 1] = vy1.x; yl[ 2] = vy2.x; yl[ 3] = vy3.x;
+            yl[ 4] = vy0.y; yl[ 5] = vy1.y; yl[ 6] = vy2.y; yl[ 7] = vy3.y;
+            yl[ 8] = vy0.z; yl[ 9] = vy1.z; yl[10] = vy2.z; yl[11] = vy3.z;
+            yl[12] = vy0.w; yl[13] = vy1.w; yl[14] = vy2.w; yl[15] = vy3.w;
         }
 
         for (short row = 0; row < nr0; ++row) {
@@ -7814,6 +8385,60 @@ kernel void kernel_mul_mv_q4_K_f32_L16r4_w64(
     kernel_mul_mv_q4_K_f32_L16_w64_impl<4, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
+[[host_name("kernel_mul_mv_q4_K_f32_L16r4_w64_swiglu")]]
+kernel void kernel_mul_mv_q4_K_f32_L16r4_w64_swiglu(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0, device const char * src1, device char * dst, device const char * src2,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q4_K_f32_L16_swiglu_w64_impl<4, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, src2, tgpig, tiisg, sgitg);
+}
+
+[[host_name("kernel_mul_mv_q4_K_f32_L16r4_w64_norm")]]
+kernel void kernel_mul_mv_q4_K_f32_L16r4_w64_norm(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0, device const char * src1, device char * dst,
+        device const char * src2, device const char * src3,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q4_K_f32_L16_norm_w64_impl<4, false>(args, src0, src1, dst, src2, src3, tgpig, tiisg, sgitg);
+}
+
+[[host_name("kernel_mul_mv_q4_K_f32_L16r4_w64_normadd")]]
+kernel void kernel_mul_mv_q4_K_f32_L16r4_w64_normadd(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0, device const char * src1, device char * dst,
+        device const char * src2, device const char * src3,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q4_K_f32_L16_norm_w64_impl<4, true>(args, src0, src1, dst, src2, src3, tgpig, tiisg, sgitg);
+}
+
+[[host_name("kernel_mul_mv_q4_K_f32_L16r4_w64_swiglu_norm")]]
+kernel void kernel_mul_mv_q4_K_f32_L16r4_w64_swiglu_norm(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0, device const char * src1, device char * dst,
+        device const char * src2, device const char * src3, device const char * src4,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q4_K_f32_L16_swiglu_norm_w64_impl<4, false>(args, src0, src1, dst, src2, src3, src4, tgpig, tiisg, sgitg);
+}
+
+[[host_name("kernel_mul_mv_q4_K_f32_L16r4_w64_swiglu_normadd")]]
+kernel void kernel_mul_mv_q4_K_f32_L16r4_w64_swiglu_normadd(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0, device const char * src1, device char * dst,
+        device const char * src2, device const char * src3, device const char * src4,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q4_K_f32_L16_swiglu_norm_w64_impl<4, true>(args, src0, src1, dst, src2, src3, src4, tgpig, tiisg, sgitg);
+}
+
 [[host_name("kernel_mul_mv_q4_K_f32_L16r8_w64")]]
 kernel void kernel_mul_mv_q4_K_f32_L16r8_w64(
         constant ggml_metal_kargs_mul_mv & args,
@@ -7823,6 +8448,62 @@ kernel void kernel_mul_mv_q4_K_f32_L16r8_w64(
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
     kernel_mul_mv_q4_K_f32_L16_w64_impl<8, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+}
+
+// the fused forms of the eight-row kernel: same bodies, nr0 = 8, so a wider group does not
+// have to give back the dispatches the fusion saved
+[[host_name("kernel_mul_mv_q4_K_f32_L16r8_w64_swiglu")]]
+kernel void kernel_mul_mv_q4_K_f32_L16r8_w64_swiglu(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0, device const char * src1, device char * dst, device const char * src2,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q4_K_f32_L16_swiglu_w64_impl<8, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, src2, tgpig, tiisg, sgitg);
+}
+
+[[host_name("kernel_mul_mv_q4_K_f32_L16r8_w64_norm")]]
+kernel void kernel_mul_mv_q4_K_f32_L16r8_w64_norm(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0, device const char * src1, device char * dst,
+        device const char * src2, device const char * src3,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q4_K_f32_L16_norm_w64_impl<8, false>(args, src0, src1, dst, src2, src3, tgpig, tiisg, sgitg);
+}
+
+[[host_name("kernel_mul_mv_q4_K_f32_L16r8_w64_normadd")]]
+kernel void kernel_mul_mv_q4_K_f32_L16r8_w64_normadd(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0, device const char * src1, device char * dst,
+        device const char * src2, device const char * src3,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q4_K_f32_L16_norm_w64_impl<8, true>(args, src0, src1, dst, src2, src3, tgpig, tiisg, sgitg);
+}
+
+[[host_name("kernel_mul_mv_q4_K_f32_L16r8_w64_swiglu_norm")]]
+kernel void kernel_mul_mv_q4_K_f32_L16r8_w64_swiglu_norm(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0, device const char * src1, device char * dst,
+        device const char * src2, device const char * src3, device const char * src4,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q4_K_f32_L16_swiglu_norm_w64_impl<8, false>(args, src0, src1, dst, src2, src3, src4, tgpig, tiisg, sgitg);
+}
+
+[[host_name("kernel_mul_mv_q4_K_f32_L16r8_w64_swiglu_normadd")]]
+kernel void kernel_mul_mv_q4_K_f32_L16r8_w64_swiglu_normadd(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0, device const char * src1, device char * dst,
+        device const char * src2, device const char * src3, device const char * src4,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q4_K_f32_L16_swiglu_norm_w64_impl<8, true>(args, src0, src1, dst, src2, src3, src4, tgpig, tiisg, sgitg);
 }
 
 [[host_name("kernel_mul_mv_q8_0_f32_L4r1_w64")]]
