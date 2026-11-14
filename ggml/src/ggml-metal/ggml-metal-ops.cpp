@@ -2075,6 +2075,30 @@ int ggml_metal_op_ssm_conv(ggml_metal_op_t ctx, int idx) {
 
     const ggml_metal_buffer_id bid_dst = ggml_metal_get_buffer_id(n_fuse > 1 ? ctx->node(idx + n_fuse - 1) : op);
 
+    // prefill by tiles of 64 channels x 32 tokens, both sides coalesced
+    const ggml_metal_device_props * props_ssm = ggml_metal_device_get_props(ctx->dev);
+    if (props_ssm->simd_width == 32 && !props_ssm->has_unified_memory && ne1 > 1 && ne10 <= 8 && nb00 == sizeof(float) && nb0 == sizeof(float) && TOSH_ENV("TOSH_SSM_CONV_TILED_DISABLE") == nullptr) {
+        char name[128];
+        snprintf(name, sizeof(name), "kernel_ssm_conv_f32_f32_tiled_nc=%d_silu=%d", (int) ne10, use_silu ? 1 : 0);
+        ggml_metal_pipeline_with_params pipeline = ggml_metal_library_get_pipeline(lib, name);
+        if (!pipeline.pipeline) {
+            ggml_metal_cv_t cv = ggml_metal_cv_init();
+            ggml_metal_cv_set_int16(cv, 1,              FC_SSM_CONV + 0);
+            ggml_metal_cv_set_bool (cv, use_silu,       FC_SSM_CONV + 1);
+            ggml_metal_cv_set_int32(cv, (int32_t) ne10, FC_SSM_CONV + 2);
+            pipeline = ggml_metal_library_compile_pipeline(lib, "kernel_ssm_conv_f32_f32_tiled", name, cv);
+            ggml_metal_cv_free(cv);
+        }
+        ggml_metal_encoder_set_pipeline(enc, pipeline);
+        ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+        ggml_metal_encoder_set_buffer(enc, bid_dst, 3);
+        ggml_metal_encoder_set_threadgroup_memory_size(enc, GGML_PAD(64*(32 + ne10 - 1)*sizeof(float), 16), 0);
+        ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + 63)/64, (ne1 + 31)/32, ne02, 256, 1, 1);
+        return n_fuse;
+    }
+
     // Use batched kernel for prefill (ne1 > 1) to reduce threadgroup dispatch overhead
     const bool use_batched = (ne1 > 1);
 

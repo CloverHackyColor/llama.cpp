@@ -601,3 +601,55 @@ kernel void kernel_ssm_scan_ssd_mma_f32(
         threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
     }
 }
+
+// prefill: a threadgroup takes 64 channels x 32 tokens; the input rows go through threadgroup memory so that both
+// the reads (along time) and the writes (along the channels) coalesce
+kernel void kernel_ssm_conv_f32_f32_tiled(
+        constant ggml_metal_kargs_ssm_conv & args,
+        device const  void * src0,
+        device const  void * src1,
+        device       float * dst,
+        threadgroup  float * sm [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]]) {
+    const int nc = FC_ssm_conv_nc;
+    const int r0 = tgpig.x*64;
+    const int t0 = tgpig.y*32;
+    const int i3 = tgpig.z;
+    const int W  = 32 + nc - 1;
+
+    for (int e = tiitg; e < 64*W; e += 256) {
+        const int r  = e / W;
+        const int j  = e % W;
+        const int ir = r0 + r;
+        const int it = t0 + j;
+        sm[e] = ir < args.ne01 && it < args.ne00 ?
+            ((device const float *) ((device const char *) src0 + ir*args.nb01 + i3*args.nb02))[it] : 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const int r  = tiitg & 63;
+    const int ir = r0 + r;
+    if (ir >= args.ne01) {
+        return;
+    }
+
+    float c[8];
+    device const float * cw = (device const float *) ((device const char *) src1 + ir*args.nb11);
+    FOR_UNROLL (short i = 0; i < 8; ++i) {
+        c[i] = i < nc ? cw[i] : 0.0f;
+    }
+
+    const int jb = (tiitg >> 6)*8;
+    FOR_UNROLL (short j = 0; j < 8; ++j) {
+        const int t = t0 + jb + j;
+        if (t >= args.ne1) {
+            break;
+        }
+        float s = 0.0f;
+        FOR_UNROLL (short i = 0; i < 8; ++i) {
+            s += i < nc ? sm[r*W + jb + j + i]*c[i] : 0.0f;
+        }
+        *(device float *) ((device char *) dst + ir*args.nb0 + t*args.nb1 + i3*args.nb2) = FC_ssm_conv_silu ? s/(1.0f + exp(-s)) : s;
+    }
+}
