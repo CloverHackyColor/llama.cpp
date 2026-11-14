@@ -2652,6 +2652,11 @@ static int ggml_metal_op_mul_mat_mv(ggml_metal_op_t ctx, int idx) {
     static const bool disabled = TOSH_ENV("TOSH_QKV_FUSION_DISABLE") != nullptr;
 
     const bool qvk_w64 = props_dev->simd_width == 64 && TOSH_ENV("TOSH_QVK_W64_DISABLE") == nullptr;
+
+        // the 64-lane twin carries the same decomposition as the standalone matvec, so the
+        // fusion keeps that win instead of trading it for the saved dispatches
+        pattern = qvk_w64 ? decltype(pattern){ "kernel_mul_mv_qvk_q4_0_q4_0_q4_0_f32_w64", 1, 4, 4, 4 }
+                          : decltype(pattern){ "kernel_mul_mv_qvk_q4_0_q4_0_q4_0_f32",     1, 4, 4, 4 };
     } else if (tq == GGML_TYPE_Q2_K && tv == GGML_TYPE_Q4_K && tk == GGML_TYPE_Q2_K) {
         const char * s = TOSH_ENV("TOSH_EXT_KQ_FLOOR");
         const char * s = TOSH_ENV("TOSH_EXT_MAX");
@@ -2694,6 +2699,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     // these should be efficient for BS [2, ~8]
     if (op->src[1]->type == GGML_TYPE_F32 && (ne00%128 == 0) &&
     static const bool ext_disabled = TOSH_ENV("TOSH_EXT_DISABLE") != nullptr;
+        ggml_metal_mv_nc2_rows(op->src[0]->type, props_dev->simd_width, ne11, ne01, ne00) == 0 &&
         op->src[1]->type == GGML_TYPE_F32 && (ne00%128 == 0) &&
         (
          (
@@ -2784,7 +2790,6 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
                 GGML_ABORT("unsupported ne11");
         };
 
-        auto pipeline = ggml_metal_library_get_pipeline_mul_mv_ext(lib, op, nsg, nxpsg, r1ptg);
         // 2 rows per thread: the activation chunk is loaded once and reused across them
         const bool nr0_2 = op->src[0]->type == GGML_TYPE_Q4_K ||
                            op->src[0]->type == GGML_TYPE_Q5_K ||
@@ -2810,7 +2815,28 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         const bool nr0_wide = nr0_min_rows > 0 && props_dev->simd_width == 32 &&
                               op->src[0]->type == GGML_TYPE_Q4_K && ne01 >= nr0_min_rows;
 
+        // on 64 lanes a q4_K group of four or more columns runs out of the two-row variant's
+        // registers and ends up as slow as one pass per column (measured 4.0x one column at four
+        // columns, 2.4x with four rows); two and three columns stay faster with two rows
+        const bool nr0_w64 = props_dev->simd_width == 64 && op->src[0]->type == GGML_TYPE_Q4_K && ne11 >= 4 &&
+                             TOSH_ENV("TOSH_EXT_NR0_W64_DISABLE") == nullptr;
+
+        const int16_t nr0   = nr0_2 ? (nr0_env ? nr0_env : ((nr0_wide || nr0_w64) ? 4 : 2)) : 1;
+
+
+        // the wave64 q6_K variant keeps four rows per simdgroup, so the row split does not apply
+        // keep the gate in sync with the pipeline picker in ggml_metal_library_get_pipeline_mul_mv_ext
         static const bool ext_w64_disable = TOSH_ENV("TOSH_EXT_W64_DISABLE") != nullptr;
+        const bool ext_w64_q6k = !ext_w64_disable &&
+                                 props_dev->simd_width == 64 && op->src[0]->type == GGML_TYPE_Q6_K;
+
+        // from six src1 rows the eight-column variant reads the weights once instead of twice
+        if (ext_w64_q6k && ne11 >= 6) {
+            r1ptg = 8;
+        }
+
+        const int16_t r0ptg = ext_w64_q6k ? (r1ptg == 8 ? 2 : 4)*nsg : nypsg*nsg*nr0; // num src0 rows per threadgroup
+
         auto pipeline = ggml_metal_library_get_pipeline_mul_mv_ext(lib, op, nsg, nxpsg, r1ptg, nr0);
 
         ggml_metal_kargs_mul_mv_ext args = {
