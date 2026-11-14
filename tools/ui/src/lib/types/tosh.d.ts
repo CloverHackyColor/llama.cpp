@@ -54,6 +54,8 @@ export interface ToshChunk {
 /** What an assistant message keeps of the agent's work. */
 export interface ToshMessageData {
 	steps?: ToshCall[];
+	/** What the agent is doing while it works, as it says it; gone once it answers. */
+	progress?: string;
 	sketches?: ToshSketch[];
 	mapRequest?: ToshMapRequest;
 	map?: { layers: ToshMapLayer[] };

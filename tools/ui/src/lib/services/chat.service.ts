@@ -485,6 +485,9 @@ export class ChatService {
 		let aggregatedToolCalls: ApiChatCompletionToolCall[] = [];
 		let lastTimings: ChatMessageTimings | undefined;
 		let streamFinished = false;
+		// an error the server sends inside the stream, after its 200: the message must say it, not end empty
+		let streamError: (Error & { contextInfo?: { n_prompt_tokens: number; n_ctx: number } }) | undefined;
+		let finishReason: string | undefined;
 		let modelEmitted = false;
 		let idEmitted = false;
 		let toolCallIndexOffset = 0;
@@ -632,6 +635,31 @@ export class ChatService {
 
 							try {
 								const parsed: ApiChatCompletionStreamChunk = JSON.parse(data);
+								const failure = (parsed as unknown as { error?: ApiErrorResponse['error'] }).error;
+
+								if (failure && typeof failure === 'object') {
+									streamError = new Error(ChatService.toldFailure(failure.message || 'Server error'));
+									streamError.name = 'ServerError';
+
+									if ('n_prompt_tokens' in failure && 'n_ctx' in failure) {
+										streamError.contextInfo = {
+											n_ctx: failure.n_ctx,
+											n_prompt_tokens: failure.n_prompt_tokens
+										};
+									}
+
+									// a draft shown before the error is no answer
+									if (drafted) {
+										drafted = false;
+										aggregatedContent = '';
+
+										if (!abortSignal?.aborted) onTosh?.({ event: { type: 'retract' } });
+									}
+
+									streamFinished = true;
+
+									continue;
+								}
 
 								// the Tosh agent's progress and metadata; a retract drops the text streamed so far
 								if (parsed.tosh && typeof parsed.tosh === 'object') {
@@ -657,6 +685,8 @@ export class ChatService {
 
 								const choice = parsed.choices?.[0];
 								const content = choice?.delta?.content;
+
+								if (choice?.finish_reason) finishReason = choice.finish_reason;
 								const reasoningContent = choice?.delta?.reasoning_content;
 								const toolCalls = choice?.delta?.tool_calls;
 								const timings = parsed.timings;
@@ -783,6 +813,30 @@ export class ChatService {
 
 				if (conversationId) {
 					ChatService.clearStreamState(conversationId);
+				}
+
+				if (streamError) {
+					// what arrived before the error stays, said to be incomplete
+					if (aggregatedContent.trim()) {
+						const note = '\n\n_The answer stopped with an error before it ended, so it is incomplete._';
+
+						aggregatedContent += note;
+
+						if (!abortSignal?.aborted) onChunk?.(note);
+					}
+
+					onError?.(streamError);
+
+					return;
+				}
+
+				// an answer cut at its token limit says so, unless the agent already did
+				if (finishReason === 'length' && aggregatedContent && !/incomplet[ae]\._\s*$/.test(aggregatedContent)) {
+					const note = '\n\n_The answer was cut at the limit of tokens per answer, so it is incomplete._';
+
+					aggregatedContent += note;
+
+					if (!abortSignal?.aborted) onChunk?.(note);
 				}
 
 				const finalToolCalls =
@@ -1626,6 +1680,13 @@ export class ChatService {
 		onTimingsCallback(timings, promptProgress);
 	}
 
+	/** The engine's own words for a GPU that failed say nothing to the user; an agent's text for it is kept. */
+	private static toldFailure(message: string): string {
+		return /^compute error|error state|kIOAccel|failed to process mtmd/i.test(message)
+			? 'The engine failed on the GPU while processing the request, so it did not finish. Send the message again once the server is back.'
+			: message;
+	}
+
 	/**
 	 * Parses error response and creates appropriate error with context information
 	 * @param response - HTTP response object
@@ -1637,7 +1698,7 @@ export class ChatService {
 		try {
 			const errorText = await response.text();
 			const errorData: ApiErrorResponse = JSON.parse(errorText);
-			const message = errorData.error?.message || 'Unknown server error';
+			const message = ChatService.toldFailure(errorData.error?.message || 'Unknown server error');
 			const error = new Error(message) as Error & {
 				contextInfo?: { n_prompt_tokens: number; n_ctx: number };
 			};

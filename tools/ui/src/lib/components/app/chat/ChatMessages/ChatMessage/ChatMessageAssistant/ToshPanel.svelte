@@ -87,6 +87,10 @@
 			</CollapsibleContentBlock>
 		{/if}
 
+		{#if tosh.progress}
+			<p class="animate-pulse text-xs text-muted-foreground">{tosh.progress}…</p>
+		{/if}
+
 		{#if tosh.sketches?.length}
 			<ToshSketches sketches={tosh.sketches} />
 		{/if}

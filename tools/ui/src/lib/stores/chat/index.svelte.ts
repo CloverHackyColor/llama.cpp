@@ -897,9 +897,12 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 
 			if (event?.type === 'tool_call' && event.call) {
 				tosh = { ...tosh, steps: [...(tosh.steps ?? []), event.call] };
+			} else if (event?.type === 'progress' && typeof event.label === 'string') {
+				tosh = { ...tosh, progress: event.label };
 			} else if (!event) {
 				tosh = {
 					...tosh,
+					progress: undefined,
 					...(chunk.sketches?.length ? { sketches: chunk.sketches } : {}),
 					...(chunk.map_request ? { mapRequest: chunk.map_request } : {})
 				};
@@ -1055,6 +1058,13 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 				}
 
 				console.error('Streaming error:', error);
+				if (tosh.progress) {
+					tosh = { ...tosh, progress: undefined };
+					conversationsStore.updateMessageAtIndex(
+						conversationsStore.findMessageIndex(currentMessageId),
+						{ tosh }
+					);
+				}
 				// keep whatever was streamed so far, the message stays in memory and in DB
 				await this.savePartialResponseIfNeeded(convId);
 				cleanupStreamingState();
