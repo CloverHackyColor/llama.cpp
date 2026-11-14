@@ -39,6 +39,8 @@ static constexpr double HOST_MARGIN_MIB  = 2048.0;
 // experimental bounded host cache: (VRAM arena + RAM cache) / bank below this streams every token
 static constexpr double BOUNDED_MIN_COVERAGE  = 1.0;
 static constexpr double BOUNDED_GOOD_COVERAGE = 1.25;
+// TOSH_AUTO_DISK_EXPERTS=1: below full coverage the experts no cache holds are read from the model file
+static constexpr double BOUNDED_DISK_MIN_COVERAGE = 0.5;
 // TOSH_AUTO_HOST_BANK=lean: RAM holds the experts the VRAM arena does not, plus this margin
 static constexpr double LEAN_COVERAGE         = 1.08;
 // reclaimable RAM lost between the snapshot and the commit that makes the plan stale
@@ -210,6 +212,11 @@ moe_info read_moe_info(const char * path, llama_lazy_mode lazy) {
 
 // the product switch plans host memory from the machine's state unless told otherwise
 static bool g_runtime_default = false;
+
+static bool disk_experts() {
+    const char * v = getenv("TOSH_AUTO_DISK_EXPERTS");
+    return v != nullptr && strcmp(v, "0") != 0;
+}
 
 bool host_policy_runtime() {
     const char * v = getenv("TOSH_AUTO_HOST_POLICY");
@@ -802,13 +809,14 @@ bool tosh_plan_apply(common_params & params, tosh_plan * out) {
                 c.free_mib    = p.vram_free_mib - c.private_mib;
                 c.kv_mib = pr.context; c.compute_mib = pr.compute;
                 c.need_vram_mib = base + slots + overhead + p.min_arena_mib + R;
+                const double cover = mi.bank_mib*BOUNDED_MIN_COVERAGE - c.arena_mib;
                 c.need_host_mib = !runtime || full_host_ok ? host_dmoe :
-                                  host_engine + staging_mib + std::max(mi.warm_floor_mib, mi.bank_mib*BOUNDED_MIN_COVERAGE - c.arena_mib);
-                // a bounded cache must still cover the bank together with the arena
+                                  host_engine + staging_mib + std::max(mi.warm_floor_mib, disk_experts() ? std::min(cover, bounded_warm) : cover);
+                // a bounded cache must still cover the bank together with the arena, unless the disk may serve the rest
                 std::string host_reason = dmoe_block;
                 if (!host_reason.empty() && bounded_warm > 0) {
                     const double cov = (c.arena_mib + bounded_warm)/mi.bank_mib;
-                    host_reason = cov >= BOUNDED_MIN_COVERAGE ? "" :
+                    host_reason = cov >= (disk_experts() ? BOUNDED_DISK_MIN_COVERAGE : BOUNDED_MIN_COVERAGE) ? "" :
                                   string_format("BOUNDED_HOST_COVERAGE_REJECTED: %.1f GiB RAM cache, coverage %.2f", bounded_warm/1024, cov);
                 }
                 c.valid  = pr.ok && host_reason.empty() && c.arena_mib >= p.min_arena_mib;
@@ -861,8 +869,9 @@ bool tosh_plan_apply(common_params & params, tosh_plan * out) {
         const double a = c512->arena_mib;
         tosh_plan_candidate * c1k = find("dmoe", kv, 1024);
         tosh_plan_candidate * c2k = find("dmoe", kv, 2048);
-        // what a larger ubatch takes from the arena is paid in decode misses, as a share of the bank
-        const double cost = 0.10*mi.bank_mib;
+        // what a larger ubatch takes from the arena is paid in decode misses: a tenth of the bank,
+        // and never more than a tenth of the arena itself, which is the hottest share of it
+        const double cost = std::min(0.10*mi.bank_mib, 0.10*a);
         if (high && c2k && c2k->valid && a - c2k->arena_mib <= cost) return c2k;
         if (p.n_ctx <= 32768 && c1k && c1k->valid && a - c1k->arena_mib <= cost) return c1k;
         return c512;
@@ -896,6 +905,9 @@ bool tosh_plan_apply(common_params & params, tosh_plan * out) {
         reserves.push_back(std::max(512.0, reserve_pref - mtp_mib - 256.0));
     }
     p.mtp_head_dropped = false;
+    // experts on the host lose more than the head gains: every reserve, the head's last, is
+    // tried for the GPU modes before any of them settles for whole layers on the host
+    for (size_t pass = 0; pass < 2 && sel == nullptr; ++pass)
     for (size_t ri = 0; ri < reserves.size(); ++ri) {
         const double R = reserves[ri];
         evaluate(R);
@@ -908,8 +920,8 @@ bool tosh_plan_apply(common_params & params, tosh_plan * out) {
         if (sel == nullptr && !no_dmoe && (force.empty() || force == "dmoe")) {
             tosh_plan_candidate * a = pick_ub(kvs[0]);
             tosh_plan_candidate * b = kvs.size() > 1 ? pick_ub(kvs[1]) : nullptr;
-            // the q8_0 cache is worth it when its savings buy a material share of the bank
-            if (a && b && a->arena_mib < 0.9*mi.bank_mib && b->arena_mib - a->arena_mib >= 0.10*mi.bank_mib) {
+            // while the bank does not fit, every MiB the q8_0 cache saves holds experts the CPU would compute
+            if (a && b && a->arena_mib < mi.bank_mib && b->arena_mib - a->arena_mib >= std::max(512.0, 0.08*a->arena_mib)) {
                 sel = b; p.reason = "q8_0 cache gives the expert arena a material share of the bank";
             } else if (a) {
                 sel = a; p.reason = "the requested context and the reserve fit; experts take what is left";
@@ -917,7 +929,7 @@ bool tosh_plan_apply(common_params & params, tosh_plan * out) {
                 sel = b; p.reason = "only a q8_0 cache leaves a useful expert arena";
             }
         }
-        if (sel == nullptr && (force.empty() || force == "legacy")) {
+        if (sel == nullptr && (pass == 1 || force == "legacy") && (force.empty() || force == "legacy")) {
             const tosh_plan_candidate * l16 = find("legacy_offload", kvs[0], 0);
             const tosh_plan_candidate * l8  = kvs.size() > 1 ? find("legacy_offload", kvs[1], 0) : nullptr;
             if (l16 && l16->valid) sel = l16; else if (l8 && l8->valid) sel = l8;
@@ -1022,8 +1034,10 @@ bool tosh_plan_apply(common_params & params, tosh_plan * out) {
     p.code = tosh_plan_mode_name(p.plan_mode);
     if (sel) p.kv_mib = sel->kv_mib;
     if (p.plan_mode == TOSH_PLAN_MODE_FULL_HOST_DMOE || p.plan_mode == TOSH_PLAN_MODE_BOUNDED_DMOE) {
-        p.coverage_state = p.coverage >= BOUNDED_GOOD_COVERAGE ? "GOOD" : p.coverage >= BOUNDED_MIN_COVERAGE ? "CONSTRAINED" : "REJECT";
+        p.coverage_state = p.coverage >= BOUNDED_GOOD_COVERAGE ? "GOOD" : p.coverage >= BOUNDED_MIN_COVERAGE ? "CONSTRAINED" :
+                           disk_experts() ? "DISK" : "REJECT";
         if (p.coverage_state == "CONSTRAINED") p.warnings.push_back("COVERAGE_CONSTRAINED");
+        if (p.coverage_state == "DISK") p.warnings.push_back("EXPERTS_FROM_DISK");
     }
     if (sel && sel->mode != "full_gpu" && p.projected_rss_mib == 0) p.projected_rss_mib = hi.self_rss_mib + p.host_required_mib;
     // the server keeps context checkpoints and a prompt cache in RAM; they take what the plan leaves,
