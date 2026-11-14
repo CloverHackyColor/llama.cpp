@@ -1,4 +1,10 @@
 #include "llama-context.h"
+#include "llama-tosh-dmoe.h"
+#ifdef TOSH_ENABLE_DYNAMIC_MOE
+#include "tosh-dmoe.h"
+#else
+static inline size_t tosh_dmoe_private_bytes(void) { return 0; }
+#endif
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -522,6 +528,24 @@ llama_context::llama_context(
 
         sched_reserve();
 
+        // an automatic expert arena takes what the card has left once this context is sized
+        if (llama_tosh_dmoe_budget_pending() || llama_tosh_dmoe_rebudget_possible()) {
+            size_t gpu_bytes = 0;
+            for (const auto & [buft, d] : memory_breakdown()) {
+                ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+                if (dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU && !ggml_backend_buft_is_host(buft)) {
+                    gpu_bytes += d.total();
+                }
+            }
+            // the breakdown files buffers by the type a tensor asked for; the backend knows what it holds
+            if (const size_t held = tosh_dmoe_private_bytes()) {
+                gpu_bytes = held;
+            }
+            llama_tosh_dmoe_budget(gpu_bytes);
+            sched_reserve();
+        }
+        llama_tosh_dmoe_context_opened();
+
         if (!cparams.flash_attn) {
             if (ggml_is_quantized(params.type_v)) {
                 throw std::runtime_error("quantized V cache was requested, but this requires Flash Attention");
@@ -541,6 +565,7 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    llama_tosh_dmoe_context_closed();
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 

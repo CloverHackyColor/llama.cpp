@@ -1,5 +1,9 @@
 #include "ggml-metal-ops.h"
 
+#ifdef TOSH_ENABLE_DYNAMIC_MOE
+#include "tosh-dmoe.h"
+#endif
+
 #include "ggml.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
@@ -10,10 +14,14 @@
 #include "ggml-metal-fusion.h"
 #include "ggml-metal-tuning.h"
 
+#include <mutex>
 #include <cassert>
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <cmath>
+#include <unordered_map>
 #include <unordered_set>
 #include <string>
 
@@ -33,6 +41,36 @@ static ggml_metal_buffer_id ggml_metal_get_buffer_id(const ggml_tensor * t) {
     return ggml_metal_buffer_get_id(ctx, t);
 }
 
+static ggml_metal_buffer_id ggml_metal_get_host_buffer_id(
+        ggml_metal_device_t dev, const ggml_tensor * t) {
+    ggml_backend_buffer_t buffer = t->view_src ? t->view_src->buffer : t->buffer;
+
+    // The canonical CPU buffer type intentionally has no device pointer in ggml. Detect the
+    // property we actually need instead: whether the storage is host-addressable.
+    if (!ggml_backend_buffer_is_host(buffer)) {
+        return ggml_metal_get_buffer_id(t);
+    }
+
+    // Wrap the whole CPU allocation once. The expert tensors are slices of this allocation;
+    // mapping them independently duplicates address ranges and eventually exhausts Metal's
+    // resource table on large models.
+    void * const base = ggml_backend_buffer_get_base(buffer);
+    const size_t size = ggml_backend_buffer_get_size(buffer);
+    const size_t off  = (const char *) t->data - (const char *) base;
+
+    size_t offs = 0;
+    void * metal = ggml_metal_device_wrap_host(dev, base, size, &offs);
+    if (metal == nullptr) {
+        // A driver can reject a single allocation larger than maxBufferLength. Keep a bounded
+        // compatibility fallback for smaller tensors; never mistake this for a VRAM budget.
+        metal = ggml_metal_device_wrap_host(dev, t->data, ggml_nbytes(t), &offs);
+        GGML_ASSERT(metal != nullptr && "failed to wrap the Dynamic MoE CPU bank for Metal");
+        return { metal, offs };
+    }
+
+    return { metal, offs + off };
+}
+
 struct ggml_metal_op {
     ggml_metal_op(
         ggml_metal_device_t dev,
@@ -46,6 +84,7 @@ struct ggml_metal_op {
         int  debug_graph) {
         this->dev             = dev;
         this->lib             = ggml_metal_device_get_library(dev);
+        this->cmd_buf         = cmd_buf;
         this->enc             = ggml_metal_encoder_init(cmd_buf, use_concurrency);
         this->mem_ranges      = ggml_mem_ranges_init(debug_graph);
         this->finfo           = finfo;
@@ -97,6 +136,13 @@ struct ggml_metal_op {
         assert(use_fusion());
         assert(i0 >= 0 && i0 < n_nodes());
 
+        if (i0 + n_ops > n_nodes()) {
+            return false;
+        }
+
+        return ggml_can_fuse_ext(gf, idxs.data() + i0, ops, n_ops);
+    }
+
     // consult the fusion table for the longest pattern starting at i0
     // returns the matching pattern (nullptr if no fusion) and sets *n_out to the number of nodes
     const ggml_metal_fusion * can_fuse(int i0, enum ggml_metal_fusion_mode mode, int * n_out) const {
@@ -119,6 +165,7 @@ struct ggml_metal_op {
 
     ggml_metal_device_t  dev;
     ggml_metal_library_t lib;
+    ggml_metal_cmd_buf_t cmd_buf;
     ggml_metal_encoder_t enc;
     ggml_mem_ranges_t    mem_ranges;
 
@@ -465,6 +512,20 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_mul_mat_id(ctx, idx);
             } break;
+#ifdef TOSH_ENABLE_DYNAMIC_MOE
+        case GGML_OP_TOSH_DMOE_PUBLISH:
+            {
+                n_fuse = ggml_metal_op_tosh_dmoe_publish(ctx, idx);
+            } break;
+        case GGML_OP_TOSH_DMOE_JOIN:
+            {
+                n_fuse = ggml_metal_op_tosh_dmoe_join(ctx, idx);
+            } break;
+        case GGML_OP_TOSH_DMOE_OBSERVE:
+            {
+                n_fuse = ggml_metal_op_tosh_dmoe_observe(ctx, idx);
+            } break;
+#endif
         case GGML_OP_GET_ROWS:
             {
                 n_fuse = ggml_metal_op_get_rows(ctx, idx);
@@ -3825,12 +3886,19 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
 
     const uint32_t r2 = 1;
     const uint32_t r3 = 1;
+    int32_t ne02_run = ne02;
+
     // escape hatch: revert wave64 MoE prefill to the mat-vec route
     const bool mm_id_manual_ok = props_dev->simd_width == 32 ||
         TOSH_ENV("TOSH_W64_MMID_PREFILL_DISABLE") == NULL;
 
+    const bool use_mm_id = ggml_metal_op_mul_mat_id_use_mm(op, props_dev->has_simdgroup_mm || (props_dev->use_mm_manual && mm_id_manual_ok));
 
-    if (ggml_metal_op_mul_mat_id_use_mm(op, props_dev->has_simdgroup_mm)) {
+    // the tile path maps ids without the -1 a mixed expert layer publishes
+    // (map0 matches ids as 16-bit expert numbers, so the -1 of a wide publish selects nothing)
+    GGML_ASSERT(!(use_mm_id && op->src[2]->op == GGML_OP_TOSH_DMOE_PUBLISH && ggml_get_op_params_i32(op->src[2], 1) == 0));
+
+    if (use_mm_id) {
         // some Metal matrix data types require aligned pointers
         // ref: https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf (Table 2.5)
         //switch (op->src[0]->type) {
@@ -3882,7 +3950,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
 
         {
             ggml_metal_kargs_mul_mm_id_map0 args = {
-                ne02,
+                ne02_run,
                 ne10,
                 ne11, // n_expert_used (bcast)
                 nb11,
@@ -3892,11 +3960,11 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
                 nb21,
             };
 
-            auto pipeline = ggml_metal_library_get_pipeline_mul_mm_id_map0(lib, ne02, ne20);
+            auto pipeline = ggml_metal_library_get_pipeline_mul_mm_id_map0(lib, ne02_run, ne20);
 
             const size_t smem = pipeline.smem;
 
-            GGML_ASSERT(ne02 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+            GGML_ASSERT(ne02_run <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
 
             GGML_ASSERT(smem <= props_dev->max_theadgroup_memory_size);
 
@@ -3908,7 +3976,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
 
             ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
-            ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, ne02, 1, 1);
+            ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, ne02_run, 1, 1);
         }
 
         ggml_metal_op_concurrency_reset(ctx);
@@ -3930,7 +3998,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
 
             ggml_metal_kargs_mul_mm_id args = {
                 /*.ne00  =*/ ne00,
-                /*.ne02  =*/ ne02,
+                /*.ne02  =*/ ne02_run,
                 /*.nb01  =*/ nb01,
                 /*.nb02  =*/ nb02,
                 /*.nb03  =*/ nb03,
@@ -4001,7 +4069,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
             /*.nbi1 =*/ nb21,
             /*.ne00 =*/ ne00,
             /*.ne01 =*/ ne01,
-            /*.ne02 =*/ ne02,
+            /*.ne02 =*/ ne02_run,
             /*.nb00 =*/ nb00,
             /*.nb01 =*/ nb01,
             /*.nb02 =*/ nb02,
@@ -4031,6 +4099,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
 
         const int64_t _ne1 = 1;
         const int64_t ne123 = ne20*ne21;
+
         ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
         // wave64 decode: run the MoE mat-vec on a full 64-wide simdgroup (matches the
@@ -4077,21 +4146,305 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
         }
     }
 
+    return 1;
+}
 
-        ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
+#ifdef TOSH_ENABLE_DYNAMIC_MOE
+// TOSH_DMOE_MASK forces router positions to the host for the correctness matrix:
+// all | alt | half | random
+static int32_t tosh_dmoe_test_mask() {
+    static const int32_t mask = []() {
+        const char * s = getenv("TOSH_DMOE_MASK");
+        if (s == nullptr) return 0;
+        if (strcmp(s, "all")    == 0) return 1;
+        if (strcmp(s, "alt")    == 0) return 2;
+        if (strcmp(s, "half")   == 0) return 3;
+        if (strcmp(s, "random") == 0) return 4;
+        return 0;
+    }();
+    return mask;
+}
 
-        if (op->src[0]->type == GGML_TYPE_F32 ||
-            op->src[0]->type == GGML_TYPE_F16 ||
-            op->src[0]->type == GGML_TYPE_BF16 ||
-            op->src[0]->type == GGML_TYPE_Q8_0) {
-            ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nr0 - 1)/(nr0), (_ne1 + nr1 - 1)/nr1, ne123, 32, nsg, 1);
-        } else {
-            ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nr0*nsg - 1)/(nr0*nsg), (_ne1 + nr1 - 1)/nr1, ne123, 32, nsg, 1);
-        }
+struct tosh_dmoe_wide_args {
+    int32_t  n_embd;
+    int32_t  n_used;
+    int32_t  n_tokens;
+    int32_t  n_expert;
+    int32_t  rows;
+    int32_t  max_host;
+    int32_t  tail;
+    int32_t  pad;
+    uint32_t off_ids;
+    uint32_t off_rmp;
+    uint32_t off_map;
+    uint32_t off_out;
+    uint64_t nb_cur1;
+    uint64_t nb_ids1;
+};
+
+static tosh_dmoe_wide_args tosh_dmoe_wide_args_of(const ggml_tensor * ids, int n_embd, int n_expert, int rows, uint64_t nb_cur1) {
+    const int n_used = ids->ne[0], n_tok = ids->ne[1];
+    return {
+        n_embd, n_used, n_tok, n_expert, rows, TOSH_DMOE_WIDE_MAX_ROWS, 0, 0,
+        (uint32_t) tosh_dmoe_wide_off_ids(n_tok, n_embd, n_used),
+        (uint32_t) tosh_dmoe_wide_off_rmp(n_tok, n_embd, n_used),
+        (uint32_t) tosh_dmoe_wide_off_map(n_tok, n_embd, n_used),
+        (uint32_t) tosh_dmoe_wide_off_out(n_tok, n_embd, n_used),
+        nb_cur1, ids->nb[1],
+    };
+}
+
+static int ggml_metal_op_tosh_dmoe_publish_wide(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    const ggml_tensor * cur = op->src[0];
+    const ggml_tensor * ids = op->src[1];
+    const ggml_tensor * res = op->src[2];
+
+    const int il       = ggml_get_op_params_i32(op, 0);
+    const int n_embd   = cur->ne[0];
+    const int n_used   = ids->ne[0];
+    const int n_tokens = ids->ne[1];
+    const int n_expert = res->ne[0];
+
+    GGML_ASSERT(il >= 0 && il < TOSH_DMOE_MAX_LAYERS);
+    GGML_ASSERT(n_tokens <= TOSH_DMOE_WIDE_MAX_TOKENS && n_embd % 4 == 0 && n_expert <= 1024);
+    GGML_ASSERT(ggml_is_contiguous(op));
+
+    void * ev = ggml_metal_device_dmoe_event(ctx->dev);
+    ggml_metal_buffer_id bid_stage = ggml_metal_device_dmoe_wide_stage(ctx->dev, tosh_dmoe_wide_bytes(n_embd, n_used));
+
+    uint64_t value;
+    memcpy(&value, &op->op_params[2], sizeof(value));
+
+    tosh_dmoe_wide_args args = tosh_dmoe_wide_args_of(ids, n_embd, n_expert, ggml_get_op_params_i32(op, 1), cur->nb[1]);
+    args.tail = ggml_get_op_params_i32(op, 5);
+    if (const int live = tosh_dmoe_rare_rows_live(); live > 0) {
+        args.rows = live;
     }
+
+    ggml_metal_buffer_id bid_res = ggml_metal_device_dmoe_tables(ctx->dev);
+    if (bid_res.metal != nullptr) {
+        bid_res.offs = ((size_t) ggml_get_op_params_i32(op, 4)*TOSH_DMOE_MAX_LAYERS + il)*res->ne[0]*sizeof(int32_t);
+    } else {
+        bid_res = ggml_metal_get_buffer_id(res);
+    }
+
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    auto p_act = ggml_metal_library_compile_pipeline(ctx->lib, "tosh_dmoe_publish_wide_act", "tosh_dmoe_publish_wide_act", nullptr);
+    ggml_metal_encoder_set_pipeline(enc, p_act);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(cur), 1);
+    ggml_metal_encoder_set_buffer  (enc, bid_stage, 2);
+    ggml_metal_encoder_dispatch_threadgroups(enc, n_tokens, 1, 1, 256, 1, 1);
+
+    auto p_ids = ggml_metal_library_compile_pipeline(ctx->lib, "tosh_dmoe_publish_wide_ids", "tosh_dmoe_publish_wide_ids", nullptr);
+    ggml_metal_encoder_set_pipeline(enc, p_ids);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(ids), 1);
+    ggml_metal_encoder_set_buffer  (enc, bid_res, 2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op), 3);
+    ggml_metal_encoder_set_buffer  (enc, bid_stage, 4);
+    ggml_metal_encoder_set_threadgroup_memory_size(enc, (size_t) (n_expert + 1)*sizeof(uint32_t), 0);
+    ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, 1024, 1, 1);
+
+    ggml_metal_encoder_event(enc, ctx->cmd_buf, ev, value, true);
+    ggml_metal_op_concurrency_reset(ctx);
 
     return 1;
 }
+
+static int ggml_metal_op_tosh_dmoe_join_wide(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    const ggml_tensor * gpu = op->src[0];
+    const ggml_tensor * ids = op->src[1];
+
+    const int n_embd   = gpu->ne[0];
+    const int n_used   = gpu->ne[1];
+    const int n_tokens = gpu->ne[2];
+
+    void * ev = ggml_metal_device_dmoe_event(ctx->dev);
+    ggml_metal_buffer_id bid_stage = ggml_metal_device_dmoe_wide_stage(ctx->dev, tosh_dmoe_wide_bytes(n_embd, n_used));
+
+    uint64_t value;
+    memcpy(&value, &ids->op_params[2], sizeof(value));
+
+    ggml_metal_encoder_event(ctx->enc, ctx->cmd_buf, ggml_metal_device_dmoe_reach_event(ctx->dev), value, true);
+    ggml_metal_encoder_event(ctx->enc, ctx->cmd_buf, ev, value + 1, false);
+    ggml_metal_op_concurrency_reset(ctx);
+
+    tosh_dmoe_wide_args args = tosh_dmoe_wide_args_of(ids, n_embd, ids->src[2]->ne[0], 0, 0);
+
+    auto pipeline = ggml_metal_library_compile_pipeline(ctx->lib, "tosh_dmoe_join_wide", "tosh_dmoe_join_wide", nullptr);
+
+    ggml_metal_encoder_t enc = ctx->enc;
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, bid_stage, 1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op), 2);
+    ggml_metal_encoder_dispatch_threadgroups(enc, n_used*n_tokens, 1, 1, 128, 1, 1);
+    ggml_metal_op_concurrency_reset(ctx);
+
+    return 1;
+}
+
+int ggml_metal_op_tosh_dmoe_publish(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    if (ggml_get_op_params_i32(op, 1) > 0) {
+        return ggml_metal_op_tosh_dmoe_publish_wide(ctx, idx);
+    }
+
+    const ggml_tensor * cur = op->src[0];
+    const ggml_tensor * ids = op->src[1];
+    const ggml_tensor * res = op->src[2];
+
+    const int il       = ggml_get_op_params_i32(op, 0);
+    const int n_embd   = cur->ne[0];
+    const int n_used   = ids->ne[0];
+    const int n_tokens = ids->ne[1];
+
+    GGML_ASSERT(il >= 0 && il < TOSH_DMOE_MAX_LAYERS);
+    GGML_ASSERT(n_tokens <= TOSH_DMOE_MAX_TOKENS && n_embd % 4 == 0 && n_used <= 256);
+    GGML_ASSERT(ggml_is_contiguous(op));
+
+    const size_t stride = tosh_dmoe_layer_stride(n_embd, n_used);
+
+    void * ev = ggml_metal_device_dmoe_event(ctx->dev);
+    ggml_metal_buffer_id bid_stage = ggml_metal_device_dmoe_stage(ctx->dev, stride);
+    bid_stage.offs = (size_t) il*stride;
+
+    uint64_t value;
+    memcpy(&value, &op->op_params[2], sizeof(value));
+
+    struct {
+        int32_t  n_embd;
+        int32_t  n_used;
+        uint32_t off_ids;
+        uint32_t off_slots;
+        uint64_t nb_cur1;
+        uint64_t nb_ids1;
+        int32_t  il;
+        int32_t  mask;
+    } args = {
+        n_embd,
+        n_used,
+        (uint32_t) tosh_dmoe_off_ids(n_embd, n_used),
+        (uint32_t) tosh_dmoe_off_slots(n_embd, n_used),
+        cur->nb[1],
+        ids->nb[1],
+        il,
+        tosh_dmoe_test_mask(),
+    };
+
+    auto pipeline = ggml_metal_library_compile_pipeline(ctx->lib, "tosh_dmoe_publish", "tosh_dmoe_publish", nullptr);
+
+    ggml_metal_encoder_t enc = ctx->enc;
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(cur), 1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(ids), 2);
+    // a dynamic cache reads the table version this graph was submitted with
+    ggml_metal_buffer_id bid_res = ggml_metal_device_dmoe_tables(ctx->dev);
+    if (bid_res.metal != nullptr) {
+        bid_res.offs = ((size_t) ggml_get_op_params_i32(op, 4)*TOSH_DMOE_MAX_LAYERS + il)*res->ne[0]*sizeof(int32_t);
+    } else {
+        bid_res = ggml_metal_get_buffer_id(res);
+    }
+    ggml_metal_encoder_set_buffer  (enc, bid_res, 3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),  4);
+    ggml_metal_encoder_set_buffer  (enc, bid_stage, 5);
+    ggml_metal_encoder_dispatch_threadgroups(enc, n_tokens, 1, 1, 256, 1, 1);
+
+    ggml_metal_encoder_event(enc, ctx->cmd_buf, ev, value, true);
+    ggml_metal_op_concurrency_reset(ctx);
+
+    return 1;
+}
+
+int ggml_metal_op_tosh_dmoe_join(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    if (ggml_get_op_params_i32(op, 1) == 1) {
+        return ggml_metal_op_tosh_dmoe_join_wide(ctx, idx);
+    }
+
+    const ggml_tensor * gpu   = op->src[0];
+    const ggml_tensor * slots = op->src[1];
+
+    const int il       = ggml_get_op_params_i32(op, 0);
+    const int n_embd   = gpu->ne[0];
+    const int n_used   = gpu->ne[1];
+    const int n_tokens = gpu->ne[2];
+
+    const size_t stride = tosh_dmoe_layer_stride(n_embd, n_used);
+
+    void * ev = ggml_metal_device_dmoe_event(ctx->dev);
+    ggml_metal_buffer_id bid_stage = ggml_metal_device_dmoe_stage(ctx->dev, stride);
+    bid_stage.offs = (size_t) il*stride;
+
+    uint64_t value;
+    memcpy(&value, &slots->op_params[2], sizeof(value));
+
+    ggml_metal_encoder_event(ctx->enc, ctx->cmd_buf, ev, value + 1, false);
+    ggml_metal_op_concurrency_reset(ctx);
+
+    struct {
+        int32_t  n_embd;
+        int32_t  n_used;
+        uint32_t off_out;
+    } args = {
+        n_embd,
+        n_used,
+        (uint32_t) tosh_dmoe_off_out(n_embd, n_used),
+    };
+
+    auto pipeline = ggml_metal_library_compile_pipeline(ctx->lib, "tosh_dmoe_join", "tosh_dmoe_join", nullptr);
+
+    ggml_metal_encoder_t enc = ctx->enc;
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(gpu),   1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(slots), 2);
+    ggml_metal_encoder_set_buffer  (enc, bid_stage, 3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),    4);
+    ggml_metal_encoder_dispatch_threadgroups(enc, n_used*n_tokens, 1, 1, 128, 1, 1);
+
+    return 1;
+}
+
+int ggml_metal_op_tosh_dmoe_observe(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+    const ggml_tensor * ids = op->src[0];
+
+    ggml_metal_buffer_id bid_ring = ggml_metal_device_dmoe_obs_ring(ctx->dev);
+    tosh_dmoe_obs_record * rec = tosh_dmoe_obs_reserve(ggml_get_op_params_i32(op, 0), (int) ids->ne[0], (int) ids->ne[1]);
+    if (bid_ring.metal == nullptr || rec == nullptr) {
+        return 1;
+    }
+    bid_ring.offs = rec->offset;
+
+    struct {
+        int32_t  n_used;
+        int32_t  n_tokens;
+        uint64_t nb1;
+    } args = { (int32_t) ids->ne[0], (int32_t) ids->ne[1], ids->nb[1] };
+
+    auto pipeline = ggml_metal_library_compile_pipeline(ctx->lib, "tosh_dmoe_observe", "tosh_dmoe_observe", nullptr);
+
+    ggml_metal_encoder_t enc = ctx->enc;
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(ids), 1);
+    ggml_metal_encoder_set_buffer  (enc, bid_ring, 2);
+    ggml_metal_encoder_dispatch_threadgroups(enc, args.n_tokens, 1, 1, 32, 1, 1);
+
+    return 1;
+}
+#endif
 
 int ggml_metal_op_add_id(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);

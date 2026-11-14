@@ -12,6 +12,16 @@
 #include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
+#ifdef TOSH_ENABLE_DYNAMIC_MOE
+#include "tosh-dmoe.h"
+#else
+static inline bool   tosh_dmoe_compact(void) { return false; }
+static inline float  tosh_dmoe_token_decay(void) { return 0.0f; }
+static inline void   tosh_dmoe_set_chunk_rows(const int32_t *, const float *, int) {}
+static inline void   tosh_dmoe_note_time(int, int64_t) {}
+static inline void   tosh_dmoe_timeline(int, int, double, double) {}
+static inline double tosh_dmoe_host_seconds(void) { return 0.0; }
+#endif
 
 #include <assert.h>
 #include <limits.h>
@@ -1915,6 +1925,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
+    std::vector<int32_t> chunk_ids;
+    std::vector<int32_t> chunk_rows;
+    std::vector<float>   chunk_tail;
+    ggml_tensor * chunk_rows_ids = nullptr;
 
     int prev_backend_id = -1;
 
@@ -1994,7 +2008,49 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         node->op == GGML_OP_MUL_MAT_ID && node->src[0] == input_cpy) {
                         const ggml_tensor * ids = node->src[2];
                         const int64_t n_expert = input->ne[2];
+                        const bool compact = tosh_dmoe_compact();
+                        if ((compact || ids->ne[0]*ids->ne[1] >= 2*n_expert) &&
                             ggml_backend_sched_prefetch_init(sched, split_backend, ggml_nbytes(input))) {
+                            if (compact) {
+                                // the chunk's routing decides which experts the upload carries
+                                ggml_tensor * ids_tensor = node->src[2];
+                                ggml_backend_t ids_backend = split_backend;
+                                for (int i = input_id + 1; i < split->n_inputs; i++) {
+                                    if (ids_tensor == tensor_copy(split->inputs[i], split_backend_id, sched->cur_copy)) {
+                                        ids_tensor = split->inputs[i];
+                                        ids_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[i]);
+                                        break;
+                                    }
+                                }
+                                if (ids_tensor != chunk_rows_ids) {
+                                    const int64_t t_wait = ggml_time_us();
+                                    const double tl_wait = tosh_dmoe_host_seconds();
+                                    chunk_ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
+                                    ggml_backend_tensor_get_async(ids_backend, ids_tensor, chunk_ids.data(), 0, ggml_nbytes(ids_tensor));
+                                    ggml_backend_synchronize(ids_backend);
+                                    const int64_t t_count = ggml_time_us();
+                                    tosh_dmoe_note_time(0, t_count - t_wait);
+                                    tosh_dmoe_timeline(0, -1, tl_wait, tosh_dmoe_host_seconds());
+                                    chunk_rows.assign(n_expert, 0);
+                                    chunk_tail.assign(n_expert, 0.0f);
+                                    const float decay = tosh_dmoe_token_decay();
+                                    float w = 1.0f;
+                                    for (int64_t i1 = ids_tensor->ne[1] - 1; i1 >= 0; i1--, w *= decay) {
+                                        for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; i0++) {
+                                            const int32_t id = chunk_ids[i1 * ids_tensor->nb[1]/sizeof(int32_t) + i0 * ids_tensor->nb[0]/sizeof(int32_t)];
+                                            if (id < 0) {
+                                                continue;   // a row the host computes
+                                            }
+                                            GGML_ASSERT(id < n_expert);
+                                            chunk_rows[id]++;
+                                            chunk_tail[id] += w;
+                                        }
+                                    }
+                                    chunk_rows_ids = ids_tensor;
+                                    tosh_dmoe_note_time(3, ggml_time_us() - t_count);
+                                }
+                                tosh_dmoe_set_chunk_rows(chunk_rows.data(), chunk_tail.data(), (int) n_expert);
+                            }
                             const int slot = sched->prefetch_cur;
                             sched->prefetch_cur = (sched->prefetch_cur + 1) % sched->prefetch_n_slots;
                             // wait for the previous user of this slot to finish computing
@@ -2009,13 +2065,22 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             prefetch_saved_data   = input_cpy->data;
                             input_cpy->buffer = sched->prefetch_slots[slot];
                             input_cpy->data   = ggml_backend_buffer_get_base(sched->prefetch_slots[slot]);
+                            const int64_t t_up = compact ? ggml_time_us() : 0;
+                            const double tl_up = compact ? tosh_dmoe_host_seconds() : 0.0;
                             ggml_backend_tensor_set_async(sched->prefetch_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+                            if (compact) {
+                                tosh_dmoe_set_chunk_rows(nullptr, nullptr, 0);
+                                tosh_dmoe_note_time(1, ggml_time_us() - t_up);
+                                tosh_dmoe_timeline(3, -1, tl_up, tosh_dmoe_host_seconds());
+                            }
                             ggml_backend_event_record(sched->prefetch_ready[slot], sched->prefetch_backend);
                             ggml_backend_event_wait(split_backend, sched->prefetch_ready[slot]);
                             split_prefetch_slot = slot;
                             continue;
                         }
                     }
+                }
+
                 // wait for the split backend to finish using the input before overwriting it
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
@@ -2066,6 +2131,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         for (int64_t i1 = 0; i1 < ids_tensor->ne[1]; i1++) {
                             for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; i0++) {
                                 int32_t id = ids[i1 * ids_tensor->nb[1]/sizeof(int32_t) + i0 * ids_tensor->nb[0]/sizeof(int32_t)];
+                                if (id < 0 && tosh_dmoe_compact()) {
+                                    continue;   // a row the host computes
+                                }
                                 GGML_ASSERT(id >= 0 && id < n_expert);
                                 ggml_bitset_set(used_ids.data(), id);
                             }
@@ -2090,8 +2158,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     };
 
                     int id = 0;
-                    while (!ggml_bitset_get(used_ids.data(), id)) {
+                    while (id < n_expert && !ggml_bitset_get(used_ids.data(), id)) {
                         id++;
+                    }
+                    if (id == n_expert) {
+                        continue;   // every row runs on the host
                     }
                     int32_t first_id = id;
                     int32_t last_id = first_id;

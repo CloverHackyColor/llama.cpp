@@ -5,6 +5,8 @@
 
 #include "ggml-metal-device.h"
 #include "ggml-metal-fusion.h"
+
+#ifdef TOSH_ENABLE_DYNAMIC_MOE
 #include "ggml-metal-context.h"
 #include "ggml-metal-ops.h"
 #include "ggml-metal-tuning.h"
@@ -845,6 +847,10 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
 static bool ggml_backend_metal_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
 
+    // mixed execution takes every batch above its host path: the CPU backend would compute the
+    // resident experts too, and a bounded host cache leaves it no bytes. The device read the
+    // threshold before a plan could lower it
+    if (tosh_dmoe_enabled() || tosh_hostcache_on()) min_batch = std::min(min_batch, TOSH_DMOE_MAX_TOKENS + 1);
     return (op->op == GGML_OP_MUL_MAT ||
             op->op == GGML_OP_MUL_MAT_ID) &&
             get_op_batch_size(op) >= ggml_metal_device_get_props(ctx_dev)->op_offload_min_batch_size;
@@ -1007,6 +1013,8 @@ static void ggml_backend_metal_fusion_set_enabled(ggml_backend_fusion_t finfo, b
     ggml_metal_fusion_info_set_enabled((struct ggml_metal_fusion_info *) finfo, enabled);
 }
 
+// the shared buffer type is host-resident on a discrete GPU when the expert cache asks for
+// it, so offer it by name and let -ot place the expert banks there
 // Tensor split reduces after every subgraph. The meta backend's generic path spends a full
 // graph submission per device on each of those adds; here the copy and the add are issued
 // directly, which is what the CUDA and SYCL backends already do for themselves.

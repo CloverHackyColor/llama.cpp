@@ -1156,9 +1156,13 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "TOSH_DMOE_PUBLISH",
+    "TOSH_DMOE_JOIN",
+    "TOSH_DMOE_OBSERVE",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1272,9 +1276,13 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "dmoe_publish(x)",
+    "dmoe_join(x)",
+    "dmoe_observe(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3458,6 +3466,101 @@ void ggml_mul_mat_set_hint(
 
     c ~= as[:,:,i] @ b[:,i%r,t], i = ids[e,t] for all e,t in ids
 */
+struct ggml_tensor * ggml_tosh_dmoe_publish(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * cur,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * residency,
+        int                   il) {
+    GGML_ASSERT(cur->type == GGML_TYPE_F32 && ggml_is_contiguous_rows(cur));
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 && residency->type == GGML_TYPE_I32);
+    GGML_ASSERT(ids->ne[1] == cur->ne[1]);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, ids->ne[0], ids->ne[1]);
+
+    ggml_set_op_params_i32(result, 0, il);
+
+    result->op     = GGML_OP_TOSH_DMOE_PUBLISH;
+    result->src[0] = cur;
+    result->src[1] = ids;
+    result->src[2] = residency;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_tosh_dmoe_join(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * gpu,
+        struct ggml_tensor  * slots,
+        int                   il) {
+    GGML_ASSERT(gpu->type == GGML_TYPE_F32 && ggml_is_contiguous(gpu));
+    GGML_ASSERT(slots->op == GGML_OP_TOSH_DMOE_PUBLISH);
+    GGML_ASSERT(gpu->ne[1] == slots->ne[0] && gpu->ne[2] == slots->ne[1]);
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 3, gpu->ne);
+
+    ggml_set_op_params_i32(result, 0, il);
+
+    result->op     = GGML_OP_TOSH_DMOE_JOIN;
+    result->src[0] = gpu;
+    result->src[1] = slots;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_tosh_dmoe_publish_wide(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * cur,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * residency,
+        int                   il,
+        int                   rows,
+        int                   tail) {
+    GGML_ASSERT(rows > 0 && tail >= 0);
+    struct ggml_tensor * result = ggml_tosh_dmoe_publish(ctx, cur, ids, residency, il);
+    ggml_set_op_params_i32(result, 1, rows);
+    ggml_set_op_params_i32(result, 5, tail);
+    return result;
+}
+
+struct ggml_tensor * ggml_tosh_dmoe_join_wide(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * gpu,
+        struct ggml_tensor  * wide_ids,
+        int                   il) {
+    GGML_ASSERT(gpu->type == GGML_TYPE_F32 && ggml_is_contiguous(gpu));
+    GGML_ASSERT(wide_ids->op == GGML_OP_TOSH_DMOE_PUBLISH && ggml_get_op_params_i32(wide_ids, 1) > 0);
+    GGML_ASSERT(gpu->ne[1] == wide_ids->ne[0] && gpu->ne[2] == wide_ids->ne[1]);
+
+    // in place: the host rows overwrite the positions the GPU skipped
+    struct ggml_tensor * result = ggml_view_tensor(ctx, gpu);
+
+    ggml_set_op_params_i32(result, 0, il);
+    ggml_set_op_params_i32(result, 1, 1);
+
+    result->op     = GGML_OP_TOSH_DMOE_JOIN;
+    result->src[0] = gpu;
+    result->src[1] = wide_ids;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_tosh_dmoe_observe(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * ids,
+        int                   il) {
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+
+    ggml_set_op_params_i32(result, 0, il);
+
+    result->op     = GGML_OP_TOSH_DMOE_OBSERVE;
+    result->src[0] = ids;
+
+    return result;
+}
+
 struct ggml_tensor * ggml_mul_mat_id(
         struct ggml_context * ctx,
         struct ggml_tensor  * as,

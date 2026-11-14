@@ -8,6 +8,7 @@
 #include "../src/llama-ext.h"
 
 #include "fit.h"
+#include "tosh-plan.h"
 #include "log.h"
 #include "llama.h"
 #include "sampling.h"
@@ -1229,6 +1230,7 @@ common_decision_type common_get_decision_type(const std::string & fname) {
 
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
+
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 

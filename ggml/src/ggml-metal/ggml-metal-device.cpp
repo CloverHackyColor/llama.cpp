@@ -2376,7 +2376,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
 
     const bool align = props_id->needs_aligned_loads;
 
+    // only the ids a mixed expert layer publishes can be -1
+    const bool id_skip = op->src[2] != nullptr && op->src[2]->op == GGML_OP_TOSH_DMOE_PUBLISH;
+
     snprintf(base, 256, "kernel_mul_mv_id_%s_%s%s%s", ggml_metal_tname_pair(lib, tsrc0, tsrc1), ggml_type_name(tsrc1), suffix, id_w64 ? "_w64" : "");
+    snprintf(name, 256, "%s_nsg=%d_nw=%d_a4=%d_a8=%d_al=%d_sk=%d", base, nsg, nw, row4, row8, align, id_skip);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
@@ -2390,6 +2394,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
         ggml_metal_cv_set_bool (cv, row4, FC_MUL_MV + 6);
         ggml_metal_cv_set_bool (cv, row8, FC_MUL_MV + 7);
         ggml_metal_cv_set_bool (cv, align, FC_MUL_MV + 8);
+        ggml_metal_cv_set_bool (cv, id_skip, FC_MUL_MV + 9);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 

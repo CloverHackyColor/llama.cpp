@@ -1,7 +1,11 @@
 #include "llama-graph.h"
+#ifdef TOSH_ENABLE_DYNAMIC_MOE
+#include "tosh-dmoe.h"
+#endif
 
 #include "llama-impl.h"
 #include "llama-model.h"
+#include "llama-tosh-dmoe.h"
 #include "llama-batch.h"
 #include "llama-cparams.h"
 #include "llama-sampler.h"
@@ -2237,6 +2241,58 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * weights = ggml_get_rows(ctx0, probs, selected_experts); // [1, n_expert_used, n_tokens]
     cb(weights, "ffn_moe_weights", il);
 
+    ggml_tensor * expert_ids = selected_experts;
+
+    // mixed execution: resident experts run from the VRAM arena, the rest on the host
+    const llama_tosh_dmoe_layer * dmoe = llama_tosh_dmoe_layer_of(gate_exps ? gate_exps : gate_up_exps);
+#ifdef TOSH_ENABLE_DYNAMIC_MOE
+    const llama_tosh_dmoe_layer * dmoe_bank = dmoe;
+    bool dmoe_shape_ok = false;
+    if (dmoe != nullptr) {
+        const bool plain_swiglu = type_op == LLM_FFN_SILU && (il < 0 || hparams.swiglu_clamp_exp[il] <= 1e-6f);
+        const bool oai  = type_op == LLM_FFN_SWIGLU_OAI_MOE;
+        const bool gelu = type_op == LLM_FFN_GELU && (gate_exps || gate_up_exps);
+        const bool banks_ok = gate_up_exps ? (!up_exps && !gate_up_exps_b) : (up_exps && gate_exps);
+        dmoe_shape_ok = banks_ok && down_exps && !up_exps_s && !gate_exps_s && !weight_before_ffn &&
+            (plain_swiglu || oai || gelu) &&
+            llama_tosh_dmoe_accept(dmoe, oai ? 1 : gelu ? 2 : 0, oai ? 1.702f : 0.0f, oai ? 7.0f : 0.0f,
+                                   gate_exps_b != nullptr, up_exps_b != nullptr);
+        if (!dmoe_shape_ok || n_tokens > TOSH_DMOE_MAX_TOKENS) {
+            dmoe = nullptr;
+        }
+    }
+    // a batch too wide for mixed execution still tells the residency policy what it routed
+    if (dmoe_bank != nullptr && dmoe == nullptr && n_tokens > TOSH_DMOE_MAX_TOKENS && llama_tosh_dmoe_observe_prefill()) {
+        ggml_build_forward_expand(gf, ggml_tosh_dmoe_observe(ctx0, selected_experts, il));
+    }
+    // and on a GPU-sized batch its rarely routed, non-resident experts run on the host
+    ggml_tensor * dmoe_wide = nullptr;
+    if (dmoe_bank != nullptr && dmoe == nullptr && dmoe_shape_ok && llama_tosh_dmoe_rare_rows() > 0 &&
+        n_tokens >= llama_tosh_dmoe_wide_min_tokens() && n_tokens <= TOSH_DMOE_WIDE_MAX_TOKENS) {
+        ggml_tensor * cur_2d = ggml_is_contiguous(cur) ? cur : ggml_cont(ctx0, cur);
+        dmoe_wide = ggml_tosh_dmoe_publish_wide(ctx0, cur_2d, selected_experts, dmoe_bank->residency, il,
+                llama_tosh_dmoe_rare_rows(), llama_tosh_dmoe_rare_tail());
+        cb(dmoe_wide, "ffn_moe_dmoe_wide", il);
+        expert_ids = dmoe_wide;
+    }
+    ggml_tensor * dmoe_slots = nullptr;
+    if (dmoe != nullptr) {
+        ggml_tensor * cur_2d = ggml_is_contiguous(cur) ? cur : ggml_cont(ctx0, cur);
+        dmoe_slots = ggml_tosh_dmoe_publish(ctx0, cur_2d, selected_experts, dmoe->residency, il);
+        cb(dmoe_slots, "ffn_moe_dmoe_slots", il);
+        expert_ids = dmoe_slots;
+        if (gate_up_exps) {
+            gate_up_exps = dmoe->arena_gate;
+        } else {
+            up_exps   = dmoe->arena_up;
+            gate_exps = dmoe->arena_gate;
+        }
+        down_exps  = dmoe->arena_down;
+    }
+#else
+    GGML_UNUSED(dmoe);
+#endif
+
 
     if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT) {
         weights = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);
@@ -2282,7 +2338,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     if (gate_up_exps) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
-        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_s); // [n_ff*2, n_expert_used, n_tokens]
+        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, expert_ids, up_exps_s); // [n_ff*2, n_expert_used, n_tokens]
         cb(gate_up, "ffn_moe_gate_up", il);
 
         if (up_exps_s) {
@@ -2301,7 +2357,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(up, "ffn_moe_up", il);
     } else {
         // separate gate and up path
-        up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s); // [n_ff, n_expert_used, n_tokens]
+        up = build_lora_mm_id(up_exps, cur, expert_ids, up_exps_s); // [n_ff, n_expert_used, n_tokens]
         cb(up, "ffn_moe_up", il);
 
         if (up_exps_s) {
@@ -2314,7 +2370,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         if (gate_exps) {
-            cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
+            cur = build_lora_mm_id(gate_exps, cur, expert_ids, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
             cb(cur, "ffn_moe_gate", il);
         } else {
             cur = up;
@@ -2415,12 +2471,37 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             GGML_ABORT("fatal error");
     }
 
-    experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
+    // with mixed execution the ids are slots, and host rows join after the matmul: scale by expert later
+    ggml_tensor * down_s_late = nullptr;
+#ifdef TOSH_ENABLE_DYNAMIC_MOE
+    if (down_exps_s && (dmoe_slots || dmoe_wide)) {
+        down_s_late = down_exps_s;
+        down_exps_s = nullptr;
+    }
+#endif
+    experts = build_lora_mm_id(down_exps, cur, expert_ids, down_exps_s); // [n_embd, n_expert_used, n_tokens]
     if (arch == LLM_ARCH_MISTRAL4) {
         // src1 can exceed F16 range
         ggml_prec_set_src(experts, GGML_PREC_F32, 1);
     }
     cb(experts, "ffn_moe_down", il);
+
+#ifdef TOSH_ENABLE_DYNAMIC_MOE
+    if (dmoe_slots != nullptr) {
+        experts = ggml_tosh_dmoe_join(ctx0, experts, dmoe_slots, il);
+        cb(experts, "ffn_moe_dmoe_join", il);
+    }
+    if (dmoe_wide != nullptr) {
+        experts = ggml_tosh_dmoe_join_wide(ctx0, experts, dmoe_wide, il);
+        cb(experts, "ffn_moe_dmoe_join_wide", il);
+    }
+#endif
+    if (down_s_late) {
+        ggml_tensor * s = ggml_reshape_3d(ctx0, down_s_late, 1, down_s_late->ne[0], 1);
+        s = ggml_repeat_4d(ctx0, s, 1, down_s_late->ne[0], n_tokens, 1);
+        s = ggml_get_rows(ctx0, s, selected_experts);
+        experts = ggml_mul(ctx0, experts, s);
+    }
 
     if (down_exps_s) {
         cb(experts, "ffn_moe_down_scaled", il);

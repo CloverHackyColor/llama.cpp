@@ -8,6 +8,9 @@
 #import "ggml-backend-impl.h"
 #import "ggml-metal-impl.h"
 
+#ifdef TOSH_ENABLE_DYNAMIC_MOE
+#import "tosh-dmoe.h"
+#endif
 #import "ggml-metal-common.h"
 
 #include <Foundation/Foundation.h>
@@ -16,6 +19,37 @@
 
 #include <stdatomic.h>
 #include <unistd.h>
+
+#import <IOKit/IOKitLib.h>
+#import <CommonCrypto/CommonDigest.h>
+#import <CoreFoundation/CoreFoundation.h>
+
+// The driver's own VRAM counters for this device: free, and in use by every process. Metal only
+// reports this process's allocations and a working-set ceiling that host mappings also fill.
+static bool ggml_metal_vram_stats(id<MTLDevice> d, int64_t * vfree, int64_t * vused) {
+    io_service_t e = IOServiceGetMatchingService(MACH_PORT_NULL, IORegistryEntryIDMatching(d.registryID));
+    if (e == 0) {
+        return false;
+    }
+    CFDictionaryRef ps = (CFDictionaryRef) IORegistryEntryCreateCFProperty(e, CFSTR("PerformanceStatistics"), kCFAllocatorDefault, 0);
+    IOObjectRelease(e);
+    if (ps == NULL) {
+        return false;
+    }
+    CFNumberRef f = (CFNumberRef) CFDictionaryGetValue(ps, CFSTR("vramFreeBytes"));
+    CFNumberRef u = (CFNumberRef) CFDictionaryGetValue(ps, CFSTR("inUseVidMemoryBytes"));
+    const bool ok = f != NULL && u != NULL &&
+        CFNumberGetValue(f, kCFNumberSInt64Type, vfree) && CFNumberGetValue(u, kCFNumberSInt64Type, vused);
+    CFRelease(ps);
+    return ok;
+}
+
+#ifdef TOSH_ENABLE_DYNAMIC_MOE
+static id<MTLDevice> g_vram_dev = nil;
+static bool ggml_metal_vram_query(int64_t * vfree, int64_t * vused) {
+    return g_vram_dev != nil && ggml_metal_vram_stats(g_vram_dev, vfree, vused);
+}
+#endif
 
 
 #ifndef TARGET_OS_VISION
@@ -116,6 +150,7 @@ int ggml_metal_pipeline_max_theads_per_threadgroup(struct ggml_metal_pipeline_wi
 //   X(suffix, name): name is both the kernels/<name>.metal basename and the
 //   ggml_metallib_<name>_{start,end} embed-symbol stem.
 #define GGML_METAL_LIBS \
+    X(FA,              fa)             \
     X(FA_AUX,          fa_aux)         \
     X(FA_F16,          fa_f16)         \
     X(FA_F32,          fa_f32)         \
@@ -319,6 +354,76 @@ static NSString * ggml_metal_library_flatten_source(NSString * path_source, NSEr
     return src;
 }
 
+// Precompiled libraries next to the binary, instead of spending tens of seconds compiling the
+// sources on every launch. They are built without the tensor API, so M5-class GPUs fall through.
+// kernels/fingerprint lists "<kind> <sha256 of its source>"; a library built from other sources
+// than the ones embedded in this binary is stale and is not loaded
+static bool ggml_metal_library_precompiled_matches(NSString * dir, NSString * const * want) {
+    NSString * text = [NSString stringWithContentsOfFile:[dir stringByAppendingPathComponent:@"fingerprint"]
+                                                encoding:NSUTF8StringEncoding error:nil];
+    if (text == nil) {
+        GGML_LOG_WARN("%s: precompiled kernels carry no fingerprint, compiling the embedded sources\n", __func__);
+        return false;
+    }
+    NSMutableDictionary<NSString *, NSString *> * have = [NSMutableDictionary dictionary];
+    for (NSString * line in [text componentsSeparatedByString:@"\n"]) {
+        NSArray<NSString *> * f = [line componentsSeparatedByString:@" "];
+        if (f.count == 2) have[f[0]] = f[1];
+    }
+    for (int kind = 0; kind < GGML_METAL_LIB_COUNT; ++kind) {
+        NSString * name = [NSString stringWithUTF8String:k_lib_names[kind]];
+        if (![have[name] isEqualToString:want[kind]]) {
+            GGML_LOG_WARN("%s: precompiled '%s' was built from other sources, compiling the embedded ones\n",
+                          __func__, k_lib_names[kind]);
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool ggml_metal_library_load_precompiled(ggml_metal_library_t res, id<MTLDevice> device, NSString * const * want) {
+    if (ggml_metal_device_get_props(res->dev)->has_tensor) {
+        return false;
+    }
+
+    NSString * bin_cur = [[NSProcessInfo processInfo] arguments][0];
+    NSString * dir = [[bin_cur stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"kernels"];
+
+    if (![[NSFileManager defaultManager] fileExistsAtPath:dir]) {
+        return false;
+    }
+    if (!ggml_metal_library_precompiled_matches(dir, want)) {
+        return false;
+    }
+
+    const int64_t t_start = ggml_time_us();
+
+    for (int kind = 0; kind < GGML_METAL_LIB_COUNT; ++kind) {
+        NSString * path = [dir stringByAppendingPathComponent:
+            [NSString stringWithFormat:@"%s.metallib", k_lib_names[kind]]];
+
+        NSError * error = nil;
+        res->objs[kind] = [device newLibraryWithURL:[NSURL fileURLWithPath:path] error:&error];
+        if (!res->objs[kind]) {
+            GGML_LOG_WARN("%s: precompiled '%s' unusable, compiling from source\n", __func__, k_lib_names[kind]);
+            for (int i = 0; i < GGML_METAL_LIB_COUNT; ++i) {
+                if (res->objs[i]) {
+                    [res->objs[i] release];
+                    res->objs[i] = nil;
+                }
+            }
+            return false;
+        }
+    }
+
+    GGML_LOG_INFO("%s: loaded %d precompiled libraries in %.3f sec\n",
+                  __func__, GGML_METAL_LIB_COUNT, (ggml_time_us() - t_start) / 1e6);
+
+    ggml_metal_library_build_index(res);
+
+    return true;
+}
+
 // Compile all per-kind libraries in parallel. `source_for_kind` returns the MSL
 // source for a kind (the helper takes ownership and releases it), or nil with
 // *err set on failure. On success the objs[] slots are populated and the routing
@@ -493,6 +598,28 @@ ggml_metal_library_t ggml_metal_library_init(ggml_metal_device_t dev) {
     GGML_METAL_LIBS
 #undef X
     };
+
+    // what these kernels were built from, to tell a stale precompiled library apart in a log
+    NSString * want[GGML_METAL_LIB_COUNT];
+    {
+        CC_SHA256_CTX all;
+        CC_SHA256_Init(&all);
+        for (int kind = 0; kind < GGML_METAL_LIB_COUNT; ++kind) {
+            unsigned char d[CC_SHA256_DIGEST_LENGTH];
+            CC_SHA256(lib_start[kind], (CC_LONG) (lib_end[kind] - lib_start[kind]), d);
+            NSMutableString * hex = [NSMutableString stringWithCapacity:64];
+            for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; ++i) [hex appendFormat:@"%02x", d[i]];
+            want[kind] = hex;
+            CC_SHA256_Update(&all, d, sizeof(d));
+        }
+        unsigned char d[CC_SHA256_DIGEST_LENGTH];
+        CC_SHA256_Final(d, &all);
+        GGML_LOG_INFO("%s: kernel fingerprint %02x%02x%02x%02x%02x%02x\n", __func__, d[0], d[1], d[2], d[3], d[4], d[5]);
+    }
+
+    if (ggml_metal_library_load_precompiled(res, device, want)) {
+        return res;
+    }
 
     const bool ok = ggml_metal_library_compile_all(res, device, prep,
         ^NSString * (int kind, NSError ** err) {
@@ -843,6 +970,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
 
 struct ggml_metal_encoder {
     id<MTLComputeCommandEncoder> obj;
+    bool concurrent;
 };
 
 struct ggml_metal_pipeline_with_params ggml_metal_device_pipeline_add3(ggml_metal_device_t dev) {
@@ -954,6 +1082,8 @@ ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, b
 
     id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) cmd_buf_raw;
 
+    res->concurrent = concurrent;
+
     if (concurrent) {
         res->obj = [cmd_buf computeCommandEncoderWithDispatchType: MTLDispatchTypeConcurrent];
     } else {
@@ -1008,6 +1138,26 @@ void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder) {
     [encoder->obj endEncoding];
 }
 
+void ggml_metal_encoder_event(ggml_metal_encoder_t encoder, ggml_metal_cmd_buf_t cmd_buf_raw, void * ev, uint64_t value, bool signal) {
+    id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) cmd_buf_raw;
+
+    [encoder->obj endEncoding];
+    [encoder->obj release];
+
+    if (signal) {
+        [cmd_buf encodeSignalEvent:(id<MTLSharedEvent>) ev value:value];
+    } else {
+        [cmd_buf encodeWaitForEvent:(id<MTLSharedEvent>) ev value:value];
+    }
+
+    if (encoder->concurrent) {
+        encoder->obj = [cmd_buf computeCommandEncoderWithDispatchType: MTLDispatchTypeConcurrent];
+    } else {
+        encoder->obj = [cmd_buf computeCommandEncoder];
+    }
+    [encoder->obj retain];
+}
+
 #define GGML_METAL_HOST_WRAP_MAX 256
 
 struct ggml_metal_device {
@@ -1055,7 +1205,264 @@ struct ggml_metal_device {
     int n_host_wraps;
     size_t host_wrap_bytes;
     NSLock * wrap_lock;
+
+    // mixed expert execution: one event and one host-visible stage, created on first use
+    id<MTLSharedEvent> dmoe_ev;
+    id<MTLSharedEvent> dmoe_reach;
+    id<MTLBuffer>      dmoe_stage;
+    NSLock *           dmoe_lock;
+    id<MTLBuffer>      dmoe_tables;
+    id<MTLBuffer>      dmoe_obs;
+    id<MTLBuffer>      dmoe_wide;
 };
+
+#ifdef TOSH_ENABLE_DYNAMIC_MOE
+static uint64_t ggml_metal_dmoe_ev_get(void * ev) { return [(id<MTLSharedEvent>) ev signaledValue]; }
+static void ggml_metal_dmoe_ev_set(void * ev, uint64_t v) { [(id<MTLSharedEvent>) ev setSignaledValue:v]; }
+
+void * ggml_metal_device_dmoe_event(ggml_metal_device_t dev) {
+    [dev->dmoe_lock lock];
+    if (dev->dmoe_ev == nil) {
+        dev->dmoe_ev = [dev->mtl_device newSharedEvent];
+        tosh_dmoe_set_event(dev->dmoe_ev, ggml_metal_dmoe_ev_get, ggml_metal_dmoe_ev_set);
+    }
+    [dev->dmoe_lock unlock];
+    return dev->dmoe_ev;
+}
+
+// signalled when a wide join is reached, before it waits on the host
+void * ggml_metal_device_dmoe_reach_event(ggml_metal_device_t dev) {
+    [dev->dmoe_lock lock];
+    if (dev->dmoe_reach == nil) {
+        dev->dmoe_reach = [dev->mtl_device newSharedEvent];
+        tosh_dmoe_set_reach_event(dev->dmoe_reach, ggml_metal_dmoe_ev_get);
+    }
+    [dev->dmoe_lock unlock];
+    return dev->dmoe_reach;
+}
+
+struct ggml_metal_buffer_id ggml_metal_device_dmoe_obs_ring(ggml_metal_device_t dev) {
+    [dev->dmoe_lock lock];
+    if (dev->dmoe_obs == nil) {
+        dev->dmoe_obs = [dev->mtl_device newBufferWithLength:TOSH_DMOE_OBS_RING_BYTES options:MTLResourceStorageModeShared];
+        if (dev->dmoe_obs != nil) {
+            tosh_dmoe_set_obs_ring([dev->dmoe_obs contents]);
+        }
+    }
+    [dev->dmoe_lock unlock];
+    struct ggml_metal_buffer_id res = { dev->dmoe_obs, 0 };
+    return res;
+}
+
+struct ggml_metal_buffer_id ggml_metal_device_dmoe_tables(ggml_metal_device_t dev) {
+    struct ggml_metal_buffer_id res = { nil, 0 };
+    size_t bytes = 0;
+    int32_t * host = tosh_dmoe_tables(&bytes, NULL, NULL);
+    if (host == NULL) {
+        return res;
+    }
+    [dev->dmoe_lock lock];
+    if (dev->dmoe_tables == nil) {
+        dev->dmoe_tables = [dev->mtl_device newBufferWithBytesNoCopy:host length:bytes options:MTLResourceStorageModeShared deallocator:nil];
+        GGML_ASSERT(dev->dmoe_tables != nil && "residency tables must be page aligned");
+    }
+    [dev->dmoe_lock unlock];
+    res.metal = dev->dmoe_tables;
+    return res;
+}
+
+// promotions: a queue of their own and a bounded host-visible stage the canonical bytes pass through
+#define DMOE_UP_SLOTS   8
+#define DMOE_UP_BYTES   (8u << 20)
+#define DMOE_UP_TICKETS 1024
+
+struct ggml_metal_dmoe_up {
+    ggml_metal_device_t  dev;
+    id<MTLCommandQueue>  queue;
+    id<MTLBuffer>        stage[DMOE_UP_SLOTS];
+    id<MTLCommandBuffer> stage_cb[DMOE_UP_SLOTS];
+    id<MTLCommandBuffer> tickets[DMOE_UP_TICKETS];
+    id<MTLBuffer>        down;      // host-visible stage of the copies back to RAM
+    uint64_t             n_tickets;
+    int                  next;
+    long                 fail_at;   // test only
+    NSLock *             lock;
+};
+
+static uint64_t ggml_metal_dmoe_upload_impl(void * ctx_raw, const struct tosh_dmoe_copy * copies, int n);
+
+static uint64_t ggml_metal_dmoe_upload(void * ctx_raw, const struct tosh_dmoe_copy * copies, int n) {
+    @autoreleasepool {
+        return ggml_metal_dmoe_upload_impl(ctx_raw, copies, n);
+    }
+}
+
+static uint64_t ggml_metal_dmoe_upload_impl(void * ctx_raw, const struct tosh_dmoe_copy * copies, int n) {
+    struct ggml_metal_dmoe_up * up = ctx_raw;
+    [up->lock lock];
+    const uint64_t ticket = ++up->n_tickets;
+    if ((long) ticket == up->fail_at) {
+        [up->lock unlock];
+        return 0;
+    }
+    const int s = up->next;
+    up->next = (up->next + 1) % DMOE_UP_SLOTS;
+    if (up->stage_cb[s] != nil) {
+        [up->stage_cb[s] waitUntilCompleted];
+        [up->stage_cb[s] release];
+        up->stage_cb[s] = nil;
+    }
+    size_t total = 0;
+    for (int i = 0; i < n; ++i) {
+        total += copies[i].size;
+    }
+    if (total > [up->stage[s] length]) {
+        // a stage slot grows once to the largest expert, so staging stays bounded by 8 experts
+        id<MTLBuffer> grown = [up->dev->mtl_device newBufferWithLength:(total + (1u << 20) - 1)/(1u << 20)*(1u << 20)
+                                                               options:MTLResourceStorageModeShared];
+        if (grown == nil) {
+            [up->lock unlock];
+            return 0;
+        }
+        [up->stage[s] release];
+        up->stage[s] = grown;
+    }
+    char * stage = [up->stage[s] contents];
+    size_t off = 0;
+    id<MTLCommandBuffer> cb = [up->queue commandBuffer];
+    id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+    for (int i = 0; i < n; ++i) {
+        const struct ggml_tensor * t = copies[i].dst;
+        ggml_backend_buffer_t buffer = t->view_src ? t->view_src->buffer : t->buffer;
+        struct ggml_metal_buffer_id dst = ggml_metal_buffer_get_id(buffer->context, t);
+        memcpy(stage + off, copies[i].src, copies[i].size);
+        [blit copyFromBuffer:up->stage[s] sourceOffset:off toBuffer:dst.metal destinationOffset:dst.offs + copies[i].offset size:copies[i].size];
+        off += copies[i].size;
+    }
+    [blit endEncoding];
+    [cb commit];
+    [cb retain];
+    [cb retain];
+    up->stage_cb[s] = cb;
+    id<MTLCommandBuffer> old = up->tickets[ticket % DMOE_UP_TICKETS];
+    up->tickets[ticket % DMOE_UP_TICKETS] = cb;
+    [up->lock unlock];
+    if (old != nil) {
+        [old release];
+    }
+    return ticket;
+}
+
+static int ggml_metal_dmoe_upload_status(void * ctx_raw, uint64_t ticket) {
+    struct ggml_metal_dmoe_up * up = ctx_raw;
+    [up->lock lock];
+    id<MTLCommandBuffer> cb = up->tickets[ticket % DMOE_UP_TICKETS];
+    const MTLCommandBufferStatus st = cb != nil ? [cb status] : MTLCommandBufferStatusError;
+    [up->lock unlock];
+    if (st == MTLCommandBufferStatusCompleted) return 1;
+    if (st == MTLCommandBufferStatusError)     return -1;
+    return 0;
+}
+
+static double ggml_metal_dmoe_upload_gpu_us(void * ctx_raw, uint64_t ticket) {
+    struct ggml_metal_dmoe_up * up = ctx_raw;
+    [up->lock lock];
+    id<MTLCommandBuffer> cb = up->tickets[ticket % DMOE_UP_TICKETS];
+    const double us = cb != nil ? ([cb GPUEndTime] - [cb GPUStartTime])*1e6 : 0.0;
+    [up->lock unlock];
+    return us;
+}
+
+#define DMOE_DOWN_BYTES (32u << 20)
+
+static bool ggml_metal_dmoe_download(void * ctx_raw, const struct tosh_dmoe_copy * copies, int n) {
+    struct ggml_metal_dmoe_up * up = ctx_raw;
+    @autoreleasepool {
+        [up->lock lock];
+        if (up->down == nil) {
+            up->down = [up->dev->mtl_device newBufferWithLength:DMOE_DOWN_BYTES options:MTLResourceStorageModeShared];
+        }
+        bool ok = up->down != nil;
+        for (int i = 0; ok && i < n;) {
+            id<MTLCommandBuffer> cb = [up->queue commandBuffer];
+            id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+            size_t off = 0;
+            int j = i;
+            for (; j < n && off + copies[j].size <= DMOE_DOWN_BYTES; ++j) {
+                const struct ggml_tensor * t = copies[j].src;
+                ggml_backend_buffer_t buffer = t->view_src ? t->view_src->buffer : t->buffer;
+                struct ggml_metal_buffer_id src = ggml_metal_buffer_get_id(buffer->context, t);
+                [blit copyFromBuffer:src.metal sourceOffset:src.offs + copies[j].offset toBuffer:up->down destinationOffset:off size:copies[j].size];
+                off += copies[j].size;
+            }
+            [blit endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+            ok = j > i && [cb status] == MTLCommandBufferStatusCompleted;
+            const char * stage = [up->down contents];
+            off = 0;
+            for (int k = i; ok && k < j; ++k) {
+                memcpy((void *) copies[k].dst, stage + off, copies[k].size);
+                off += copies[k].size;
+            }
+            i = j;
+        }
+        [up->lock unlock];
+        return ok;
+    }
+}
+
+static void ggml_metal_dmoe_uploader_init(ggml_metal_device_t dev);
+static ggml_metal_device_t g_uploader_dev = NULL;
+static void ggml_metal_dmoe_uploader_make(void) {
+    if (g_uploader_dev != NULL) {
+        ggml_metal_dmoe_uploader_init(g_uploader_dev);
+    }
+}
+
+static void ggml_metal_dmoe_uploader_init(ggml_metal_device_t dev) {
+    struct ggml_metal_dmoe_up * up = calloc(1, sizeof(struct ggml_metal_dmoe_up));
+    up->dev   = dev;
+    up->queue = [dev->mtl_device newCommandQueue];
+    for (int i = 0; i < DMOE_UP_SLOTS; ++i) {
+        up->stage[i] = [dev->mtl_device newBufferWithLength:DMOE_UP_BYTES options:MTLResourceStorageModeShared];
+    }
+    up->lock = [[NSLock alloc] init];
+    const char * f = getenv("TOSH_DMOE_TEST_UPLOAD_FAIL");
+    up->fail_at = f ? atol(f) : -1;
+    struct tosh_dmoe_uploader u = { up, ggml_metal_dmoe_upload, ggml_metal_dmoe_upload_status, ggml_metal_dmoe_upload_gpu_us,
+                                    ggml_metal_dmoe_download };
+    tosh_dmoe_set_uploader(&u);
+}
+
+struct ggml_metal_buffer_id ggml_metal_device_dmoe_wide_stage(ggml_metal_device_t dev, size_t bytes) {
+    [dev->dmoe_lock lock];
+    if (dev->dmoe_wide == nil) {
+        dev->dmoe_wide = [dev->mtl_device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+        GGML_ASSERT(dev->dmoe_wide != nil);
+        tosh_dmoe_set_wide_stage([dev->dmoe_wide contents], bytes);
+    }
+    GGML_ASSERT([dev->dmoe_wide length] >= bytes && "the wide stage size cannot change once allocated");
+    [dev->dmoe_lock unlock];
+    struct ggml_metal_buffer_id res = { dev->dmoe_wide, 0 };
+    return res;
+}
+
+struct ggml_metal_buffer_id ggml_metal_device_dmoe_stage(ggml_metal_device_t dev, size_t layer_stride) {
+    [dev->dmoe_lock lock];
+    const size_t size = layer_stride*TOSH_DMOE_MAX_LAYERS;
+    if (dev->dmoe_stage == nil || [dev->dmoe_stage length] < size) {
+        GGML_ASSERT(dev->dmoe_stage == nil && "the stage stride cannot change once allocated");
+        dev->dmoe_stage = [dev->mtl_device newBufferWithLength:size options:MTLResourceStorageModeShared];
+        GGML_ASSERT(dev->dmoe_stage != nil);
+        memset([dev->dmoe_stage contents], 0, size);
+        tosh_dmoe_set_stage([dev->dmoe_stage contents], layer_stride);
+    }
+    [dev->dmoe_lock unlock];
+    struct ggml_metal_buffer_id res = { dev->dmoe_stage, 0 };
+    return res;
+}
+#endif
 
 //
 // MTLResidenceSet wrapper
@@ -1348,6 +1755,15 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
 
                 dev->stage_lock = [[NSRecursiveLock alloc] init];
                 dev->wrap_lock  = [[NSLock alloc] init];
+                dev->dmoe_lock  = [[NSLock alloc] init];
+#ifdef TOSH_ENABLE_DYNAMIC_MOE
+                if (g_uploader_dev == NULL) {
+                    // created on first use: mixed execution can be chosen after the device starts
+                    g_uploader_dev = dev;
+                    tosh_dmoe_set_uploader_factory(ggml_metal_dmoe_uploader_make);
+                }
+#endif
+
                 dev->addr_virt = 0x000000400ULL;
 
                 dev->props.device = device;
@@ -1664,12 +2080,30 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
                         dev->props.max_buffer_size = cap;
                         fprintf(stderr, "ggml_metal: max single buffer capped to %zu MiB by TOSH_METAL_MAX_BUFFER_MB\n", cap / 1024 / 1024);
                     }
+                }
                 dev->props.max_theadgroup_memory_size = dev->mtl_device.maxThreadgroupMemoryLength;
                 if (@available(macOS 10.12, iOS 16.0, *)) {
                     dev->props.max_working_set_size   = dev->mtl_device.recommendedMaxWorkingSetSize;
                 } else {
                     dev->props.max_working_set_size   = dev->mtl_device.maxBufferLength;
                 }
+#ifdef TOSH_ENABLE_DYNAMIC_MOE
+                // the expert arena is sized from what the card has free before anything is allocated;
+                // taken for every process, since mixed execution can be chosen after the device starts
+                {
+                    tosh_dmoe_set_private_query(ggml_metal_private_bytes);
+                    if (g_vram_dev == nil) {
+                        g_vram_dev = dev->mtl_device;
+                        tosh_dmoe_set_vram_query(ggml_metal_vram_query);
+                    }
+                    size_t vfree = 0, vtotal = 0;
+                    if (tosh_vram_read(&vfree, &vtotal)) {
+                        tosh_dmoe_set_vram(vfree, vtotal);
+                    } else {
+                        tosh_dmoe_set_vram(dev->props.max_working_set_size, dev->props.max_working_set_size);
+                    }
+                }
+#endif
 
                 {
                     const char * val = getenv("GGML_METAL_FUSION_DEBUG");
@@ -1860,8 +2294,14 @@ void * ggml_metal_device_wrap_host(ggml_metal_device_t dev, const void * data, s
         }
     }
 
-    atomic_store_explicit(&dev->rsets->d_loop, dev->rsets->loops_per_s*dev->rsets->keep_alive_s, memory_order_relaxed);
-}
+    // A no-copy host buffer only makes already allocated system-RAM pages addressable by Metal;
+    // it does not make them private VRAM residents. recommendedMaxWorkingSetSize is therefore the
+    // wrong ceiling: on a discrete GPU it rejects the exact oversized models this cache exists to
+    // serve. The device's maximum *single buffer* size is the real structural constraint. Keep the
+    // aggregate limit only as an explicit laboratory/debug override.
+    if (len > dev->props.max_buffer_size) {
+        [dev->wrap_lock unlock];
+        return NULL;
     }
 
     // Left uncapped, a large MoE offload maps its whole host-resident expert set here and the
@@ -1874,6 +2314,13 @@ void * ggml_metal_device_wrap_host(ggml_metal_device_t dev, const void * data, s
     if (limit_mb != NULL) {
         limit = (size_t) strtoull(limit_mb, NULL, 10)*1024*1024;
     }
+#ifdef TOSH_ENABLE_DYNAMIC_MOE
+    // with every bank in host memory a full working set of wraps collapses the uploads;
+    // two thirds of it keeps the fast path
+    else if (tosh_dmoe_enabled()) {
+        limit = limit/3*2;
+    }
+#endif
     if (limit > 0 && (len > limit || dev->host_wrap_bytes > limit - len)) {
         [dev->wrap_lock unlock];
         return NULL;
@@ -1886,6 +2333,11 @@ void * ggml_metal_device_wrap_host(ggml_metal_device_t dev, const void * data, s
     if (buf == nil) {
         [dev->wrap_lock unlock];
         return NULL;
+    }
+
+    if (len >= (size_t) 1024*1024*1024) {
+        GGML_LOG_INFO("%s: mapped %.2f GiB of existing host RAM as one Metal buffer (not VRAM)\n",
+                __func__, (double) len/(1024.0*1024.0*1024.0));
     }
 
     if (dev->n_host_wraps == GGML_METAL_HOST_WRAP_MAX) {
@@ -2094,6 +2546,12 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
     }
 
     switch (op->op) {
+#ifdef TOSH_ENABLE_DYNAMIC_MOE
+        case GGML_OP_TOSH_DMOE_PUBLISH:
+        case GGML_OP_TOSH_DMOE_JOIN:
+        case GGML_OP_TOSH_DMOE_OBSERVE:
+            return true;
+#endif
         case GGML_OP_SCALE:
         case GGML_OP_FILL:
         case GGML_OP_CLAMP:
@@ -2812,8 +3270,15 @@ static void * ggml_metal_host_malloc(size_t n) {
 }
 
 // release what a half-built buffer already owns, without touching the residency set
+// private (VRAM) bytes held by ggml buffers of this process, for sizing the expert arena
+static _Atomic size_t g_metal_private_bytes;
+size_t ggml_metal_private_bytes(void) { return atomic_load(&g_metal_private_bytes); }
+
 static void ggml_metal_buffer_free_owned(ggml_metal_buffer_t buf) {
     for (int i = 0; i < buf->n_buffers; i++) {
+        if (!buf->is_shared && buf->buffers[i].metal != nil) {
+            atomic_fetch_sub(&g_metal_private_bytes, (size_t) [buf->buffers[i].metal length]);
+        }
         [buf->buffers[i].metal release];
     }
 
@@ -2824,6 +3289,8 @@ static void ggml_metal_buffer_free_owned(ggml_metal_buffer_t buf) {
         free(buf->all_data);
 #endif
     }
+}
+
 ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size, bool shared) {
     ggml_metal_buffer_t res = calloc(1, sizeof(struct ggml_metal_buffer));
 
@@ -2860,13 +3327,19 @@ ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size,
         res->buffers[0].metal = nil;
 
         if (size_aligned > 0) {
-            if (props_dev->use_shared_buffers && shared) {
+            // `shared` already carries the device's answer plus the host-buffer opt-in, and
+            // taking the device flag again here wrapped host memory in a private buffer: the
+            // writes landed in one place and the GPU read the other
+            if (shared) {
                 res->buffers[0].metal = [res->dev->mtl_device newBufferWithBytesNoCopy:res->all_data
                                                                   length:size_aligned
                                                                  options:MTLResourceStorageModeShared
                                                              deallocator:nil];
             } else {
                 res->buffers[0].metal = [res->dev->mtl_device newBufferWithLength:size_aligned options:MTLResourceStorageModePrivate];
+                if (res->buffers[0].metal != nil) {
+                    atomic_fetch_add(&g_metal_private_bytes, size_aligned);
+                }
             }
         }
 
@@ -3000,6 +3473,9 @@ void ggml_metal_buffer_free(ggml_metal_buffer_t buf) {
         ggml_metal_device_rsets_rm(buf->dev, buf->rset);
 
         for (int i = 0; i < buf->n_buffers; i++) {
+            if (!buf->is_shared && buf->owned && buf->buffers[i].metal != nil) {
+                atomic_fetch_sub(&g_metal_private_bytes, (size_t) [buf->buffers[i].metal length]);
+            }
             [buf->buffers[i].metal release];
         }
 

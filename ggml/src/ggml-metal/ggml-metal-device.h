@@ -97,6 +97,9 @@ void ggml_metal_encoder_set_threadgroup_memory_size(ggml_metal_encoder_t encoder
 
 void ggml_metal_encoder_dispatch_threadgroups(ggml_metal_encoder_t encoder, int tg0, int tg1, int tg2, int tptg0, int tptg1, int tptg2);
 
+// ends the encoder, signals or waits on `ev` at `value` in the command buffer, and reopens it
+void ggml_metal_encoder_event(ggml_metal_encoder_t encoder, ggml_metal_cmd_buf_t cmd_buf, void * ev, uint64_t value, bool signal);
+
 void ggml_metal_encoder_memory_barrier(ggml_metal_encoder_t encoder);
 
 void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder);
@@ -383,6 +386,16 @@ void ggml_metal_device_get_memory(ggml_metal_device_t dev, size_t * free, size_t
 bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_tensor * op);
 
 const struct ggml_metal_device_props * ggml_metal_device_get_props(ggml_metal_device_t dev);
+
+#ifdef TOSH_ENABLE_DYNAMIC_MOE
+void *                      ggml_metal_device_dmoe_event(ggml_metal_device_t dev);
+struct ggml_metal_buffer_id ggml_metal_device_dmoe_stage(ggml_metal_device_t dev, size_t layer_stride);
+struct ggml_metal_buffer_id ggml_metal_device_dmoe_tables(ggml_metal_device_t dev);
+struct ggml_metal_buffer_id ggml_metal_device_dmoe_obs_ring(ggml_metal_device_t dev);
+struct ggml_metal_buffer_id ggml_metal_device_dmoe_wide_stage(ggml_metal_device_t dev, size_t bytes);
+size_t ggml_metal_private_bytes(void);
+void * ggml_metal_device_dmoe_reach_event(ggml_metal_device_t dev);
+#endif
 
 struct ggml_metal_fusion_info;
 

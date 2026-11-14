@@ -612,6 +612,10 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_TOSH_DMOE_PUBLISH,
+        GGML_OP_TOSH_DMOE_JOIN,
+        GGML_OP_TOSH_DMOE_OBSERVE,
+
         GGML_OP_COUNT,
     };
 
@@ -1508,6 +1512,45 @@ extern "C" {
             enum ggml_op_hint    hint);
 
     // indirect matrix multiplication
+    // Mixed expert execution: publish hands the layer's routing to a host executor and returns,
+    // per routed expert, its resident slot or -1; join takes the resident rows from `gpu` and the
+    // rest from the host. Both run on one backend, so the layer never splits the graph.
+    GGML_API struct ggml_tensor * ggml_tosh_dmoe_publish(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cur,        // [n_embd, n_tokens] f32
+            struct ggml_tensor  * ids,        // [n_expert_used, n_tokens] i32
+            struct ggml_tensor  * residency,  // [n_expert] i32, slot or -1
+            int                   il);
+
+    GGML_API struct ggml_tensor * ggml_tosh_dmoe_join(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * gpu,        // [n_embd, n_expert_used, n_tokens] f32
+            struct ggml_tensor  * slots,      // publish's result
+            int                   il);
+
+    // wide batches: ids of experts routed to at most `rows` rows of the chunk and not resident
+    // become -1, and the host computes them; join_wide writes the host rows in place
+    GGML_API struct ggml_tensor * ggml_tosh_dmoe_publish_wide(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cur,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * residency,
+            int                   il,
+            int                   rows,
+            int                   tail);      // the chunk's last `tail` tokens stay on the GPU
+
+    GGML_API struct ggml_tensor * ggml_tosh_dmoe_join_wide(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * gpu,
+            struct ggml_tensor  * wide_ids,
+            int                   il);
+
+    // copies a layer's routing to the host for the residency policy, nothing else
+    GGML_API struct ggml_tensor * ggml_tosh_dmoe_observe(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * ids,        // [n_expert_used, n_tokens] i32
+            int                   il);
+
     GGML_API struct ggml_tensor * ggml_mul_mat_id(
             struct ggml_context * ctx,
             struct ggml_tensor  * as,

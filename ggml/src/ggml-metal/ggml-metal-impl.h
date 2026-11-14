@@ -506,6 +506,23 @@ typedef struct {
 
 // the AMD kernels take their own copy: a field added to the upstream vec struct changes the
 // constant buffer layout and with it the code the Metal compiler emits for them
+typedef struct {
+    int32_t  ne01;
+    int32_t  ne02;
+    int32_t  ne03;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    int32_t  ne11;
+    int32_t  ne_12_2; // assume K and V are same shape
+    int32_t  ne_12_3;
+    int32_t  ns10;
+    uint64_t nb11;
+    uint64_t nb12;
+    uint64_t nb13;
+    int32_t  ns20;
+    uint64_t nb21;
+    uint64_t nb22;
     uint64_t nb23;
     int32_t  ne31;
     int32_t  ne32;

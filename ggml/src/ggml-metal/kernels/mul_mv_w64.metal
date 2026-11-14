@@ -7,6 +7,8 @@
 #include "dequantize.h"
 
 constant bool  FC_mul_mv_align [[function_constant(FC_MUL_MV + 8)]];
+// ids of a mixed expert layer mark host-run experts with -1
+constant bool  FC_mul_mv_id_skip [[function_constant(FC_MUL_MV + 9)]];
 
 // The 22-, 34-, 98-, 110- and 210-byte blocks leave every other one two bytes short of a word,
 // and a dword read there is undefined on a card that requires natural alignment. The constant
@@ -8140,6 +8142,10 @@ kernel void kernel_mul_mv_id_w64(
     tgpig.z = 0;
 
     const int32_t i02 = ((device const int32_t *) (ids + iid1*args.nbi1))[idx];
+
+    if (FC_mul_mv_id_skip && i02 < 0) {
+        return;
+    }
 
     const int64_t i11 = idx % args.ne11;
     const int64_t i12 = iid1;

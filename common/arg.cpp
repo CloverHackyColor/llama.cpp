@@ -261,6 +261,22 @@ static void parse_tensor_buffer_overrides(const std::string & value, std::vector
         }
     }
 
+    // a backend can offer more than its default one, and -ot is the only way to reach them
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        auto * dev = ggml_backend_dev_get(i);
+        auto * reg = ggml_backend_dev_backend_reg(dev);
+        if (!reg) {
+            continue;
+        }
+        auto fn = (ggml_backend_dev_get_extra_bufts_t)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts");
+        if (!fn) {
+            continue;
+        }
+        for (auto ** bufts = fn(dev); bufts && *bufts; ++bufts) {
+            buft_list[ggml_backend_buft_name(*bufts)] = *bufts;
+        }
+    }
 
     for (const auto & override : string_split<std::string>(value, ',')) {
         std::string::size_type pos = override.find('=');

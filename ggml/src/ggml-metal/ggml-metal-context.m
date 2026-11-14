@@ -9,6 +9,8 @@
 #import "ggml-metal-ops.h"
 #import "ggml-metal-fusion.h"
 
+#ifdef TOSH_ENABLE_DYNAMIC_MOE
+#include "tosh-dmoe.h"
 
 #import <Foundation/Foundation.h>
 
@@ -243,6 +245,14 @@ struct ggml_metal {
     id<MTLCommandBuffer> prefetch_stage_cmds[GGML_METAL_MAX_PREFETCH_STAGES];
     int prefetch_stage_count;
     int prefetch_stage_cur;
+
+#ifdef TOSH_ENABLE_DYNAMIC_MOE
+    // compact prefill uploads: bounded host ring, one command buffer per chunk
+    id<MTLBuffer>        dmoe_ring;
+    id<MTLBuffer>        dmoe_mark;
+    id<MTLCommandBuffer> dmoe_ring_cmds[8];
+    int                  dmoe_ring_cur;
+#endif
 
     ggml_metal_event_t ev_cpy; // for async copies
     ggml_metal_event_t ev_sync; // destination completion signal
@@ -1071,6 +1081,17 @@ void ggml_metal_free(ggml_metal_t ctx) {
         [ctx->prefetch_stages[i] release];
     }
 
+#ifdef TOSH_ENABLE_DYNAMIC_MOE
+    for (int i = 0; i < 8; ++i) {
+        if (ctx->dmoe_ring_cmds[i]) {
+            [ctx->dmoe_ring_cmds[i] waitUntilCompleted];
+            [ctx->dmoe_ring_cmds[i] release];
+        }
+    }
+    [ctx->dmoe_ring release];
+    [ctx->dmoe_mark release];
+#endif
+
     for (int i = 0; i < ctx->n_xlinks; ++i) {
         if (ctx->xlinks[i].seq > 0) {
             [ctx->xlinks[i].ev_done waitUntilSignaledValue:ctx->xlinks[i].seq timeoutMS:10000];
@@ -1184,6 +1205,19 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
         [ctx->cmd_buf_last waitUntilCompleted];
         ctx->cmd_buf_last = nil;
     }
+#ifdef TOSH_ENABLE_DYNAMIC_MOE
+    if (tosh_dmoe_enabled()) {
+        // a wide batch synchronizes mid-graph to read its routing; its join still needs the host
+        if (tosh_dmoe_event_get() >= tosh_dmoe_last_value() + 1) {
+            tosh_dmoe_set_active(false);
+        }
+        tosh_dmoe_mark_completed();
+    }
+    if (tosh_dmoe_failed() != NULL && !ctx->has_error) {
+        GGML_LOG_ERROR("%s: mixed expert execution failed: %s\n", __func__, tosh_dmoe_failed());
+        ctx->has_error = true;
+    }
+#endif
     if (cbp_on) {
         const uint64_t t1 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         atomic_fetch_add_explicit(&g_cbp_wait_ns, t1 - cbp_t, memory_order_relaxed);
@@ -1277,6 +1311,326 @@ void ggml_metal_read_batch_begin(ggml_metal_t ctx) {
 void ggml_metal_read_batch_end(ggml_metal_t ctx) {
     ggml_metal_device_read_batch_end(ctx->dev);
 }
+
+#ifdef TOSH_ENABLE_DYNAMIC_MOE
+static _Atomic uint64_t g_dmoe_pf_host_bytes;
+static _Atomic uint64_t g_dmoe_pf_vram_bytes;
+static _Atomic uint64_t g_dmoe_pf_skip_bytes;
+static _Atomic uint64_t g_dmoe_pf_rare_bytes[3];
+static _Atomic uint64_t g_dmoe_pf_uploads;
+static _Atomic uint64_t g_dmoe_pf_used;
+static _Atomic uint64_t g_dmoe_pf_used_res;
+
+static void ggml_metal_dmoe_pf_report(void) {
+    const uint64_t h = atomic_load(&g_dmoe_pf_host_bytes), v = atomic_load(&g_dmoe_pf_vram_bytes);
+    if (h + v > 0 && getenv("TOSH_DMOE_STATS")) {
+        const double G = 1073741824.0;
+        fprintf(stderr, "tosh_dmoe: prefill bank uploads %.2f GiB from host, %.2f GiB from the VRAM arena, %.2f GiB not routed and skipped\n",
+                h/G, v/G, atomic_load(&g_dmoe_pf_skip_bytes)/G);
+        const uint64_t n = atomic_load(&g_dmoe_pf_uploads);
+        if (n > 0) {
+            fprintf(stderr, "tosh_dmoe: compact uploads %llu, routed experts per upload %.1f (%.1f resident) | host bytes of experts with 1 / <=2 / <=4 rows %.2f / %.2f / %.2f GiB\n",
+                    (unsigned long long) n, (double) atomic_load(&g_dmoe_pf_used)/n, (double) atomic_load(&g_dmoe_pf_used_res)/n,
+                    atomic_load(&g_dmoe_pf_rare_bytes[0])/G, atomic_load(&g_dmoe_pf_rare_bytes[1])/G, atomic_load(&g_dmoe_pf_rare_bytes[2])/G);
+        }
+    }
+}
+
+#define DMOE_RING_CHUNKS 8
+#define DMOE_RING_CHUNK  ((size_t) 16 << 20)
+
+
+static void ggml_metal_dmoe_submit(ggml_metal_t ctx, id<MTLCommandBuffer> cmd_buf, int il) {
+    [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+        tosh_dmoe_note_time(2, (int64_t) ((cb.GPUEndTime - cb.GPUStartTime)*1e6));
+        tosh_dmoe_timeline(2, il, cb.GPUStartTime, cb.GPUEndTime);
+    }];
+    [cmd_buf commit];
+    [ctx->cmd_bufs_ext addObject:cmd_buf];
+    ctx->cmd_buf_last = cmd_buf;
+    [cmd_buf retain];
+}
+
+// Copies the pieces into their ring chunk on several threads and blits them to the slot.
+static void ggml_metal_dmoe_ring_flush(ggml_metal_t ctx, const void * data, id<MTLBuffer> dst, size_t dst_offs,
+        const struct dmoe_piece * p, int n, bool * first, int il) {
+    if (n == 0) {
+        return;
+    }
+    const int c = ctx->dmoe_ring_cur;
+    ctx->dmoe_ring_cur = (c + 1) % DMOE_RING_CHUNKS;
+    if (ctx->dmoe_ring_cmds[c]) {
+        [ctx->dmoe_ring_cmds[c] waitUntilCompleted];
+        [ctx->dmoe_ring_cmds[c] release];
+        ctx->dmoe_ring_cmds[c] = nil;
+    }
+    char * ring = (char *) ctx->dmoe_ring.contents + (size_t) c*DMOE_RING_CHUNK;
+    const size_t sub = (size_t) 1 << 20;
+    size_t n_sub = 0;
+    for (int i = 0; i < n; ++i) n_sub += (p[i].len + sub - 1)/sub;
+    dispatch_apply(n_sub, DISPATCH_APPLY_AUTO, ^(size_t k) {
+        size_t kk = k;
+        for (int i = 0; i < n; ++i) {
+            const size_t m = (p[i].len + sub - 1)/sub;
+            if (kk < m) {
+                const size_t o = kk*sub, l = MIN(sub, p[i].len - o);
+                return;
+            }
+            kk -= m;
+        }
+    });
+    id<MTLCommandBuffer> cmd_buf = [ctx->queue commandBuffer];
+    if (*first) {
+        ggml_metal_encode_pending_waits(ctx, cmd_buf);
+        *first = false;
+    }
+    id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
+    for (int i = 0; i < n; ++i) {
+        [encoder copyFromBuffer:ctx->dmoe_ring sourceOffset:(size_t) c*DMOE_RING_CHUNK + p[i].dst
+                       toBuffer:dst destinationOffset:dst_offs + p[i].src size:p[i].len];
+    }
+    [encoder endEncoding];
+    ggml_metal_dmoe_submit(ctx, cmd_buf, il);
+    ctx->dmoe_ring_cmds[c] = [cmd_buf retain];
+}
+
+// Only the experts the chunk routes to: residents device to device, the rest from host memory
+// through the ring. Promotions copy from the filled slot once its blits are done.
+static bool ggml_metal_dmoe_compact_upload(ggml_metal_t ctx, const struct tosh_dmoe_bank_plan * plan,
+        struct ggml_metal_buffer_id bid_dst, struct ggml_metal_buffer_id bid_arena, const void * data) {
+    if (ctx->dmoe_ring == nil) {
+        ctx->dmoe_ring = [ggml_metal_device_get_obj(ctx->dev) newBufferWithLength:DMOE_RING_CHUNKS*DMOE_RING_CHUNK
+                                                                         options:MTLResourceStorageModeShared | MTLResourceCPUCacheModeWriteCombined];
+        if (ctx->dmoe_ring == nil) {
+            return false;
+        }
+    }
+    const size_t eb = plan->expert_bytes;
+    const int32_t * rows = plan->rows;
+    bool first = true;
+    uint64_t host_bytes = 0, vram_bytes = 0, skip_bytes = 0, rare[3] = { 0, 0, 0 }, used = 0, used_res = 0;
+
+    // residents first: they need no host work and can run while the ring fills
+    {
+        id<MTLCommandBuffer> cmd_buf = [ctx->queue commandBuffer];
+        ggml_metal_encode_pending_waits(ctx, cmd_buf);
+        first = false;
+        id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
+        for (int e = 0; e < plan->n_expert; ++e) {
+            if (rows[e] == 0) {
+                skip_bytes += eb;
+                continue;
+            }
+            used++;
+            if (plan->slot_of[e] >= 0) {
+                [encoder copyFromBuffer:bid_arena.metal sourceOffset:bid_arena.offs + (size_t) plan->slot_of[e]*eb
+                               toBuffer:bid_dst.metal destinationOffset:bid_dst.offs + (size_t) e*eb size:eb];
+                vram_bytes += eb;
+                used_res++;
+            } else {
+                if (rows[e] <= 1) rare[0] += eb;
+                if (rows[e] <= 2) rare[1] += eb;
+                if (rows[e] <= 4) rare[2] += eb;
+            }
+        }
+        [encoder endEncoding];
+        ggml_metal_dmoe_submit(ctx, cmd_buf, plan->il);
+    }
+
+    struct dmoe_piece p[64];
+    int n = 0;
+    size_t fill = 0;
+        if (rows[e] == 0 || plan->slot_of[e] >= 0) {
+            ++e;
+            continue;
+        }
+        int e1 = e + 1;
+        while (e1 < plan->n_expert && rows[e1] > 0 && plan->slot_of[e1] < 0) ++e1;
+        size_t off = (size_t) e*eb, len = (size_t) (e1 - e)*eb;
+        host_bytes += len;
+        while (len > 0) {
+            if (fill == DMOE_RING_CHUNK || n == 64) {
+                ggml_metal_dmoe_ring_flush(ctx, data, bid_dst.metal, bid_dst.offs, p, n, &first, plan->il);
+                n = 0;
+                fill = 0;
+            }
+            const size_t take = MIN(len, DMOE_RING_CHUNK - fill);
+            fill += take;
+            off  += take;
+            len  -= take;
+        }
+        e = e1;
+    }
+
+    if (plan->n_promo > 0) {
+        id<MTLCommandBuffer> cmd_buf = [ctx->queue commandBuffer];
+        id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
+        for (int i = 0; i < plan->n_promo; ++i) {
+            const int e = plan->promo_expert[i], sl = plan->promo_slot[i];
+            if (e < 0 || e >= plan->n_expert || sl < 0 || rows[e] == 0) continue;
+            [encoder copyFromBuffer:bid_dst.metal sourceOffset:bid_dst.offs + (size_t) e*eb
+                           toBuffer:bid_arena.metal destinationOffset:bid_arena.offs + (size_t) sl*eb size:eb];
+        }
+        [encoder endEncoding];
+        ggml_metal_dmoe_submit(ctx, cmd_buf, plan->il);
+    }
+
+    // when the host runs rare experts, report when this layer's down bank is on the GPU: a read of
+    // the slot waits for every blit that wrote it
+    if (plan->which == 2 && tosh_dmoe_rare_rows_live() > 0) {
+        if (ctx->dmoe_mark == nil) {
+            ctx->dmoe_mark = [ggml_metal_device_get_obj(ctx->dev) newBufferWithLength:256 options:MTLResourceStorageModeShared];
+        }
+        id<MTLCommandBuffer> cmd_buf = [ctx->queue commandBuffer];
+        id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
+        [encoder copyFromBuffer:bid_dst.metal sourceOffset:bid_dst.offs toBuffer:ctx->dmoe_mark destinationOffset:0 size:16];
+        [encoder endEncoding];
+        const int il = plan->il;
+        [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+            tosh_dmoe_rare_dma_done(il, cb.GPUEndTime);
+        }];
+        [cmd_buf commit];
+        [ctx->cmd_bufs_ext addObject:cmd_buf];
+        ctx->cmd_buf_last = cmd_buf;
+        [cmd_buf retain];
+    }
+
+    atomic_fetch_add(&g_dmoe_pf_host_bytes, host_bytes);
+    atomic_fetch_add(&g_dmoe_pf_vram_bytes, vram_bytes);
+    atomic_fetch_add(&g_dmoe_pf_skip_bytes, skip_bytes);
+    for (int i = 0; i < 3; ++i) atomic_fetch_add(&g_dmoe_pf_rare_bytes[i], rare[i]);
+    atomic_fetch_add(&g_dmoe_pf_uploads, 1);
+    atomic_fetch_add(&g_dmoe_pf_used, used);
+    atomic_fetch_add(&g_dmoe_pf_used_res, used_res);
+    return true;
+}
+
+// A bank upload for prefill: experts already in the VRAM arena are copied device to device,
+// the rest come from host memory. Same bytes land in the slot as a full upload.
+static bool ggml_metal_dmoe_bank_upload(ggml_metal_t ctx, struct ggml_tensor * tensor, const void * data, size_t size) {
+    struct tosh_dmoe_bank_plan plan;
+    if (!tosh_dmoe_enabled() || !tosh_dmoe_bank_planner(data, size, &plan)) {
+        return false;
+    }
+    if (plan.expert_bytes*plan.n_expert != size) {
+        return false;
+    }
+    struct ggml_metal_buffer_id bid_dst   = ggml_metal_get_buffer_id(tensor);
+    struct ggml_metal_buffer_id bid_arena = ggml_metal_get_buffer_id((const struct ggml_tensor *) plan.arena);
+    if (bid_dst.metal == nil || bid_arena.metal == nil) {
+        return false;
+    }
+
+    static bool registered = false;
+    if (!registered) {
+        registered = true;
+        atexit(ggml_metal_dmoe_pf_report);
+    }
+    if (plan.rows != NULL && ggml_metal_dmoe_compact_upload(ctx, &plan, bid_dst, bid_arena, data)) {
+        return true;
+    }
+
+    int stage = -1;
+    size_t offs_src = 0;
+    id<MTLBuffer> buf_src = ggml_metal_device_wrap_host(ctx->dev, data, size, &offs_src);
+    if (buf_src == nil) {
+        stage = ctx->prefetch_stage_cur;
+        ctx->prefetch_stage_cur = (ctx->prefetch_stage_cur + 1) % ctx->prefetch_stage_count;
+        if (ctx->prefetch_stage_cmds[stage]) {
+            [ctx->prefetch_stage_cmds[stage] waitUntilCompleted];
+            [ctx->prefetch_stage_cmds[stage] release];
+            ctx->prefetch_stage_cmds[stage] = nil;
+        }
+        buf_src = ctx->prefetch_stages[stage];
+        if (buf_src == nil || buf_src.length < size) {
+            [buf_src release];
+            buf_src = [ggml_metal_device_get_obj(ctx->dev) newBufferWithLength:size
+                                                                        options:MTLResourceStorageModeShared | MTLResourceCPUCacheModeWriteCombined];
+            ctx->prefetch_stages[stage] = buf_src;
+        }
+        if (buf_src == nil) {
+            return false;
+        }
+        offs_src = 0;
+    }
+
+    const size_t eb = plan.expert_bytes;
+    // with the chunk's routing only the routed experts are carried; the rest of the slot is never read
+    const int32_t * rows = plan.rows;
+    id<MTLCommandBuffer> cmd_buf = [ctx->queue commandBuffer];
+    ggml_metal_encode_pending_waits(ctx, cmd_buf);
+    id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
+    uint64_t host_bytes = 0, vram_bytes = 0, skip_bytes = 0, rare[3] = { 0, 0, 0 }, used = 0, used_res = 0;
+    for (int e = 0; e < plan.n_expert;) {
+        if (rows && rows[e] == 0) {
+            skip_bytes += eb;
+            ++e;
+            continue;
+        }
+        used++;
+        if (plan.slot_of[e] >= 0) {
+            [encoder copyFromBuffer:bid_arena.metal sourceOffset:bid_arena.offs + (size_t) plan.slot_of[e]*eb
+                           toBuffer:bid_dst.metal destinationOffset:bid_dst.offs + (size_t) e*eb size:eb];
+            vram_bytes += eb;
+            used_res++;
+            ++e;
+            continue;
+        }
+        int e1 = e + 1;
+        while (e1 < plan.n_expert && plan.slot_of[e1] < 0 && (!rows || rows[e1] > 0)) ++e1;
+        if (rows) {
+            for (int i = e; i < e1; ++i) {
+                if (rows[i] <= 1) rare[0] += eb;
+                if (rows[i] <= 2) rare[1] += eb;
+                if (rows[i] <= 4) rare[2] += eb;
+            }
+            used += e1 - e - 1;
+        }
+        const size_t off = (size_t) e*eb, len = (size_t) (e1 - e)*eb;
+        if (stage >= 0) {
+            memcpy((char *) buf_src.contents + off, (const char *) data + off, len);
+        }
+        [encoder copyFromBuffer:buf_src sourceOffset:offs_src + off
+                       toBuffer:bid_dst.metal destinationOffset:bid_dst.offs + off size:len];
+        host_bytes += len;
+        e = e1;
+    }
+    // promotions ride on the upload: the expert is already in VRAM, so it costs a device copy
+    for (int i = 0; i < plan.n_promo; ++i) {
+        const int e = plan.promo_expert[i], s = plan.promo_slot[i];
+        if (e < 0 || e >= plan.n_expert || s < 0) continue;
+        [encoder copyFromBuffer:bid_dst.metal sourceOffset:bid_dst.offs + (size_t) e*eb
+                       toBuffer:bid_arena.metal destinationOffset:bid_arena.offs + (size_t) s*eb size:eb];
+    }
+    [encoder endEncoding];
+    if (rows) {
+        [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+            tosh_dmoe_note_time(2, (int64_t) ((cb.GPUEndTime - cb.GPUStartTime)*1e6));
+        }];
+    }
+    [cmd_buf commit];
+
+    [ctx->cmd_bufs_ext addObject:cmd_buf];
+    ctx->cmd_buf_last = cmd_buf;
+    if (stage >= 0) {
+        ctx->prefetch_stage_cmds[stage] = [cmd_buf retain];
+    }
+    [cmd_buf retain];
+
+    atomic_fetch_add(&g_dmoe_pf_host_bytes, host_bytes);
+    atomic_fetch_add(&g_dmoe_pf_vram_bytes, vram_bytes);
+    if (rows) {
+        atomic_fetch_add(&g_dmoe_pf_skip_bytes, skip_bytes);
+        for (int i = 0; i < 3; ++i) atomic_fetch_add(&g_dmoe_pf_rare_bytes[i], rare[i]);
+        atomic_fetch_add(&g_dmoe_pf_uploads, 1);
+        atomic_fetch_add(&g_dmoe_pf_used, used);
+        atomic_fetch_add(&g_dmoe_pf_used_res, used_res);
+    }
+    return true;
+}
+#endif
+
+void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     @autoreleasepool {
         ggml_metal_prof_note(tensor->name, size, false);
         id<MTLDevice> device = ggml_metal_device_get_obj(ctx->dev);
@@ -1290,6 +1644,11 @@ void ggml_metal_read_batch_end(ggml_metal_t ctx) {
 
         // Expert prefetch keeps the zero-copy source path while it fits the
         // device budget, then falls back to a bounded shared staging ring.
+#ifdef TOSH_ENABLE_DYNAMIC_MOE
+        if (ctx->is_prefetch && offset == 0 && ggml_metal_dmoe_bank_upload(ctx, tensor, data, size)) {
+            return;
+        }
+#endif
         if (ctx->is_prefetch) {
             int stage = -1;
             size_t offs_src = 0;
@@ -3566,6 +3925,42 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
     if (gf->n_nodes == 0) {
         return GGML_STATUS_SUCCESS;
     }
+#ifdef TOSH_ENABLE_DYNAMIC_MOE
+    // mixed layers get their event values in submission order, before any parallel encoding;
+    // a dynamic cache also pins the residency table this graph reads
+    const bool dmoe_on = tosh_dmoe_enabled();
+    const int dmoe_version = dmoe_on ? tosh_dmoe_published_version() : 0;
+    bool dmoe_ticked = false;
+    for (int i = 0; dmoe_on && i < gf->n_nodes; ++i) {
+        struct ggml_tensor * node = gf->nodes[i];
+        if (node->op == GGML_OP_TOSH_DMOE_OBSERVE) {
+            tosh_dmoe_note_wide(true);
+            continue;
+        }
+        if (node->op != GGML_OP_TOSH_DMOE_PUBLISH) {
+            continue;
+        }
+        tosh_dmoe_note_wide(ggml_get_op_params_i32(node, 1) > 0);
+        const uint64_t value = tosh_dmoe_next_value();
+        memcpy(&node->op_params[2], &value, sizeof(value));
+
+        ggml_set_op_params_i32(node, 4, dmoe_version);
+        if (!dmoe_ticked) {
+            tosh_dmoe_tick_next();
+            dmoe_ticked = true;
+        }
+
+        struct tosh_dmoe_job * job = tosh_dmoe_job_of(value);
+        job->version  = dmoe_version;
+        job->tick     = (uint32_t) tosh_dmoe_tick();
+        job->il       = ggml_get_op_params_i32(node, 0);
+        job->n_tokens = (int32_t) node->src[1]->ne[1];
+        job->n_used   = (int32_t) node->src[1]->ne[0];
+        job->n_embd   = (int32_t) node->src[0]->ne[0];
+        __atomic_store_n(&job->value, value, __ATOMIC_RELEASE);
+        tosh_dmoe_set_active(true);
+    }
+#endif
 
     // number of nodes encoded by the main thread (empirically determined)
     // the split was tuned on unified memory; TOSH_N_MAIN overrides it to A/B the share here
@@ -3840,12 +4235,21 @@ void ggml_metal_graph_optimize(ggml_metal_t ctx, struct ggml_cgraph * gf) {
     //const int64_t t_start = ggml_time_us();
 
     if (ctx->use_graph_optimize) {
-        ggml_graph_optimize(gf);
         static int max_tokens = -1;
         if (max_tokens < 0) {
             const char * s = TOSH_ENV("GGML_METAL_GRAPH_OPTIMIZE_MIN_BATCH");
             max_tokens = s ? atoi(s) - 1 : 7;
         }
+
+        // a wide batch whose rare experts run on the host is not reordered: moving nodes around its
+        // publish produced non-finite activations on small batches (32-63 tokens)
+        bool host_rows = false;
+#ifdef TOSH_ENABLE_DYNAMIC_MOE
+        for (int i = 0; i < gf->n_nodes && !host_rows; ++i) {
+            host_rows = gf->nodes[i]->op == GGML_OP_TOSH_DMOE_PUBLISH && ggml_get_op_params_i32(gf->nodes[i], 1) > 0;
+        }
+#endif
+        if (!host_rows && (max_tokens < 0 || !ggml_metal_graph_is_moe_decode(gf, max_tokens))) {
             ggml_graph_optimize(gf);
         }
     }
