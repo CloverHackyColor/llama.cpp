@@ -1213,6 +1213,12 @@ struct server_tool_grep_search : server_tool {
             return {{"error", "path does not exist: " + path}};
         }
 
+        // Sort files by relative path for deterministic pagination.
+        std::sort(files.begin(), files.end(),
+            [](const auto & a, const auto & b) {
+                return a.second < b.second;
+            });
+
         std::ostringstream output_text;
 
         size_t skipped = 0;
