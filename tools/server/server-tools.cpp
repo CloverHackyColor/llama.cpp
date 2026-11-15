@@ -1089,6 +1089,7 @@ struct server_tool_file_glob_search : server_tool {
 
 static constexpr size_t SERVER_TOOL_GREP_SEARCH_MAX_RESULTS = 100;
 
+
 struct server_tool_grep_search : server_tool {
     server_tool_grep_search() {
         name = "grep_search";
@@ -1108,7 +1109,10 @@ struct server_tool_grep_search : server_tool {
                     "Automatically skips files ignored by .gitignore (when the directory is inside a git repo) "
                     "and common junk directories (.git, node_modules, build, dist, etc.) otherwise. "
                     "include/exclude: a pattern with no '/' matches the basename at any depth; a pattern "
-                    "containing '/' matches the full relative path (auto-anchored with \"**/\" unless already anchored)."},
+                    "containing '/' matches the full relative path (auto-anchored with \"**/\" unless already anchored). "
+                    "Results are paginated. Use offset=0 for the first page. "
+                    "If has_more is true, call again with offset=next_offset and all other parameters unchanged. "
+                    "Continue until has_more is false or search_incomplete is true."},
                 {"parameters", {
                     {"type", "object"},
                     {"properties", {
@@ -1120,6 +1124,8 @@ struct server_tool_grep_search : server_tool {
                         {"literal",             {{"type", "boolean"}, {"description", "Treat pattern as a literal string instead of a regular expression (default: false)"}}},
                         {"ignore_case",         {{"type", "boolean"}, {"description", "Case-insensitive search (default: false)"}}},
                         {"context_lines",       {{"type", "integer"}, {"description", "Number of lines of context to show before and after each match (default: 0)"}}},
+                        {"limit",               {{"type", "integer"}, {"description", "Maximum number of matching lines to return (default: 100, maximum: 100)"}}},
+                        {"offset",              {{"type", "integer"}, {"description", "Number of matching lines to skip (default: 0). Use next_offset from the previous response."}}},
                     }},
                     {"required", json::array({"path", "pattern"})},
                 }},
@@ -1137,13 +1143,26 @@ struct server_tool_grep_search : server_tool {
         bool        ignore_case = json_value(params, "ignore_case", false);
         int         ctx_lines   = std::max(0, json_value(params, "context_lines", 0));
 
+        int requested_limit = json_value(params, "limit",
+            static_cast<int>(SERVER_TOOL_GREP_SEARCH_MAX_RESULTS));
+        int requested_offset = json_value(params, "offset", 0);
+
+        const size_t limit = static_cast<size_t>(
+            std::clamp(requested_limit, 1,
+                static_cast<int>(SERVER_TOOL_GREP_SEARCH_MAX_RESULTS)));
+
+        const size_t offset = static_cast<size_t>(
+            std::max(0, requested_offset));
+
         std::string pattern_src = pat_str;
         if (literal) {
             static const std::string specials = "\\^$.|?*+()[]{}";
             std::string escaped;
             escaped.reserve(pat_str.size() * 2);
             for (char c : pat_str) {
-                if (specials.find(c) != std::string::npos) escaped += '\\';
+                if (specials.find(c) != std::string::npos) {
+                    escaped += '\\';
+                }
                 escaped += c;
             }
             pattern_src = escaped;
@@ -1152,7 +1171,9 @@ struct server_tool_grep_search : server_tool {
         std::regex pattern;
         try {
             auto flags = std::regex::ECMAScript;
-            if (ignore_case) flags |= std::regex::icase;
+            if (ignore_case) {
+                flags |= std::regex::icase;
+            }
             pattern = std::regex(pattern_src, flags);
         } catch (const std::regex_error & e) {
             return {{"error", std::string("invalid regex: ") + e.what()}};
@@ -1160,10 +1181,12 @@ struct server_tool_grep_search : server_tool {
 
         auto io = make_tools_io(params);
 
-        // collect (absolute_path, display_path) pairs to search
+        // Collect (absolute_path, display_path) pairs to search.
         std::vector<std::pair<std::string, std::string>> files;
 
         const std::string abs_path = io->resolve(path);
+        bool listing_truncated = false;
+
         if (io->is_regular_file(abs_path)) {
             files.emplace_back(abs_path, path);
         } else if (io->is_directory(abs_path)) {
@@ -1171,64 +1194,116 @@ struct server_tool_grep_search : server_tool {
             if (!listing.err.empty()) {
                 return {{"error", listing.err + ": " + path}};
             }
+
+            listing_truncated = listing.truncated;
+
             for (const auto & entry : listing.entries) {
-                if (!path_glob_match(include, entry.rel)) continue;
-                if (!exclude.empty() && path_glob_match(exclude, entry.rel)) continue;
-                files.emplace_back(path_to_utf8(path_from_utf8(abs_path) / path_from_utf8(entry.rel)), entry.rel);
+                if (!path_glob_match(include, entry.rel)) {
+                    continue;
+                }
+                if (!exclude.empty() && path_glob_match(exclude, entry.rel)) {
+                    continue;
+                }
+
+                files.emplace_back(
+                    path_to_utf8(path_from_utf8(abs_path) / path_from_utf8(entry.rel)),
+                    entry.rel);
             }
         } else {
             return {{"error", "path does not exist: " + path}};
         }
 
         std::ostringstream output_text;
+
+        size_t skipped = 0;
         size_t total = 0;
-        bool limit_reached = false;
+        bool has_more = false;
         bool show_num = show_lineno || ctx_lines > 0;
 
         for (const auto & file_entry : files) {
-            if (limit_reached) break;
-            const std::string & fpath        = file_entry.first;
+            if (has_more) {
+                break;
+            }
+
+            const std::string & fpath = file_entry.first;
             const std::string & display_path = file_entry.second;
 
             std::string content;
-            if (!io->read_file(fpath, content)) continue;
+            if (!io->read_file(fpath, content)) {
+                continue;
+            }
+
             std::vector<std::string> lines;
             {
                 std::istringstream f(content);
                 std::string line;
-                while (std::getline(f, line)) lines.push_back(line);
+                while (std::getline(f, line)) {
+                    lines.push_back(line);
+                }
             }
 
             for (size_t i = 0; i < lines.size(); i++) {
-                if (total >= SERVER_TOOL_GREP_SEARCH_MAX_RESULTS) {
-                    limit_reached = true;
+                if (!std::regex_search(lines[i], pattern)) {
+                    continue;
+                }
+
+                // Skip matches belonging to previous pages.
+                if (skipped < offset) {
+                    skipped++;
+                    continue;
+                }
+
+                // One extra match is enough to determine whether another page exists.
+                if (total >= limit) {
+                    has_more = true;
                     break;
                 }
-                if (!std::regex_search(lines[i], pattern)) continue;
 
-                long ctx_start = ctx_lines > 0 ? std::max<long>(0, (long) i - ctx_lines) : (long) i;
-                long ctx_end   = ctx_lines > 0 ? std::min<long>((long) lines.size() - 1, (long) i + ctx_lines) : (long) i;
+                long ctx_start = ctx_lines > 0
+                    ? std::max<long>(0, static_cast<long>(i) - ctx_lines)
+                    : static_cast<long>(i);
+
+                long ctx_end = ctx_lines > 0
+                    ? std::min<long>(
+                        static_cast<long>(lines.size()) - 1,
+                        static_cast<long>(i) + ctx_lines)
+                    : static_cast<long>(i);
 
                 for (long j = ctx_start; j <= ctx_end; j++) {
-                    bool is_match = (j == (long) i);
-                    output_text << display_path << (is_match ? ':' : '-');
+                    bool is_match = (j == static_cast<long>(i));
+
+                    output_text << display_path
+                                << (is_match ? ':' : '-');
+
                     if (show_num) {
-                        output_text << (j + 1) << (is_match ? ':' : '-');
+                        output_text << (j + 1)
+                                    << (is_match ? ':' : '-');
                     }
+
                     output_text << lines[j] << "\n";
                 }
+
                 if (ctx_lines > 0) {
                     output_text << "--\n";
                 }
+
                 total++;
             }
         }
 
-        output_text << "\n---\nTotal matches: " << total << "\n";
-        if (limit_reached) {
-            output_text << string_format(
-                "[%zu matches limit reached. Narrow the path/pattern/include to see more.]\n",
-                SERVER_TOOL_GREP_SEARCH_MAX_RESULTS);
+        const size_t next_offset = offset + total;
+
+        output_text << "\n---\n";
+        output_text << "Total matches returned: " << total << "\n";
+        output_text << "Has more: " << (has_more ? "true" : "false") << "\n";
+
+        if (has_more) {
+            output_text << "Next offset: " << next_offset << "\n";
+        }
+
+        if (listing_truncated) {
+            output_text << "Search incomplete: file listing was truncated. "
+                        << "Some files may not have been searched.\n";
         }
 
         return {{"plain_text_response", output_text.str()}};
