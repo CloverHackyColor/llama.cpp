@@ -78,6 +78,7 @@ extern "C" {
         LLAMA_VOCAB_TYPE_RWKV   = 5, // RWKV tokenizer based on greedy tokenization
         LLAMA_VOCAB_TYPE_PLAMO2 = 6, // PLaMo-2 tokenizer based on Aho-Corasick with dynamic programming
         LLAMA_VOCAB_TYPE_TEST   = 7, // Dummy tokenizer for testing: rolling hash of fixed-size chunks -> tokens, tokens -> hex
+        LLAMA_VOCAB_TYPE_PLAMO3 = 8, // PLaMo-3 tokenizer with pre-segmentation and dynamic programming
     };
 
     enum llama_rope_type {
@@ -398,6 +399,9 @@ extern "C" {
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
 
+        size_t moe_cache_size;      // device cache in bytes for the experts kept in host memory, split among the devices like the layers, 0 = disabled [EXPERIMENTAL]
+        float  moe_cache_cpu_share; // share of the MoE cache misses computed on the CPU instead of uploaded, 0 = all uploaded [EXPERIMENTAL]
+
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
         // currently works only with CPU execution
@@ -405,7 +409,7 @@ extern "C" {
         void *              abort_callback_data;
 
         // Keep the booleans together and at the end of the struct to avoid misalignment during copy-by-value.
-        bool embeddings;  // if true, extract embeddings (together with logits)
+        bool embeddings;  // if true, extract embeddings (together with logits, except for a pooling type other than NONE)
         bool offload_kqv; // offload the KQV ops (including the KV cache) to GPU
         bool no_perf;     // measure performance timings
         bool op_offload;  // offload host tensor operations to device
@@ -681,6 +685,19 @@ extern "C" {
             const char * fname_inp,
             const char * fname_out,
             const llama_model_quantize_params * params);
+
+    //
+    // NextN / speculative draft model queries
+    //
+
+    // DFlash2 selector: number of candidate tokens the draft keeps per block position from its logits
+    // (the packed lattice also holds the top_k x top_k pairwise transition scores); 0 if the model has no selector head
+    LLAMA_API int32_t llama_model_dflash_selector_top_k(const struct llama_model * model);
+
+    // returns pointer to the target-model layer indices
+    LLAMA_API const int32_t * llama_model_target_layer_ids  (const struct llama_model * model);
+    // returns the number of extracted layers from target model
+    LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_model * model);
 
     //
     // Adapters
@@ -1059,10 +1076,21 @@ extern "C" {
     // "state" here means extra hidden state carried over from a previous stage, e.g.:
     //   - MTP: state from N layers of the target model
     //   - Qwen3 VL (deepstack): state from N layers of the vision encoder
+    //   - LiliCorr: context embeddings for the transformers
+    // Returns false if the context does not take a state embedding (MTP and LiliCorr contexts do)
     LLAMA_API bool llama_batch_ext_set_embd_state(
                                 struct llama_batch_ext * batch,
                                                int32_t   idx,
                                      struct llama_embd   embd);
+
+    // Add an entry whose embedding is row `row` of the layer input device buffer of ctx_other.
+    // All entries of the batch must be of this kind. Positions are set with llama_batch_ext_set_pos(), n_pos_per_embd of them.
+    // Returns the batch index (>= 0), or the llama_batch_ext_add() error codes.
+    LLAMA_API int32_t llama_batch_ext_add_embd_row(struct llama_batch_ext * batch, llama_seq_id seq_id, int32_t row);
+
+    // The state of entry idx is row `row` of the h_nextn device buffer of the context set with llama_set_ctx_state_src().
+    // All entries of a batch have a state row, or none.
+    LLAMA_API bool llama_batch_ext_set_embd_state_row(struct llama_batch_ext * batch, int32_t idx, int32_t row);
 
     // Set if output embeddings should be available for the token at index idx in the batch
     // Note: for now, this is equivalent to setting the output logits
@@ -1080,7 +1108,7 @@ extern "C" {
 
     // Set custom position for the token at index idx in the batch
     // For M-RoPE models:
-    //     - Embedding tokens must have multiple positions per token
+    //     - Embedding tokens must have n_pos_per_embd positions per token, in order [t, y, x, z]; t is also the KV cache position
     //     - Text token only requires one single position per token
     LLAMA_API bool llama_batch_ext_set_pos(
                                 struct llama_batch_ext * batch,
@@ -1168,6 +1196,57 @@ extern "C" {
     // when pooling_type == LLAMA_POOLING_TYPE_RANK, returns float[n_cls_out] with the rank(s) of the sequence
     // otherwise: float[n_embd] (1-dimensional)
     LLAMA_API float * llama_get_embeddings_seq(struct llama_context * ctx, llama_seq_id seq_id);
+
+    //
+    // NextN / speculative decoding API
+    //
+
+    // Set whether the context outputs nextn embeddings or not
+    // If masked == true,  output the embeddings only for the tokens with batch.logits != 0
+    // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
+    LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
+
+    // Select which appended NextN block the DECODER_MTP graph runs (offset past
+    // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
+    // chain multiple trained NextN heads. Default 0 (first head).
+    LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t offset);
+
+    // Get all nextn embeddings, mirroring llama_get_embeddings()
+    LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
+
+    // Get the nextn embeddings for the ith token, mirroring llama_get_embeddings_ith()
+    LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int32_t i);
+
+    // Set whether the context outputs the input embeddings of a specific layer
+    LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
+
+    // Get the input embeddings of a specific layer, mirroring llama_get_embeddings()
+    LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);
+
+    // Write the enabled layer inputs to a device buffer [n_layer_inp*n_embd, n_batch] instead of host memory.
+    // Row r holds the token at batch index r, layers in ascending layer id order.
+    LLAMA_API void llama_set_embeddings_layer_inp_dev(struct llama_context * ctx, bool value);
+
+    // Whether decode accepts entries added with llama_batch_ext_add_embd_row()
+    // (needs a DFlash/DSpark decoder context whose ctx_other has a layer input device buffer).
+    LLAMA_API bool llama_supports_embd_row(const struct llama_context * ctx);
+
+    // Write the unmasked h_nextn rows (see llama_set_embeddings_nextn) of each decode to a device buffer
+    // [n_embd_out, n_batch + n_seq_max] instead of host memory: row r < n_batch is the token at batch index r of the last decode,
+    // row n_batch + s is free for the caller, e.g. for seq s (see llama_set_embeddings_nextn_rows()).
+    // Returns false if the buffer cannot be used, the rows are then extracted to host memory.
+    LLAMA_API bool llama_set_embeddings_nextn_dev(struct llama_context * ctx, bool value);
+
+    // Copy rows of the h_nextn device buffer to or from host memory, ordered after the last decode and its readers
+    LLAMA_API bool llama_get_embeddings_nextn_rows(struct llama_context * ctx, int64_t row0, int64_t n_rows, float * out);
+    LLAMA_API bool llama_set_embeddings_nextn_rows(struct llama_context * ctx, int64_t row0, int64_t n_rows, const float * data);
+
+    // Read the state rows of batches (see llama_batch_ext_set_embd_state_row()) from the h_nextn device buffer of ctx_src.
+    // Returns whether decode accepts batches with state rows.
+    LLAMA_API bool llama_set_ctx_state_src(struct llama_context * ctx, struct llama_context * ctx_src);
+
+    // The paired context (llama_context_params::ctx_other), e.g. the target context of a draft context; may be nullptr
+    LLAMA_API struct llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
     //
     // backend sampling API [EXPERIMENTAL]
@@ -1565,6 +1644,10 @@ extern "C" {
                                float   penalty_freq,     // must be finite, 0.0 = disabled
                                float   penalty_present); // must be finite, 0.0 = disabled
 
+    /// maximum number of distinct DRY sequence breakers, duplicates not counted
+    /// processing each breaker scans the entire vocabulary, so the init cost is O(num_breakers x n_vocab)
+    #define LLAMA_DRY_MAX_SEQ_BREAKERS 64
+
     ///  @details DRY sampler, designed by p-e-w, as described in: https://github.com/oobabooga/text-generation-webui/pull/5677, porting Koboldcpp implementation authored by pi6am: https://github.com/LostRuins/koboldcpp/pull/982
     LLAMA_API struct llama_sampler * llama_sampler_init_dry(
             const struct llama_vocab *  vocab,
@@ -1688,6 +1771,8 @@ extern "C" {
         int32_t n_p_eval;   // number of prompt tokens
         int32_t n_eval;     // number of generated tokens
         int32_t n_reused;   // number of times a ggml compute graph had been reused
+        int32_t n_reallocs_same; // number of graph reallocations during inference with an unchanged graph size
+        int32_t n_reallocs_diff; // number of graph reallocations during inference with a changed graph size
     };
 
     struct llama_perf_sampler_data {
