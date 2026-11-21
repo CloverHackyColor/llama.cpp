@@ -82,11 +82,38 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_base(ggml
     return res;
 }
 
+// bf16 read as raw bits and widened by hand. Cards without the Metal 3 family have no bfloat
+// at all, and the ones that do have no arithmetic for it either, so the manual path is also
+// the faster one wherever the simdgroup matrix unit is missing.
+static bool ggml_metal_bf16_manual(ggml_metal_library_t lib) {
+    const struct ggml_metal_device_props * props = +ggml_metal_device_get_props(ggml_metal_library_get_device(lib));
+      // escape hatch for the A/B; a card with no bfloat has no other path
+      static const bool off = false; //TOSH_ENV("TOSH_BF16_MANUAL_DISABLE") != nullptr;
+
+    return !props->has_bfloat || (!props->has_simdgroup_mm && !off);   
+}
+
+static const char * ggml_metal_tname(ggml_metal_library_t lib, ggml_type t) {
+    if (t == GGML_TYPE_BF16 && ggml_metal_bf16_manual(lib)) {
+        return "bf16e";      
+    }
+    return ggml_type_name(t);   
+}
+
+// Only the pairs the manual kernels are instantiated for: bf16 weights against f32.
+static const char * ggml_metal_tname_pair(ggml_metal_library_t lib, ggml_type t, ggml_type other) {
+    if (t == GGML_TYPE_BF16 && other == GGML_TYPE_F32) {
+        return ggml_metal_tname(lib, t);
+    }
+    return ggml_type_name(t);
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cpy(ggml_metal_library_t lib, ggml_type tsrc, ggml_type tdst) {
     char base[256];
     char name[256];
 
-    snprintf(base, 256, "kernel_cpy_%s_%s", ggml_type_name(tsrc), ggml_type_name(tdst));
+    snprintf(base, 256, "kernel_cpy_%s_%s", ggml_metal_tname_pair(lib, tsrc, tdst),
+             ggml_metal_tname_pair(lib, tdst, tsrc));
     snprintf(name, 256, "%s", base);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
@@ -151,7 +178,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_get_rows(ggml_me
     char base[256];
     char name[256];
 
-    snprintf(base, 256, "kernel_get_rows_%s", ggml_type_name(tsrc));
+    snprintf(base, 256, "kernel_get_rows_%s", ggml_metal_tname(lib, tsrc));
     snprintf(name, 256, "%s", base);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
@@ -822,7 +849,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ext(ggml_
 
     GGML_ASSERT(ne12 <= INT16_MAX && r2 <= INT16_MAX && r3 <= INT16_MAX);
 
-    snprintf(base, 256, "kernel_mul_mv_ext_%s_%s_r1_%d", ggml_type_name(tsrc0), ggml_type_name(tsrc1), r1ptg);
+    snprintf(base, 256, "kernel_mul_mv_ext_%s_%s_r1_%d", ggml_metal_tname(lib, tsrc0), ggml_type_name(tsrc1), r1ptg);
     snprintf(name, 256, "%s_nsg=%d_nxpsg=%d_ne12=%d_r2=%d_r3=%d", base, nsg, nxpsg, ne12, r2, r3);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
@@ -1239,7 +1266,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
     const int16_t r2 = (int16_t) (ne12 / ne02);
     const int16_t r3 = (int16_t) (ne13 / ne03);
 
-    snprintf(base, 256, "kernel_mul_mv_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);
+    snprintf(base, 256, "kernel_mul_mv_%s_%s%s", ggml_metal_tname_pair(lib, tsrc0, tsrc1), ggml_type_name(tsrc1),
+             suffix);
     snprintf(name, 256, "%s_nsg=%d_ne12=%d_r2=%d_r3=%d_split=%d", base, nsg, ne12, r2, r3, split);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
@@ -1530,7 +1558,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
             }
     };
 
-    snprintf(base, 256, "kernel_mul_mv_id_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);
+    snprintf(base, 256, "kernel_mul_mv_id_%s_%s%s", ggml_metal_tname_pair(lib, tsrc0, tsrc1), ggml_type_name(tsrc1),
+             suffix);
     snprintf(name, 256, "%s_nsg=%d_split=%d", base, nsg, split);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);

@@ -1555,17 +1555,48 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
     const bool has_bfloat              = dev->props.has_bfloat;
 
     if (!has_bfloat) {
-        if (op->type == GGML_TYPE_BF16) {
+      bool bf16 = op->type == GGML_TYPE_BF16;
+
+      for (size_t i = 0, n = 3; i < n; ++i) {
+        bf16 =
+            bf16 || (op->src[i] != NULL && op->src[i]->type == GGML_TYPE_BF16);
+      }
+
+      if (bf16) {
+        switch (op->op) {
+        case GGML_OP_NONE:
+        case GGML_OP_RESHAPE:
+        case GGML_OP_VIEW:
+        case GGML_OP_PERMUTE:
+        case GGML_OP_TRANSPOSE:
+          return true;
+
+        case GGML_OP_GET_ROWS:
+          return op->src[0]->type == GGML_TYPE_BF16 &&
+                 op->type == GGML_TYPE_F32;
+
+        case GGML_OP_MUL_MAT:
+        case GGML_OP_MUL_MAT_ID:
+          if (op->src[0]->type != GGML_TYPE_BF16 ||
+              op->src[1]->type != GGML_TYPE_F32) {
             return false;
-        }
+          }
+          break;
 
-        for (size_t i = 0, n = 3; i < n; ++i) {
-            if (op->src[i] != NULL && op->src[i]->type == GGML_TYPE_BF16) {
-                return false;
-            }
+        case GGML_OP_CPY:
+        case GGML_OP_CONT:
+        case GGML_OP_DUP:
+          return (op->src[0]->type == GGML_TYPE_F32 &&
+                  op->type == GGML_TYPE_BF16) ||
+                 (op->src[0]->type == GGML_TYPE_BF16 &&
+                  op->type == GGML_TYPE_F32);
+
+        default:
+          return false;
         }
+      }
     }
-
+    
     switch (op->op) {
         case GGML_OP_SCALE:
             return ggml_is_contiguous_rows(op->src[0]) && (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_BF16);
