@@ -5,6 +5,7 @@
 #import "ggml-backend-impl.h"
 #import "ggml-metal-impl.h"
 #import "ggml-metal-common.h"
+#import <CommonCrypto/CommonDigest.h>
 
 #include <Foundation/Foundation.h>
 
@@ -24,8 +25,8 @@
 #define GGML_METAL_HAS_RESIDENCY_SETS 1
 #endif
 
-// overload of MTLGPUFamilyMetalX (not available in some environments)
-static const NSInteger MTLGPUFamilyMetal3_GGML = 5001;
+          // overload of MTLGPUFamilyMetalX (not available in some environments)
+          static const NSInteger MTLGPUFamilyMetal3_GGML = 5001;
 static const NSInteger MTLGPUFamilyMetal4_GGML = 5002;
 
 // MTLLanguageVersion4_0 is not present in older SDKs
@@ -309,6 +310,93 @@ static NSString * ggml_metal_library_flatten_source(NSString * path_source, NSEr
     return src;
 }
 
+// Precompiled libraries next to the binary, instead of spending tens of seconds
+// compiling the sources on every launch. They are built without the tensor API,
+// so M5-class GPUs fall through. kernels/fingerprint lists "<kind> <sha256 of
+// its source>"; a library built from other sources than the ones embedded in
+// this binary is stale and is not loaded
+static bool ggml_metal_library_precompiled_matches(NSString *dir,
+                                                   NSString *const *want) {
+  NSString *text =
+      [NSString stringWithContentsOfFile:
+                    [dir stringByAppendingPathComponent:@"fingerprint"]
+                                encoding:NSUTF8StringEncoding
+                                   error:nil];
+  if (text == nil) {
+    GGML_LOG_WARN("%s: precompiled kernels carry no fingerprint, compiling the "
+                  "embedded sources\n",
+                  __func__);
+    return false;
+  }
+  NSMutableDictionary<NSString *, NSString *> *have =
+      [NSMutableDictionary dictionary];
+  for (NSString *line in [text componentsSeparatedByString:@"\n"]) {
+    NSArray<NSString *> *f = [line componentsSeparatedByString:@" "];
+    if (f.count == 2)
+      have[f[0]] = f[1];
+  }
+  for (int kind = 0; kind < GGML_METAL_LIB_COUNT; ++kind) {
+    NSString *name = [NSString stringWithUTF8String:k_lib_names[kind]];
+    if (![have[name] isEqualToString:want[kind]]) {
+      GGML_LOG_WARN("%s: precompiled '%s' was built from other sources, "
+                    "compiling the embedded ones\n",
+                    __func__, k_lib_names[kind]);
+      return false;
+    }
+  }
+  return true;
+}
+
+static bool ggml_metal_library_load_precompiled(ggml_metal_library_t res,
+                                                id<MTLDevice> device,
+                                                NSString *const *want) {
+  if (ggml_metal_device_get_props(res->dev)->has_tensor) {
+    return false;
+  }
+
+  NSString *bin_cur = [[NSProcessInfo processInfo] arguments][0];
+  NSString *dir = [[bin_cur stringByDeletingLastPathComponent]
+      stringByAppendingPathComponent:@"kernels"];
+
+  if (![[NSFileManager defaultManager] fileExistsAtPath:dir]) {
+    return false;
+  }
+  if (!ggml_metal_library_precompiled_matches(dir, want)) {
+    return false;
+  }
+
+  const int64_t t_start = ggml_time_us();
+
+  for (int kind = 0; kind < GGML_METAL_LIB_COUNT; ++kind) {
+    NSString *path = [dir
+        stringByAppendingPathComponent:[NSString
+                                           stringWithFormat:@"%s.metallib",
+                                                            k_lib_names[kind]]];
+
+    NSError *error = nil;
+    res->objs[kind] =
+        [device newLibraryWithURL:[NSURL fileURLWithPath:path] error:&error];
+    if (!res->objs[kind]) {
+      GGML_LOG_WARN("%s: precompiled '%s' unusable, compiling from source\n",
+                    __func__, k_lib_names[kind]);
+      for (int i = 0; i < GGML_METAL_LIB_COUNT; ++i) {
+        if (res->objs[i]) {
+          [res->objs[i] release];
+          res->objs[i] = nil;
+        }
+      }
+      return false;
+    }
+  }
+
+  GGML_LOG_INFO("%s: loaded %d precompiled libraries in %.3f sec\n", __func__,
+                GGML_METAL_LIB_COUNT, (ggml_time_us() - t_start) / 1e6);
+
+  ggml_metal_library_build_index(res);
+
+  return true;
+}
+
 // Compile all per-kind libraries in parallel. `source_for_kind` returns the MSL
 // source for a kind (the helper takes ownership and releases it), or nil with
 // *err set on failure. On success the objs[] slots are populated and the routing
@@ -483,6 +571,32 @@ ggml_metal_library_t ggml_metal_library_init(ggml_metal_device_t dev) {
     GGML_METAL_LIBS
 #undef X
     };
+
+    // what these kernels were built from, to tell a stale precompiled library
+    // apart in a log
+    NSString *want[GGML_METAL_LIB_COUNT];
+    {
+      CC_SHA256_CTX all;
+      CC_SHA256_Init(&all);
+      for (int kind = 0; kind < GGML_METAL_LIB_COUNT; ++kind) {
+        unsigned char d[CC_SHA256_DIGEST_LENGTH];
+        CC_SHA256(lib_start[kind], (CC_LONG)(lib_end[kind] - lib_start[kind]),
+                  d);
+        NSMutableString *hex = [NSMutableString stringWithCapacity:64];
+        for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; ++i)
+          [hex appendFormat:@"%02x", d[i]];
+        want[kind] = hex;
+        CC_SHA256_Update(&all, d, sizeof(d));
+      }
+      unsigned char d[CC_SHA256_DIGEST_LENGTH];
+      CC_SHA256_Final(d, &all);
+      GGML_LOG_INFO("%s: kernel fingerprint %02x%02x%02x%02x%02x%02x\n",
+                    __func__, d[0], d[1], d[2], d[3], d[4], d[5]);
+    }
+
+    if (ggml_metal_library_load_precompiled(res, device, want)) {
+      return res;
+    }
 
     const bool ok = ggml_metal_library_compile_all(res, device, prep,
         ^NSString * (int kind, NSError ** err) {
