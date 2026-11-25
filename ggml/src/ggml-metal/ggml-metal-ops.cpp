@@ -2721,7 +2721,9 @@ static int ggml_metal_op_mul_mat_mv(ggml_metal_op_t ctx, int idx) {
         op->src[0]->type == GGML_TYPE_Q8_0) {
         ggml_metal_encoder_dispatch_threadgroups(enc, ((ne01 + nr0 - 1)/(nr0)), ((ne11 + nr1 - 1)/nr1), ne12*ne13, 32, nsg, 1);
     } else {
-        ggml_metal_encoder_dispatch_threadgroups(enc, ((ne01 + nr0*nsg - 1)/(nr0*nsg)), ((ne11 + nr1 - 1)/nr1), ne12*ne13, 32, nsg, 1);
+        const int nw = op->src[0]->type == GGML_TYPE_Q4_K ? 64 : 32;
+        ggml_metal_encoder_dispatch_threadgroups(enc, ((ne01 + nr0 * nsg - 1) / (nr0 * nsg)), ((ne11 + nr1 - 1) / nr1),
+                                                 ne12 * ne13, nw, nsg, 1);
     }
 
     return 1;

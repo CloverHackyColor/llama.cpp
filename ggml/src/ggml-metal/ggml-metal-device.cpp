@@ -1143,7 +1143,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             } break;
         case GGML_TYPE_Q4_K:
             {
-                nsg = N_SG_Q4_K;
+                nsg = 1; //N_SG_Q4_K;
                 nr0 = N_R0_Q4_K;
             } break;
         case GGML_TYPE_Q5_K:
@@ -1268,7 +1268,10 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
 
     snprintf(base, 256, "kernel_mul_mv_%s_%s%s", ggml_metal_tname_pair(lib, tsrc0, tsrc1), ggml_type_name(tsrc1),
              suffix);
-    snprintf(name, 256, "%s_nsg=%d_ne12=%d_r2=%d_r3=%d_split=%d", base, nsg, ne12, r2, r3, split);
+   // snprintf(name, 256, "%s_nsg=%d_ne12=%d_r2=%d_r3=%d_split=%d", base, nsg, ne12, r2, r3, split);
+   snprintf(name, 256,
+         "%s_nsg=%d_ne12=%d_r2=%d_r3=%d_split=%d_nw=64",
+         base, nsg, ne12, r2, r3, split);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {

@@ -1530,6 +1530,7 @@ void kernel_mul_mv_q4_K_f32_impl(
     const short ir = it%4;     // 0...3
 
     const int nb = args.ne00/QK_K;
+    const short nblocks = FC_mul_mv_nw / 8;
 
     const int r0 = tgpig.x;
     const int r1 = tgpig.y;
@@ -1556,7 +1557,7 @@ void kernel_mul_mv_q4_K_f32_impl(
     uint16_t sc16[4];
     thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
 
-    for (int ib = ix; ib < nb; ib += 4) {
+    for (int ib = ix; ib < nb; ib += nblocks) {
         float4 sumy = {0.f, 0.f, 0.f, 0.f};
 
         for (short i = 0; i < 8; ++i) {
@@ -1603,7 +1604,7 @@ void kernel_mul_mv_q4_K_f32_impl(
             dh += args.nb01/2;
         }
 
-        y4 += 4 * QK_K;
+        y4 += nblocks * QK_K;
     }
 
     device float * dst_f32 = (device float *) dst + (int64_t)im*args.ne0*args.ne1 + (int64_t)r1*args.ne0;
