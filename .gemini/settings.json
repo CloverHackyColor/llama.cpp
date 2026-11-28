@@ -1,1 +1,7 @@
-{ "contextFileName": "AGENTS.md" }
+{ "contextFileName": "AGENTS.md", 
+"[cpp]": {
+  "editor.formatOnSave": false,
+  "editor.formatOnType": false,
+  "editor.formatOnPaste": false
+}
+}

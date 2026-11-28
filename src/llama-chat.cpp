@@ -42,6 +42,7 @@ static const std::map<std::string, llm_chat_template> LLM_CHAT_TEMPLATES = {
     { "zephyr",            LLM_CHAT_TEMPLATE_ZEPHYR            },
     { "monarch",           LLM_CHAT_TEMPLATE_MONARCH           },
     { "gemma",             LLM_CHAT_TEMPLATE_GEMMA             },
+    { "gemma4",            LLM_CHAT_TEMPLATE_GEMMA_4           },
     { "orion",             LLM_CHAT_TEMPLATE_ORION             },
     { "openchat",          LLM_CHAT_TEMPLATE_OPENCHAT          },
     { "vicuna",            LLM_CHAT_TEMPLATE_VICUNA            },
@@ -152,6 +153,9 @@ llm_chat_template llm_chat_detect_template(const std::string & tmpl) {
         return LLM_CHAT_TEMPLATE_ZEPHYR;
     } else if (tmpl_contains("bos_token + message['role']")) {
         return LLM_CHAT_TEMPLATE_MONARCH;
+    } else if (tmpl_contains("<|turn>") &&
+           tmpl_contains("<turn|>")) {
+        return LLM_CHAT_TEMPLATE_GEMMA_4;
     } else if (tmpl_contains("<start_of_turn>")) {
         return LLM_CHAT_TEMPLATE_GEMMA;
     } else if (tmpl_contains("'\\n\\nAssistant: ' + eos_token")) {
@@ -376,6 +380,46 @@ int32_t llm_chat_apply_template(
         if (add_ass) {
             ss << "<s>assistant\n";
         }
+    } else if (tmpl == LLM_CHAT_TEMPLATE_GEMMA_4) {
+        // Google Gemma 4
+        std::string system_prompt;
+
+        for (auto message : chat) {
+            const std::string role(message->role);
+
+            if (role == "system" || role == "developer") {
+                if (!system_prompt.empty()) {
+                    system_prompt += "\n\n";
+                }
+                system_prompt += trim(message->content);
+                continue;
+            }
+
+            const std::string gemma_role =
+                role == "assistant" ? "model" : role;
+
+            if (!system_prompt.empty()) {
+                ss << "<|turn>system\n"
+                   << system_prompt
+                   << "<turn|>\n";
+                system_prompt.clear();
+            }
+
+            ss << "<|turn>" << gemma_role << "\n"
+               << trim(message->content)
+               << "<turn|>\n";
+        }
+
+        if (!system_prompt.empty()) {
+            ss << "<|turn>system\n"
+               << system_prompt
+               << "<turn|>\n";
+        }
+
+        if (add_ass) {
+            ss << "<|turn>model\n";
+        }
+    
     } else if (tmpl == LLM_CHAT_TEMPLATE_GEMMA) {
         // google/gemma-7b-it
         std::string system_prompt = "";
