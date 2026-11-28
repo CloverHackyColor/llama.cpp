@@ -62,6 +62,7 @@ enum llm_chat_template {
     LLM_CHAT_TEMPLATE_PANGU_EMBED,
     LLM_CHAT_TEMPLATE_SOLAR_OPEN,
     LLM_CHAT_TEMPLATE_UNKNOWN,
+    LLM_CHAT_TEMPLATE_QWEN35,
 };
 
 struct llama_chat_message;

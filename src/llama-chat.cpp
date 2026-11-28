@@ -81,6 +81,7 @@ static const std::map<std::string, llm_chat_template> LLM_CHAT_TEMPLATES = {
     { "grok-2",            LLM_CHAT_TEMPLATE_GROK_2            },
     { "pangu-embedded",    LLM_CHAT_TEMPLATE_PANGU_EMBED       },
     { "solar-open",        LLM_CHAT_TEMPLATE_SOLAR_OPEN        },
+    { "qwen35",            LLM_CHAT_TEMPLATE_QWEN35            },
 };
 
 llm_chat_template llm_chat_template_from_str(const std::string & name) {
@@ -97,6 +98,13 @@ llm_chat_template llm_chat_detect_template(const std::string & tmpl) {
     auto tmpl_contains = [&tmpl](const char * haystack) -> bool {
         return tmpl.find(haystack) != std::string::npos;
     };
+    if (tmpl_contains("<|im_start|>") &&
+        tmpl_contains("<think>") &&
+        tmpl_contains("</think>") &&
+        tmpl_contains("<|vision_start|>") &&
+        tmpl_contains("<|image_pad|>")) {
+        return LLM_CHAT_TEMPLATE_QWEN35;
+    }
     if (tmpl_contains("<|im_start|>")) {
         return tmpl_contains("<|im_sep|>")
             ? LLM_CHAT_TEMPLATE_PHI_4
@@ -251,7 +259,15 @@ int32_t llm_chat_apply_template(
     std::string & dest, bool add_ass) {
     // Taken from the research: https://github.com/ggml-org/llama.cpp/issues/5527
     std::stringstream ss;
-    if (tmpl == LLM_CHAT_TEMPLATE_CHATML) {
+    if (tmpl == LLM_CHAT_TEMPLATE_QWEN35) {
+        // qwen35 template
+        for (auto message : chat) {
+            ss << "<|im_start|>" << message->role << "\n" << message->content << "<|im_end|>\n";
+        }
+        if (add_ass) {
+            ss << "<|im_start|>assistant\n<think>\n";
+        }
+    } else if (tmpl == LLM_CHAT_TEMPLATE_CHATML) {
         // chatml template
         for (auto message : chat) {
             ss << "<|im_start|>" << message->role << "\n" << message->content << "<|im_end|>\n";
