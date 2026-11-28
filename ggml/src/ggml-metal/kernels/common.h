@@ -37,6 +37,31 @@ typedef matrix<bfloat, 4, 4> bfloat4x4;
 typedef matrix<bfloat, 2, 4> bfloat2x4;
 #endif
 
+// bf16 on cards where Metal has no bfloat type: the same 16 bits, widened by hand. The
+// exponent is already f32's, so the conversion is a shift and nothing is approximated.
+struct bf16e {
+    ushort b;
+    bf16e() thread = default;
+    bf16e(float f) thread {
+        const uint u = as_type<uint>(f);
+        b = (ushort) ((u + 0x7fff + ((u >> 16) & 1)) >> 16); // round to nearest even
+    }
+    inline operator float() const thread   { return as_type<float>((uint) b << 16); }
+    inline operator float() const device   { return as_type<float>((uint) b << 16); }
+    inline operator float() const constant { return as_type<float>((uint) b << 16); }
+};
+
+struct bf16e4 {
+    ushort4 b;
+    inline operator float4() const thread   { return as_type<float4>(uint4(b) << 16); }
+    inline operator float4() const device   { return as_type<float4>(uint4(b) << 16); }
+    inline operator float4() const constant { return as_type<float4>(uint4(b) << 16); }
+};
+
+struct bf16e4x4 {
+    ushort4 b[4];
+};
+
 constexpr constant static float kvalues_iq4nl_f[16] = {
     -127.f, -104.f, -83.f, -65.f, -49.f, -35.f, -22.f, -10.f, 1.f, 13.f, 25.f, 38.f, 53.f, 69.f, 89.f, 113.f
 };

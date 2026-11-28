@@ -726,6 +726,10 @@ template [[host_name("kernel_mul_mm_bf16_f32_prec_f32")]] kernel mul_mm_t kernel
 template [[host_name("kernel_mul_mm_bf16_f32")]]          kernel mul_mm_t kernel_mul_mm<bfloat, bfloat, bfloat4x4, 1, dequantize_bf16, bfloat, float>;
 template [[host_name("kernel_mul_mm_bf16_bf16")]]         kernel mul_mm_t kernel_mul_mm<bfloat, bfloat, bfloat4x4, 1, dequantize_bf16, bfloat, bfloat>;
 #endif
+
+template [[host_name("kernel_mul_mm_bf16e_f32")]]
+kernel mul_mm_t kernel_mul_mm<
+    half, half, bf16e4x4, 1, dequantize_bf16e, float, float>;
 template [[host_name("kernel_mul_mm_q1_0_f32")]]    kernel mul_mm_t kernel_mul_mm<half, half, block_q1_0,    8,     dequantize_q1_0,    float, float>;
 template [[host_name("kernel_mul_mm_q2_0_f32")]]    kernel mul_mm_t kernel_mul_mm<half, half, block_q2_0,    4,     dequantize_q2_0,    float, float>;
 template [[host_name("kernel_mul_mm_q4_0_f32")]]    kernel mul_mm_t kernel_mul_mm<half, half, block_q4_0,    2,     dequantize_q4_0,    float, float>;
@@ -789,6 +793,10 @@ template [[host_name("kernel_mul_mm_id_f16_f32")]]     kernel mul_mm_id kernel_m
 #if defined(GGML_METAL_HAS_BF16)
 template [[host_name("kernel_mul_mm_id_bf16_f32")]]    kernel mul_mm_id kernel_mul_mm_id<bfloat, bfloat, bfloat4x4, 1, dequantize_bf16, bfloat, float>;
 #endif
+
+template [[host_name("kernel_mul_mm_id_bf16e_f32")]]
+kernel mul_mm_id kernel_mul_mm_id<
+    half, half, bf16e4x4, 1, dequantize_bf16e, float, float>;
 template [[host_name("kernel_mul_mm_id_q1_0_f32")]]    kernel mul_mm_id kernel_mul_mm_id<half, half, block_q1_0, 8, dequantize_q1_0, float, float>;
 template [[host_name("kernel_mul_mm_id_q2_0_f32")]]    kernel mul_mm_id kernel_mul_mm_id<half, half, block_q2_0, 4, dequantize_q2_0, float, float>;
 template [[host_name("kernel_mul_mm_id_q4_0_f32")]]    kernel mul_mm_id kernel_mul_mm_id<half, half, block_q4_0, 2, dequantize_q4_0, float, float>;
@@ -796,6 +804,7 @@ template [[host_name("kernel_mul_mm_id_q4_1_f32")]]    kernel mul_mm_id kernel_m
 template [[host_name("kernel_mul_mm_id_q5_0_f32")]]    kernel mul_mm_id kernel_mul_mm_id<half, half, block_q5_0, 2, dequantize_q5_0, float, float>;
 template [[host_name("kernel_mul_mm_id_q5_1_f32")]]    kernel mul_mm_id kernel_mul_mm_id<half, half, block_q5_1, 2, dequantize_q5_1, float, float>;
 template [[host_name("kernel_mul_mm_id_q8_0_f32")]]    kernel mul_mm_id kernel_mul_mm_id<half, half, block_q8_0, 2, dequantize_q8_0, float, float>;
+
 #if defined(GGML_METAL_HAS_BF16)
 template [[host_name("kernel_mul_mm_id_mxfp4_f32")]]   kernel mul_mm_id kernel_mul_mm_id<bfloat, bfloat, block_mxfp4, 2, dequantize_mxfp4, float, float>;
 template [[host_name("kernel_mul_mm_id_nvfp4_f32")]]   kernel mul_mm_id kernel_mul_mm_id<bfloat, bfloat, block_nvfp4, 4, dequantize_nvfp4, float, float>;
